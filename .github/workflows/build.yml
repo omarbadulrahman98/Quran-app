@@ -1,6 +1,10 @@
 name: Build APK
 on:
   workflow_dispatch:
+    inputs:
+      entry:
+        description: 'Dart entry point (lib/main.dart = normal app, lib/main_ai_teacher.dart = Quran AI Teacher test)'
+        default: 'lib/main.dart'
 permissions:
   contents: write
 jobs:
@@ -22,15 +26,22 @@ jobs:
           cp main.dart app/lib/main.dart
           cp pubspec.yaml app/pubspec.yaml
           cp quran.json app/quran.json
+          cp quran_ai_matcher.dart quran_ai_teacher.dart main_ai_teacher.dart app/lib/
           rm -f app/test/widget_test.dart
           M=app/android/app/src/main/AndroidManifest.xml
           sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' $M
           sed -i 's#android:label="[^"]*"#android:label="Quran Kurdish"#' $M
+          sed -i 's#<application#<uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <application#' $M
+          if grep -q '<queries>' $M; then
+            sed -i 's#<queries>#<queries>\n        <intent>\n            <action android:name="android.speech.RecognitionService"/>\n        </intent>#' $M
+          else
+            sed -i 's#<application#<queries>\n        <intent>\n            <action android:name="android.speech.RecognitionService"/>\n        </intent>\n    </queries>\n    <application#' $M
+          fi
       - name: Build
         working-directory: app
         run: |
           flutter pub get
-          flutter build apk --release
+          flutter build apk --release -t ${{ inputs.entry || 'lib/main.dart' }}
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: apk-${{ github.run_number }}
