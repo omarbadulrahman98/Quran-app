@@ -28,6 +28,16 @@ jobs:
         working-directory: app
         run: |
           flutter pub get
+          mkdir -p assets/model
+          touch /tmp/stamp
+          dart run recite_quran:download_model || echo "model download failed"
+          # copy whatever the downloader created into assets/model
+          for f in $(find . "$HOME/.pub-cache/hosted" -type f -newer /tmp/stamp \
+              -not -path './build/*' -not -path './.dart_tool/*' \
+              \( -name '*.onnx' -o -name 'tokens*' \) 2>/dev/null); do
+            case "$f" in ./assets/model/*) ;; *) cp "$f" assets/model/ ;; esac
+          done
+          ls -la assets/model
           flutter build apk --release
       - uses: softprops/action-gh-release@v2
         with:
