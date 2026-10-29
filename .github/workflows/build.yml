@@ -18,10 +18,11 @@ jobs:
       - name: Create project
         run: |
           flutter create app --project-name quran_kurdish --org com.quran.kurdish --platforms=android
-          mkdir -p app/lib
+          mkdir -p app/lib app/assets
           cp main.dart app/lib/main.dart
           cp pubspec.yaml app/pubspec.yaml
           cp quran.json app/quran.json
+          cp banner.jpg app/assets/banner.jpg
           rm -f app/test/widget_test.dart
           python3 patch_android.py app
       - name: Build
