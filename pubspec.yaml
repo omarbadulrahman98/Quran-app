@@ -1,0 +1,25 @@
+name: quran_kurdish
+description: Quran with Kurdish and English tafseer, reciters and live recitation correction
+publish_to: 'none'
+version: 1.0.0
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  just_audio: '>=0.9.40 <0.11.0'
+  just_audio_background: ^0.0.1-beta.13
+  scrollable_positioned_list: ^0.3.8
+  shared_preferences: ^2.3.2
+  speech_to_text: ^7.0.0
+  recite_quran: ^1.0.5
+  wakelock_plus: ^1.2.0
+  audio_session: ^0.1.18
+
+flutter:
+  uses-material-design: true
+  assets:
+    - quran.json
+    - assets/model/
