@@ -22,6 +22,8 @@ jobs:
           cp main.dart app/lib/main.dart
           cp pubspec.yaml app/pubspec.yaml
           cp quran.json app/quran.json
+          # prayer timetables (data file); an empty one if the repo has none
+          if [ -f prayer_times.json ]; then cp prayer_times.json app/prayer_times.json; else echo '{"cities":{}}' > app/prayer_times.json; fi
           cp banner.jpg app/assets/banner.jpg
           rm -f app/test/widget_test.dart
           # optional adhan sound (notification channel 'adhan_sound_v1')
