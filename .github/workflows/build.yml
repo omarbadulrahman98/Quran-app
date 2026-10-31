@@ -24,8 +24,8 @@ jobs:
           cp quran.json app/quran.json
           # prayer timetables (data file); an empty one if the repo has none
           if [ -f prayer_times.json ]; then cp prayer_times.json app/prayer_times.json; else echo '{"cities":{}}' > app/prayer_times.json; fi
-          cp banner.jpg app/assets/banner.jpg
-          # second banner photo (Great Mosque of Sulaymaniyah); falls back to the first one
+          # banner photos: if one of the two files is missing, reuse the other so the build never stops
+          if [ -f banner.jpg ]; then cp banner.jpg app/assets/banner.jpg; else cp banner2.jpg app/assets/banner.jpg; fi
           if [ -f banner2.jpg ]; then cp banner2.jpg app/assets/banner2.jpg; else cp banner.jpg app/assets/banner2.jpg; fi
           rm -f app/test/widget_test.dart
           # optional adhan sound (notification channel 'adhan_sound_v1')
