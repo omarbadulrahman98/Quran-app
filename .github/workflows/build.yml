@@ -22,6 +22,7 @@ jobs:
           cp main.dart app/lib/main.dart
           cp pubspec.yaml app/pubspec.yaml
           cp quran.json app/quran.json
+          cp UthmanTN.ttf app/UthmanTN.ttf
           # prayer timetables (data file); an empty one if the repo has none
           if [ -f prayer_times.json ]; then cp prayer_times.json app/prayer_times.json; else echo '{"cities":{}}' > app/prayer_times.json; fi
           # banner photos: if one of the two files is missing, reuse the other so the build never stops
