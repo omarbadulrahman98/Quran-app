@@ -32,4 +32,4 @@ flutter:
   fonts:
     - family: UthmanTN
       fonts:
-        - asset: assets/fonts/UthmanTN.ttf
+        - asset: UthmanTN.ttf
