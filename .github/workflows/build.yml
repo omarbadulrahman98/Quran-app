@@ -29,6 +29,15 @@ jobs:
           if [ -f banner.jpg ]; then cp banner.jpg app/assets/banner.jpg; else cp banner2.jpg app/assets/banner.jpg; fi
           if [ -f banner2.jpg ]; then cp banner2.jpg app/assets/banner2.jpg; else cp banner.jpg app/assets/banner2.jpg; fi
           rm -f app/test/widget_test.dart
+          # Madani Mushaf pages: 604 page fonts + line data (QCF V1).
+          # If the download fails the app falls back to the old page layout.
+          pip install fonttools brotli >/dev/null 2>&1 || true
+          if ! python3 fetch_qcf.py app; then
+            echo "::warning::QCF download failed - the Mushaf will use the old layout"
+            mkdir -p app/assets/qcf
+            touch app/assets/qcf/.keep
+            if [ ! -f app/assets/quran_pages.json ]; then echo '{"v":1,"bism":[],"pages":[]}' > app/assets/quran_pages.json; fi
+          fi
           # optional adhan sound (notification channel 'adhan_sound_v1')
           if [ -f adhan.mp3 ]; then
             mkdir -p app/android/app/src/main/res/raw
