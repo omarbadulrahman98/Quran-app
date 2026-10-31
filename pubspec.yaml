@@ -29,7 +29,7 @@ flutter:
     - assets/banner.jpg
     - assets/banner2.jpg
     - assets/model/
-  fonts:
-    - family: UthmanTN
+    fonts:
+    - family: UthmanicHafs
       fonts:
-        - asset: UthmanTN.ttf
+        - asset: UthmanicHafs.ttf
