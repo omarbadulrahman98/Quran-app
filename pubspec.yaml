@@ -23,13 +23,15 @@ dependencies:
 
 flutter:
   uses-material-design: true
+
   assets:
     - quran.json
     - prayer_times.json
     - assets/banner.jpg
     - assets/banner2.jpg
     - assets/model/
-    fonts:
+
+  fonts:
     - family: UthmanicHafs
       fonts:
         - asset: UthmanicHafs.ttf
