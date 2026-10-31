@@ -30,6 +30,8 @@ flutter:
     - assets/banner.jpg
     - assets/banner2.jpg
     - assets/model/
+    - assets/quran_pages.json
+    - assets/qcf/
 
   fonts:
     - family: UthmanicHafs
