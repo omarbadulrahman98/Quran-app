@@ -1,6 +1,4 @@
-name: Build APK
-on:
-  workflow_dispatch:
+workflow_dispatch:
 permissions:
   contents: write
 jobs:
@@ -31,6 +29,10 @@ jobs:
           rm -f app/test/widget_test.dart
           # Madani Mushaf pages: 604 page fonts + line data (QCF V1).
           # If the download fails the app falls back to the old page layout.
+          mkdir -p app/assets/fonts app/assets/qcf
+          touch app/assets/fonts/.keep app/assets/qcf/.keep
+          # optional: your own surah-name font (put surah_name.ttf next to main.dart)
+          if [ -f surah_name.ttf ]; then cp surah_name.ttf app/assets/fonts/surah_name.ttf; fi
           pip install fonttools brotli >/dev/null 2>&1 || true
           if ! python3 fetch_qcf.py app; then
             echo "::warning::QCF download failed - the Mushaf will use the old layout"
