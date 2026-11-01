@@ -35,6 +35,7 @@ jobs:
           touch app/assets/fonts/.keep app/assets/qcf/.keep
           # optional: your own surah-name font (put surah_name.ttf next to main.dart)
           if [ -f surah_name.ttf ]; then cp surah_name.ttf app/assets/fonts/surah_name.ttf; fi
+          if [ -f Elgharib-SurahName_V4_ttf.txt ] && [ ! -f app/assets/fonts/surah_name.ttf ]; then cp Elgharib-SurahName_V4_ttf.txt app/assets/fonts/surah_name.ttf; fi
           pip install fonttools brotli >/dev/null 2>&1 || true
           if ! python3 fetch_qcf.py app; then
             echo "::warning::QCF download failed - the Mushaf will use the old layout"
