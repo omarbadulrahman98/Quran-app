@@ -48,7 +48,7 @@ jobs:
             touch app/assets/qcf/.keep
             if [ ! -f app/assets/quran_pages.json ]; then echo '{"v":1,"bism":[],"pages":[]}' > app/assets/quran_pages.json; fi
           fi
-                 # adhan sounds (one notification channel per muezzin)
+          # adhan sounds (one notification channel per muezzin)
           mkdir -p app/android/app/src/main/res/raw
           if [ -f adhan_sounds.zip ]; then
             unzip -oq adhan_sounds.zip -d app/android/app/src/main/res/raw || echo "::warning::adhan_sounds.zip is damaged - upload the mp3 files directly"
