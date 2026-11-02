@@ -15,6 +15,7 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
+
       - name: Create project
         run: |
           flutter create app --project-name quran_kurdish --org com.quran.kurdish --platforms=android
@@ -58,7 +59,10 @@ jobs:
           done
           echo "adhan files in raw: $(ls app/android/app/src/main/res/raw/*.mp3 2>/dev/null | wc -l)"
           python3 patch_android.py app
-          run: |
+
+      - name: Build APK
+        working-directory: app
+        run: |
           flutter pub get
           mkdir -p assets/model
           touch /tmp/stamp
@@ -71,6 +75,7 @@ jobs:
           done
           ls -la assets/model
           flutter build apk --release --no-shrink
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: apk-${{ github.run_number }}
