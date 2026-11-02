@@ -70,7 +70,7 @@ jobs:
             case "$f" in ./assets/model/*) ;; *) cp "$f" assets/model/ ;; esac
           done
           ls -la assets/model
-                   flutter build apk --release --no-shrink
+          flutter build apk --release --no-shrink
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: apk-${{ github.run_number }}
