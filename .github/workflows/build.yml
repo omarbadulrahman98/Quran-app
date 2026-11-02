@@ -58,7 +58,7 @@ jobs:
           done
           echo "adhan files in raw: $(ls app/android/app/src/main/res/raw/*.mp3 2>/dev/null | wc -l)"
           python3 patch_android.py app
-        run: |
+          run: |
           flutter pub get
           mkdir -p assets/model
           touch /tmp/stamp
