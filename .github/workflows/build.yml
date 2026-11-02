@@ -48,11 +48,13 @@ jobs:
             touch app/assets/qcf/.keep
             if [ ! -f app/assets/quran_pages.json ]; then echo '{"v":1,"bism":[],"pages":[]}' > app/assets/quran_pages.json; fi
           fi
-          # optional adhan sound (notification channel 'adhan_sound_v1')
-          if [ -f adhan.mp3 ]; then
-            mkdir -p app/android/app/src/main/res/raw
-            cp adhan.mp3 app/android/app/src/main/res/raw/adhan.mp3
-          fi
+          # adhan sounds (one notification channel per muezzin)
+          mkdir -p app/android/app/src/main/res/raw
+          if [ -f adhan_sounds.zip ]; then unzip -oq adhan_sounds.zip -d app/android/app/src/main/res/raw; fi
+          for f in adhan*.mp3 azan*.mp3; do
+            if [ -f "$f" ]; then cp "$f" app/android/app/src/main/res/raw/; fi
+          done
+          ls -la app/android/app/src/main/res/raw
           python3 patch_android.py app
       - name: Build
         working-directory: app
