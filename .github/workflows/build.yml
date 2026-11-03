@@ -6,6 +6,9 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -22,6 +25,8 @@ jobs:
           mkdir -p app/lib app/assets
           cp main.dart app/lib/main.dart
           cp pubspec.yaml app/pubspec.yaml
+          # pinned package versions (commit pubspec.lock to the repo to freeze them)
+          if [ -f pubspec.lock ]; then cp pubspec.lock app/pubspec.lock; fi
           cp quran.json app/quran.json
           cp UthmanicHafs.ttf app/UthmanicHafs.ttf
           # prayer timetables (data file); an empty one if the repo has none
@@ -31,7 +36,8 @@ jobs:
           if [ -f banner2.jpg ]; then cp banner2.jpg app/assets/banner2.jpg; else cp banner.jpg app/assets/banner2.jpg; fi
           rm -f app/test/widget_test.dart
           # Madani Mushaf pages: 604 page fonts + line data (QCF V1).
-          # If the download fails the app falls back to the old page layout.
+          # The old page layout was removed, so a failed download stops the build
+          # (better than shipping an APK whose Mushaf pages cannot open).
           mkdir -p app/assets/fonts app/assets/qcf
           touch app/assets/fonts/.keep app/assets/qcf/.keep
           # surah title pictures (surah_titles.zip -> assets/surah/001.png ... 114.png)
@@ -43,26 +49,31 @@ jobs:
           if [ -f surah_name.ttf ]; then cp surah_name.ttf app/assets/fonts/surah_name.ttf; fi
           if [ -f Elgharib-SurahName_V4_ttf.txt ] && [ ! -f app/assets/fonts/surah_name.ttf ]; then cp Elgharib-SurahName_V4_ttf.txt app/assets/fonts/surah_name.ttf; fi
           pip install fonttools brotli >/dev/null 2>&1 || true
-          if ! python3 fetch_qcf.py app; then
-            echo "::warning::QCF download failed - the Mushaf will use the old layout"
-            mkdir -p app/assets/qcf
-            touch app/assets/qcf/.keep
-            if [ ! -f app/assets/quran_pages.json ]; then echo '{"v":1,"bism":[],"pages":[]}' > app/assets/quran_pages.json; fi
-          fi
+          python3 fetch_qcf.py app
           # adhan sounds (one notification channel per muezzin)
           mkdir -p app/android/app/src/main/res/raw
           if [ -f adhan_sounds.zip ]; then
-            unzip -oq adhan_sounds.zip -d app/android/app/src/main/res/raw || echo "::warning::adhan_sounds.zip is damaged - upload the mp3 files directly"
+            unzip -oq adhan_sounds.zip -d app/android/app/src/main/res/raw || echo "::warning::adhan_sounds.zip is damaged"
           fi
           for f in adhan*.mp3 azan*.mp3; do
             if [ -f "$f" ]; then cp "$f" app/android/app/src/main/res/raw/; fi
           done
           echo "adhan files in raw: $(ls app/android/app/src/main/res/raw/*.mp3 2>/dev/null | wc -l)"
+          # fixed signing key from the GitHub secrets, so a new APK installs over the old one
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            export KEYSTORE_PATH="$RUNNER_TEMP/release.jks"
+          else
+            echo "::warning::no KEYSTORE_BASE64 secret - the APK is signed with a temporary debug key and cannot update the installed app"
+          fi
+          # patch_android.py also copies azkar.mp3 into app/assets/audio
           python3 patch_android.py app
 
       - name: Build APK
         working-directory: app
         run: |
+          flutter --version
           flutter pub get
           mkdir -p assets/model
           touch /tmp/stamp
@@ -74,10 +85,18 @@ jobs:
             case "$f" in ./assets/model/*) ;; *) cp "$f" assets/model/ ;; esac
           done
           ls -la assets/model
-          flutter build apk --release --no-shrink
+          if ! ls assets/model/*.onnx >/dev/null 2>&1; then
+            echo "::warning::no .onnx model in assets/model - live recitation correction will not work in this APK"
+          fi
+          # code health report (never stops the build): real errors + unused / dead code
+          flutter analyze --no-pub 2>&1 | grep -E "error 鈥warning 鈥�" | head -120 || true
+          # arm64 only = a much smaller APK (all modern phones are arm64)
+          flutter build apk --release --no-shrink --target-platform android-arm64
 
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: apk-${{ github.run_number }}
           name: Quran Kurdish APK
-          files: app/build/app/outputs/flutter-apk/app-release.apk
+          files: |
+            app/build/app/outputs/flutter-apk/app-release.apk
+            app/pubspec.lock
