@@ -88,10 +88,14 @@ jobs:
           if ! ls assets/model/*.onnx >/dev/null 2>&1; then
             echo "::warning::no .onnx model in assets/model - live recitation correction will not work in this APK"
           fi
-          # code health report (never stops the build): real errors + unused / dead code
-          flutter analyze --no-pub 2>&1 | grep -E "error 鈥warning 鈥�" | head -120 || true
+          # code health report (never stops the build): real errors first, then warnings.
+          # flutter analyze prints lines like "  error 鈥� message 鈥� lib/main.dart:12:3 鈥� code";
+          # the filter below only needs the leading word, so it does not depend on the bullet character.
+          flutter analyze --no-pub 2>&1 | grep -E "^ *(error|warning) " | head -120 || true
           # arm64 only = a much smaller APK (all modern phones are arm64)
           flutter build apk --release --no-shrink --target-platform android-arm64
+          # print the real size of the APK in the log
+          ls -lh build/app/outputs/flutter-apk/app-release.apk
 
       - uses: softprops/action-gh-release@v2
         with:
