@@ -69,6 +69,14 @@ jobs:
           fi
           # patch_android.py also copies azkar.mp3 into app/assets/audio
           python3 patch_android.py app
+          # location permission for the Qibla compass (GPS); added only if patch_android.py did not already add it
+          MANIFEST=app/android/app/src/main/AndroidManifest.xml
+          for P in ACCESS_FINE_LOCATION ACCESS_COARSE_LOCATION; do
+            if ! grep -q "android.permission.$P" "$MANIFEST"; then
+              sed -i "0,/<application/s//<uses-permission android:name=\"android.permission.$P\"\/>\n    <application/" "$MANIFEST"
+            fi
+          done
+          grep -n "permission.ACCESS_.*_LOCATION" "$MANIFEST" || echo "::warning::location permission was not added to AndroidManifest.xml"
 
       - name: Build APK
         working-directory: app
@@ -89,7 +97,7 @@ jobs:
             echo "::warning::no .onnx model in assets/model - live recitation correction will not work in this APK"
           fi
           # code health report (never stops the build): real errors first, then warnings.
-          # flutter analyze prints lines like "  error 鈥� message 鈥� lib/main.dart:12:3 鈥� code";
+          # flutter analyze prints lines like "  error - message - lib/main.dart:12:3 - code";
           # the filter below only needs the leading word, so it does not depend on the bullet character.
           flutter analyze --no-pub 2>&1 | grep -E "^ *(error|warning) " | head -120 || true
           # arm64 only = a much smaller APK (all modern phones are arm64)
