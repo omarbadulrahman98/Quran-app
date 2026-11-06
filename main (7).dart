@@ -1,0 +1,16966 @@
+// قورئانی پیرۆز - Flutter project (data from assets/quran/*.json)
+import 'dart:convert';
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
+import 'dart:async';
+import 'dart:io' show File, Directory, HttpClient, Platform;
+
+import 'package:just_audio/just_audio.dart';
+import 'package:just_audio_background/just_audio_background.dart';
+import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
+import 'dart:typed_data' show Int32List, Int64List, Uint16List, Uint8List;
+import 'dart:ui' as ui show FrameTiming;
+import 'package:flutter/foundation.dart' show compute, debugPrint;
+import 'package:flutter/services.dart'
+    show FontLoader, rootBundle, SystemUiOverlayStyle;
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:speech_to_text/speech_recognition_error.dart'
+    show SpeechRecognitionError;
+import 'package:speech_to_text/speech_recognition_result.dart'
+    show SpeechRecognitionResult;
+import 'package:speech_to_text/speech_to_text.dart' as stt;
+import 'package:recite_quran/recite_quran.dart' as rq;
+import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:audio_session/audio_session.dart' as asn;
+import 'package:flutter_compass/flutter_compass.dart' as fc;
+import 'package:geolocator/geolocator.dart' as geo;
+import 'package:flutter_local_notifications/flutter_local_notifications.dart'
+    as fln;
+import 'package:timezone/data/latest.dart' as tzdata;
+import 'package:timezone/timezone.dart' as tzl;
+
+// ============================================================
+//  قورئانی پیرۆز - Quran + Kurdish tafseer
+//  (UI part - identical in the DartPad and the Flutter project)
+// ============================================================
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  try {
+    await JustAudioBackground.init(
+      androidNotificationChannelId: 'com.quran.kurdish.audio',
+      androidNotificationChannelName: 'Quran audio',
+      androidNotificationOngoing: true,
+    );
+  } catch (_) {}
+  await settings.load();
+  audio.trimCache(); // old downloaded audio never piles up
+  await PrayerData.load(); // assets/prayer_times.json -> extra cities / days
+  // every step has its own try: one failing load must never stop the adhan
+  try { await locPrefs.ensureLoaded(); } catch (_) {}
+  try { await adhanPrefs.load(); } catch (_) {}
+  try { await azkarPrefs.load(); } catch (_) {}
+  try {
+    // Adhan notifications: same PrayerCalc data as the prayer card.
+    await AdhanScheduler.init();
+    locPrefs.addListener(AdhanScheduler.scheduleSoon);
+    adhanPrefs.addListener(AdhanScheduler.scheduleSoon);
+    locPrefs.addListener(AzkarAuto.scheduleSoon);
+    azkarPrefs.addListener(AzkarAuto.scheduleSoon);
+    WidgetsBinding.instance.addObserver(_AdhanLifecycle());
+    // a fresh install / update can lose the notification permission
+    if (adhanPrefs.mode.any((m) => m != 0)) {
+      AdhanScheduler.ensureNotificationPermission();
+    }
+    AdhanScheduler.scheduleSoon();
+    AzkarAuto.scheduleSoon();
+  } catch (_) {}
+  assert(PrayerCalc.selfTest()); // debug only: Awqaf benchmark of 29/10/2026
+  runApp(const QuranApp());
+}
+
+// ---------- colours / fonts ----------
+const Color _green = Color(0xFF1E7A3E);
+const Color _gold = Color(0xFFD9A21B);
+const Color _creamBg = Color(0xFFE9F2F9); // pale sky blue (page background of the whole app)
+const Color _darkBg = Color(0xFF111A14);
+/// Quran/ayah font (KFGQPC Uthmanic Script HAFS) - declared in pubspec.yaml
+const String _quranFont = 'UthmanicHafs';
+const List<String> _arFonts = [
+  'Amiri',
+  'Noto Naskh Arabic',
+  'Scheherazade New',
+  'Traditional Arabic',
+  'Arial',
+];
+
+bool _isDark(BuildContext c) => Theme.of(c).brightness == Brightness.dark;
+Color _cardColor(BuildContext c) =>
+    _isDark(c) ? const Color(0xFF1B2620) : const Color(0xFFFAFDFF);
+Color _lineColor(BuildContext c) =>
+    _isDark(c) ? const Color(0xFF2C3A31) : const Color(0xFFD3E2EE);
+Color _inkColor(BuildContext c) =>
+    _isDark(c) ? const Color(0xFFEDE6D3) : const Color(0xFF2A2A22);
+Color _mutedColor(BuildContext c) =>
+    _isDark(c) ? const Color(0xFFA9B5AC) : const Color(0xFF6B6A5E);
+
+// ---------- model ----------
+enum Tr { puxt, asan, none }
+
+const Map<Tr, String> _trLabels = {
+  Tr.puxt: 'کوردی (پوخت)',
+  Tr.asan: 'کوردی (ئاسان)',
+  Tr.none: 'بێ تەفسیر',
+};
+
+class Ayah {
+  final int n;
+  final String ar;
+  final String? puxt;
+  final String? asan;
+  Ayah(this.n, this.ar, [this.puxt, this.asan]);
+
+  String? tr(Tr t) {
+    switch (t) {
+      case Tr.puxt:
+        return puxt;
+      case Tr.asan:
+        return asan;
+      case Tr.none:
+        return null;
+    }
+  }
+}
+
+class SurahInfo {
+  final int n;
+  final String ar;
+  final String en;
+  final bool makki;
+  final int count;
+  const SurahInfo(this.n, this.ar, this.en, this.makki, this.count);
+}
+
+// ---------- settings (dark mode, font size, translation) ----------
+class Settings extends ChangeNotifier {
+  bool dark = false;
+  double arabicSize = 28;
+  Tr tr = Tr.puxt;
+  bool mushaf = true; // true: real Mushaf pages, false: one card per ayah
+  int pageBg = 2; // Mushaf page background (see _kPageBgs); 2 = ئاسمانی کاڵ (default)
+  String rec = 'Alafasy_128kbps';
+  List<List<String>> custom = [];
+  List<String> marks = [];
+  int lastSurah = 0;
+  int lastAyah = 0;
+  int coachLevel = 2; // 1 easy, 2 balanced (recommended), 3 strict
+  int coachSpeed = 1; // offline engine: 0 hadr (fast), 1 tadweer, 2 tahqeeq (slow)
+  // where the live recitation stopped last (surah, ayah number, word inside the ayah)
+  int coachSurah = 0, coachAyah = 0, coachWord = 0;
+  final ValueNotifier<int> lastTick = ValueNotifier<int>(0);
+
+  Future<void> load() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      dark = p.getBool('dark') ?? false;
+      arabicSize = p.getDouble('size') ?? 28;
+      mushaf = p.getBool('mushaf') ?? true;
+      pageBg = p.getInt('pageBg2') ?? 2; // new key: older saved defaults are ignored
+      final tn = p.getString('tr2');
+      if (tn != null) {
+        for (final t in Tr.values) {
+          if (t.name == tn) tr = t;
+        }
+      } else {
+        // older installs stored an index: 0 puxt, 1 asan, 2 English, 3 none
+        const legacy = {0: Tr.puxt, 1: Tr.asan, 2: Tr.puxt, 3: Tr.none};
+        tr = legacy[p.getInt('tr') ?? 0] ?? Tr.puxt;
+      }
+      rec = p.getString('rec') ?? rec;
+      marks = p.getStringList('marks') ?? [];
+      lastSurah = p.getInt('lastS') ?? 0;
+      lastAyah = p.getInt('lastA') ?? 0;
+      // 3 tiers now. Older installs stored 0..6: map them onto the new tiers.
+      final lv3 = p.getInt('coachLvl3');
+      if (lv3 != null) {
+        coachLevel = lv3.clamp(1, 3).toInt();
+      } else {
+        const migrate = {0: 1, 1: 2, 2: 3, 3: 3, 4: 2, 5: 3, 6: 2};
+        coachLevel = migrate[p.getInt('coachLvl') ?? 1] ?? 2;
+      }
+      coachSpeed = (p.getInt('coachSpd') ?? 1).clamp(0, 2).toInt();
+      coachSurah = p.getInt('cSur') ?? 0;
+      coachAyah = p.getInt('cAy') ?? 0;
+      coachWord = p.getInt('cWd') ?? 0;
+      final c = p.getString('custom');
+      if (c != null) {
+        custom = (jsonDecode(c) as List<dynamic>)
+            .map((e) => (e as List<dynamic>).map((x) => '$x').toList())
+            .toList();
+      }
+      // a reciter that was removed (or whose folder was renamed): follow the
+      // new entry, otherwise go back to Alafasy
+      final same = allReciters().where((r) => r[0].split('|').contains(rec));
+      rec = same.isNotEmpty ? same.first[0] : 'Alafasy_128kbps';
+    } catch (_) {}
+  }
+
+  Future<void> _save() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setBool('dark', dark);
+      await p.setDouble('size', arabicSize);
+      await p.setBool('mushaf', mushaf);
+      await p.setInt('pageBg2', pageBg);
+      await p.setString('tr2', tr.name);
+      await p.setString('rec', rec);
+      await p.setString('custom', jsonEncode(custom));
+      await p.setStringList('marks', marks);
+      await p.setInt('coachLvl3', coachLevel);
+      await p.setInt('coachSpd', coachSpeed);
+    } catch (_) {}
+  }
+
+  @override
+  void notifyListeners() {
+    super.notifyListeners();
+    _save();
+  }
+
+  bool isMarked(int s, int a) => marks.contains('$s:$a');
+
+  void toggleMark(int s, int a) {
+    final k = '$s:$a';
+    marks = marks.contains(k)
+        ? marks.where((m) => m != k).toList()
+        : [...marks, k];
+    notifyListeners();
+  }
+
+  void setLast(int s, int a) {
+    if (s == lastSurah && a == lastAyah) return;
+    lastSurah = s;
+    lastAyah = a;
+    lastTick.value++;
+    _saveLast();
+  }
+
+  Future<void> _saveLast() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setInt('lastS', lastSurah);
+      await p.setInt('lastA', lastAyah);
+    } catch (_) {}
+  }
+
+  void setRec(String f) {
+    rec = f;
+    notifyListeners();
+  }
+
+  void removeReciter(String f) {
+    custom = custom.where((r) => r[0] != f).toList();
+    if (rec == f) rec = 'Alafasy_128kbps';
+    notifyListeners();
+  }
+
+  void toggleDark() {
+    dark = !dark;
+    notifyListeners();
+  }
+
+  void setPageBg(int i) {
+    pageBg = i;
+    notifyListeners();
+  }
+
+  void bigger() {
+    if (arabicSize < 56) {
+      arabicSize += 2;
+      notifyListeners();
+    }
+  }
+
+  void smaller() {
+    if (arabicSize > 16) {
+      arabicSize -= 2;
+      notifyListeners();
+    }
+  }
+
+  void setTr(Tr t) {
+    tr = t;
+    notifyListeners();
+  }
+
+  void toggleMushaf() {
+    mushaf = !mushaf;
+    notifyListeners();
+  }
+
+  /// Remembers where the recitation is, so a new session continues there.
+  Future<void> saveCoachPos(int s, int a, int w) async {
+    if (s == coachSurah && a == coachAyah && w == coachWord) return;
+    coachSurah = s;
+    coachAyah = a;
+    coachWord = w;
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setInt('cSur', s);
+      await p.setInt('cAy', a);
+      await p.setInt('cWd', w);
+    } catch (_) {}
+  }
+
+  void setCoachLevel(int l) {
+    coachLevel = l.clamp(1, 3).toInt();
+    notifyListeners();
+  }
+
+  void setCoachSpeed(int v) {
+    coachSpeed = v.clamp(0, 2).toInt();
+    notifyListeners();
+  }
+}
+
+final Settings settings = Settings();
+
+// ---------- app ----------
+class QuranApp extends StatelessWidget {
+  const QuranApp({super.key});
+
+  ThemeData _theme(Brightness b) {
+    final dark = b == Brightness.dark;
+    return ThemeData(
+      useMaterial3: true,
+      brightness: b,
+      colorScheme: ColorScheme.fromSeed(seedColor: _green, brightness: b),
+      scaffoldBackgroundColor: dark ? _darkBg : _creamBg,
+      appBarTheme: const AppBarTheme(
+        backgroundColor: _green,
+        foregroundColor: Colors.white,
+        centerTitle: true,
+        elevation: 0,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: settings,
+      builder: (context, _) => MaterialApp(
+        debugShowCheckedModeBanner: false,
+        scaffoldMessengerKey: appMessenger,
+        title: 'قورئانی پیرۆز',
+        themeMode: settings.dark ? ThemeMode.dark : ThemeMode.light,
+        theme: _theme(Brightness.light),
+        darkTheme: _theme(Brightness.dark),
+        builder: (context, child) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: child ?? const SizedBox.shrink(),
+        ),
+        home: const DashboardPage(),
+      ),
+    );
+  }
+}
+
+// ---------- small widgets ----------
+class _Badge extends StatelessWidget {
+  final int n;
+  final double size;
+  const _Badge(this.n, {this.size = 32});
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: size + 4,
+      height: size + 4,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          Transform.rotate(
+            angle: 0.7853981634,
+            child: Container(
+              width: size * 0.72,
+              height: size * 0.72,
+              decoration: BoxDecoration(
+                border: Border.all(color: _gold, width: 1.4),
+                borderRadius: BorderRadius.circular(4),
+              ),
+            ),
+          ),
+          Text(
+            '$n',
+            style: TextStyle(
+              fontSize: size * 0.36,
+              color: _gold,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------- surah list ----------
+class SurahListPage extends StatefulWidget {
+  const SurahListPage({super.key});
+
+  @override
+  State<SurahListPage> createState() => _SurahListPageState();
+}
+
+class _SurahListPageState extends State<SurahListPage> {
+  String _q = '';
+
+  bool _match(SurahInfo s) {
+    if (_q.isEmpty) return true;
+    return '${s.n}' == _q ||
+        s.en.toLowerCase().contains(_q) ||
+        s.ar.contains(_q);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: settings,
+      builder: (context, _) {
+        final items = kSurahs.where(_match).toList();
+        return Scaffold(
+          bottomNavigationBar: const PlayerBar(),
+          appBar: AppBar(
+            title: const Text(
+              'قورئانی پیرۆز',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+            actions: [
+              IconButton(
+                tooltip: 'گەڕان لە ئایەتەکان',
+                onPressed: () => Navigator.of(context).push(
+                  MaterialPageRoute<void>(builder: (_) => const SearchPage()),
+                ),
+                icon: const Icon(Icons.manage_search),
+              ),
+              IconButton(
+                tooltip: 'نیشانەکان',
+                onPressed: () => Navigator.of(context).push(
+                  MaterialPageRoute<void>(builder: (_) => const BookmarksPage()),
+                ),
+                icon: const Icon(Icons.bookmarks),
+              ),
+              IconButton(
+                tooltip: 'ڕێکخستنەکان',
+                onPressed: () => Navigator.of(context).push(
+                  MaterialPageRoute<void>(builder: (_) => const SettingsPage()),
+                ),
+                icon: const Icon(Icons.settings),
+              ),
+              IconButton(
+                tooltip: 'تاریک / ڕووناک',
+                onPressed: settings.toggleDark,
+                icon: Icon(settings.dark ? Icons.light_mode : Icons.dark_mode),
+              ),
+            ],
+          ),
+          body: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 820),
+              child: Column(
+                children: [
+                  const _ContinueCard(),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+                    child: TextField(
+                      onChanged: (v) => setState(() => _q = v.trim().toLowerCase()),
+                      decoration: InputDecoration(
+                        hintText: 'گەڕان بە ناو یان ژمارە...',
+                        prefixIcon: const Icon(Icons.search),
+                        filled: true,
+                        fillColor: _cardColor(context),
+                        contentPadding: const EdgeInsets.symmetric(vertical: 12),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(14),
+                          borderSide: BorderSide(color: _lineColor(context)),
+                        ),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(14),
+                          borderSide: BorderSide(color: _lineColor(context)),
+                        ),
+                      ),
+                    ),
+                  ),
+                  Expanded(
+                    child: ListView.builder(
+                      padding: const EdgeInsets.fromLTRB(12, 6, 12, 24),
+                      itemCount: items.length,
+                      itemBuilder: (context, i) => _SurahTile(items[i]),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _SurahTile extends StatelessWidget {
+  final SurahInfo s;
+  const _SurahTile(this.s);
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Material(
+        color: _cardColor(context),
+        borderRadius: BorderRadius.circular(14),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(14),
+          onTap: () => Navigator.of(context).push(
+            MaterialPageRoute<void>(builder: (_) => SurahPage(number: s.n)),
+          ),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: _lineColor(context)),
+            ),
+            child: Row(
+              children: [
+                _Badge(s.n),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        s.en,
+                        textDirection: TextDirection.ltr,
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                          color: _inkColor(context),
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        '${s.count} ئایەت • ${s.makki ? 'مەککی' : 'مەدەنی'}',
+                        style: TextStyle(fontSize: 12.5, color: _mutedColor(context)),
+                      ),
+                    ],
+                  ),
+                ),
+                Text(
+                  s.ar,
+                  style: const TextStyle(
+                    fontSize: 24,
+                    color: _gold,
+                    fontWeight: FontWeight.bold,
+                    fontFamilyFallback: _arFonts,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------- one surah ----------
+class SurahPage extends StatefulWidget {
+  final int number;
+  final int initialAyah;
+  final bool autoCoach; // opened from the microphone card: switch the teacher on
+  const SurahPage({
+    super.key,
+    required this.number,
+    this.initialAyah = 0,
+    this.autoCoach = false,
+  });
+
+  @override
+  State<SurahPage> createState() => _SurahPageState();
+}
+
+class _SurahPageState extends State<SurahPage> {
+  late final Future<List<Ayah>> _future;
+  final ItemScrollController _sc = ItemScrollController();
+  final ItemPositionsListener _pl = ItemPositionsListener.create();
+  Timer? _t;
+  List<Ayah>? _ayahs;
+  int _followed = 0;
+  int _coachFollowed = 0;
+  // Mushaf page mode (full screen: the toolbar hides, tap the page to show it)
+  bool _bars = false;
+  PageController? _pc;
+  int _firstPage = 1;
+  int _lastPage = 1;
+  int _coachPage = -1;
+  int _followedPage = -1;
+  bool _leaving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _future = loadSurah(widget.number);
+    _firstPage = _pageOf(widget.number, 1);
+    _lastPage = _pageOf(widget.number, kSurahs[widget.number - 1].count);
+    final startIdx = widget.initialAyah > 0
+        ? _pageOf(widget.number, widget.initialAyah) - _firstPage
+        : 0;
+    _pc = PageController(
+        initialPage: startIdx.clamp(0, _lastPage - _firstPage).toInt());
+    if (widget.autoCoach) {
+      _future.then((a) {
+        if (!mounted) return;
+        _ayahs = a;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _turnCoachOn();
+        });
+      }).catchError((Object _) {});
+    }
+    _pl.itemPositions.addListener(_onPos);
+    audio.addListener(_follow);
+    coach.addListener(_coachFollow);
+    coach.onForeignSurah = _onFoundSurah; // the reader may be in another surah
+  }
+
+  /// The coach heard that the reader is in another surah: show it. The
+  /// session (and the microphone) keep running, only the page changes.
+  void _onFoundSurah(int s, int a) {
+    if (_leaving || !mounted || s == widget.number) return;
+    _leaving = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      Navigator.of(context).pushReplacement(
+        PageRouteBuilder<void>(
+          pageBuilder: (_, __, ___) => SurahPage(number: s, initialAyah: a),
+          transitionDuration: Duration.zero,
+          reverseTransitionDuration: Duration.zero,
+        ),
+      );
+    });
+  }
+
+  @override
+  void dispose() {
+    _t?.cancel();
+    _pc?.dispose();
+    _pl.itemPositions.removeListener(_onPos);
+    audio.removeListener(_follow);
+    coach.removeListener(_coachFollow);
+    if (coach.onForeignSurah == _onFoundSurah) coach.onForeignSurah = null;
+    coach.detach(widget.number); // leaving the page switches the mic off
+    super.dispose();
+  }
+
+  // keep the ayah being recited in view
+  /// Page mode: turn to the page that holds [ayah].
+  void _showPageOf(int ayah, {required bool byCoach}) {
+    final pc = _pc;
+    if (pc == null || !pc.hasClients) return;
+    final idx = (_pageOf(widget.number, ayah) - _firstPage)
+        .clamp(0, _lastPage - _firstPage)
+        .toInt();
+    if (byCoach) {
+      if (idx == _coachPage) return;
+      _coachPage = idx;
+    } else {
+      if (idx == _followedPage) return;
+      _followedPage = idx;
+    }
+    final cur = pc.page;
+    if (cur != null && cur.round() == idx) return;
+    pc.animateToPage(
+      idx,
+      duration: const Duration(milliseconds: 350),
+      curve: Curves.easeOut,
+    );
+  }
+
+  /// Reached the end of this surah: carry on with the next Mushaf page, which
+  /// belongs to the next surah. The new reader opens on exactly the page that
+  /// is already on screen, so the change is not visible.
+  void _goNext(int p) {
+    if (_leaving || p < 1 || p > 604) return;
+    _leaving = true;
+    final s = _pgS(p);
+    final a = _pgA(p);
+    settings.setLast(s, a);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      Navigator.of(context).pushReplacement(
+        PageRouteBuilder<void>(
+          pageBuilder: (_, __, ___) => SurahPage(number: s, initialAyah: a),
+          transitionDuration: Duration.zero,
+          reverseTransitionDuration: Duration.zero,
+        ),
+      );
+    });
+  }
+
+  void _onPage(int i) {
+    final p = _firstPage + i;
+    if (p > _lastPage) return;
+    final first = _pgS(p) == widget.number ? _pgA(p) : 1;
+    settings.setLast(widget.number, first);
+  }
+
+  void _coachFollow() {
+    if (!coach.on || coach.surah != widget.number) return;
+    if (settings.mushaf) {
+      final pa = coach.followAyah;
+      if (pa >= 1) _showPageOf(pa, byCoach: true);
+      return;
+    }
+    if (!_sc.isAttached) return;
+    final a = coach.followAyah;
+    if (a < 1 || a == _coachFollowed) return;
+    _coachFollowed = a;
+    _sc.scrollTo(
+      index: a + 1,
+      alignment: 0.05,
+      duration: const Duration(milliseconds: 400),
+    );
+  }
+
+  void _turnCoachOn() {
+    final ay = _ayahs;
+    if (ay == null) {
+      appMessenger.currentState?.showSnackBar(
+        const SnackBar(content: Text('چاوەڕێ بکە تا سوورەتەکە بار دەبێت')),
+      );
+      return;
+    }
+    _coachFollowed = 0;
+    _coachPage = -1;
+    // no start position: the reader may begin at any ayah, the coach finds it
+    coach.start(widget.number, ay);
+  }
+
+  void _onPos() {
+    _t?.cancel();
+    _t = Timer(const Duration(milliseconds: 700), () {
+      final ay = _ayahs;
+      if (ay == null || ay.isEmpty) return;
+      int? first;
+      for (final p in _pl.itemPositions.value) {
+        if (p.index >= 2 && p.index - 2 < ay.length && p.itemTrailingEdge > 0.05) {
+          if (first == null || p.index < first) first = p.index;
+        }
+      }
+      if (first != null) settings.setLast(widget.number, ay[first - 2].n);
+    });
+  }
+
+  void _follow() {
+    if (settings.mushaf) {
+      if (audio.surah == widget.number && audio.all && audio.ayah > 0) {
+        _showPageOf(audio.ayah, byCoach: false);
+      }
+      return;
+    }
+    if (audio.surah == widget.number &&
+        audio.all &&
+        audio.ayah != _followed &&
+        _sc.isAttached) {
+      _followed = audio.ayah;
+      _sc.scrollTo(
+        index: audio.ayah + 1,
+        alignment: 0.05,
+        duration: const Duration(milliseconds: 400),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final info = kSurahs[widget.number - 1];
+    return ListenableBuilder(
+      listenable: settings,
+      builder: (context, _) {
+        final bar = AppBar(
+            systemOverlayStyle: SystemUiOverlayStyle.light,
+            leading: const BackButton(),
+            title: Text(
+              info.ar,
+              style: const TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.bold,
+                fontFamilyFallback: _arFonts,
+              ),
+            ),
+            actions: [
+              // recitation coach (mic) switch
+              _CoachToggle(onTurnOn: _turnCoachOn),
+              IconButton(
+                tooltip: settings.mushaf
+                    ? 'شێوازی کارتی ئایەتەکان'
+                    : 'شێوازی لاپەڕەی قورئان',
+                onPressed: () {
+                  _bars = true;
+                  settings.toggleMushaf();
+                },
+                icon: Icon(settings.mushaf
+                    ? Icons.view_agenda_outlined
+                    : Icons.auto_stories),
+              ),
+            ],
+          );
+        final reader = FutureBuilder<List<Ayah>>(
+            future: _future,
+            builder: (context, snap) {
+              if (snap.hasError) {
+                return Center(child: Text('هەڵە: ${snap.error}'));
+              }
+              final ayahs = snap.data;
+              if (ayahs == null) {
+                return const Center(child: CircularProgressIndicator());
+              }
+              _ayahs = ayahs;
+              if (settings.mushaf) {
+                final total = _lastPage - _firstPage + 1;
+                return NotificationListener<ScrollNotification>(
+                  onNotification: (n) {
+                    if (n is ScrollStartNotification) {
+                      _QcfStore.busy = true;
+                    } else if (n is ScrollEndNotification) {
+                      _QcfStore.busy = false;
+                      final pg = _pc?.page;
+                      if (pg != null && pg.round() >= total && _lastPage < 604) {
+                        _goNext(_lastPage + 1);
+                      }
+                    }
+                    return false;
+                  },
+                  child: PageView.builder(
+                  controller: _pc,
+                  allowImplicitScrolling: true,
+                  itemCount: _lastPage < 604 ? total + 1 : total,
+                  onPageChanged: _onPage,
+                  itemBuilder: (context, i) {
+                    if (i >= total) {
+                      // the next page of the Mushaf (the next surah starts here)
+                      final np = _lastPage + 1;
+                      return _MushafPage(
+                        key: ValueKey('pg$np'),
+                        page: np,
+                        surah: _pgS(np),
+                      );
+                    }
+                    return _MushafPage(
+                      key: ValueKey('pg${_firstPage + i}'),
+                      page: _firstPage + i,
+                      surah: info.n,
+                    );
+                  },
+                  ),
+                );
+              }
+              final showBismillah = info.n != 1 && info.n != 9;
+              final start = widget.initialAyah > 0
+                  ? (widget.initialAyah + 1).clamp(0, ayahs.length + 2).toInt()
+                  : 0;
+              return SelectionArea(
+                child: Center(
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 820),
+                    child: ScrollablePositionedList.builder(
+                      itemScrollController: _sc,
+                      itemPositionsListener: _pl,
+                      initialScrollIndex: start,
+                      padding: const EdgeInsets.only(bottom: 24),
+                      itemCount: ayahs.length + 3,
+                      itemBuilder: (context, i) {
+                        if (i == 0) return _SurahHeader(info);
+                        if (i == 1) {
+                          return showBismillah
+                              ? _Bismillah()
+                              : const SizedBox(height: 12);
+                        }
+                        if (i == ayahs.length + 2) return _NavRow(info.n);
+                        return _AyahCard(ayahs[i - 2], info.n);
+                      },
+                    ),
+                  ),
+                ),
+              );
+            },
+          );
+        final immersive = settings.mushaf;
+        final dark = Theme.of(context).brightness == Brightness.dark;
+        final topInset = MediaQuery.paddingOf(context).top;
+        final barH = kToolbarHeight + topInset;
+        final overlay = (immersive && !_bars)
+            ? (dark ? SystemUiOverlayStyle.light : SystemUiOverlayStyle.dark)
+            : SystemUiOverlayStyle.light;
+        return AnnotatedRegion<SystemUiOverlayStyle>(
+          value: overlay.copyWith(
+            statusBarColor: Colors.transparent,
+          ),
+          child: Scaffold(
+            backgroundColor: immersive ? _pageBaseColor(context) : null,
+            bottomNavigationBar: const Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [_CoachPanel(), PlayerBar()],
+            ),
+            // card mode: normal toolbar. Mushaf mode: no toolbar, the page
+            // fills the screen; tap the page to slide the toolbar in/out.
+            appBar: immersive ? null : bar,
+            body: !immersive
+                ? reader
+                : Stack(
+                    children: [
+                      Positioned.fill(
+                        child: SafeArea(
+                          bottom: false,
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.translucent,
+                            onTap: () => setState(() => _bars = !_bars),
+                            child: reader,
+                          ),
+                        ),
+                      ),
+                      AnimatedPositioned(
+                        duration: const Duration(milliseconds: 220),
+                        curve: Curves.easeOut,
+                        top: _bars ? 0 : -(barH + 12),
+                        left: 0,
+                        right: 0,
+                        height: barH,
+                        child: bar,
+                      ),
+                    ],
+                  ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+final ButtonStyle _abBtn = TextButton.styleFrom(
+  minimumSize: const Size(36, 40),
+  padding: const EdgeInsets.symmetric(horizontal: 6),
+);
+
+const TextStyle _abStyle = TextStyle(
+  color: Colors.white,
+  fontWeight: FontWeight.bold,
+  fontSize: 16,
+);
+
+class _SurahHeader extends StatelessWidget {
+  final SurahInfo s;
+  const _SurahHeader(this.s);
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 14, 12, 4),
+      padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
+      decoration: BoxDecoration(
+        color: _green,
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: Column(
+        children: [
+          Text(
+            s.ar,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              fontSize: 32,
+              color: _gold,
+              fontWeight: FontWeight.bold,
+              fontFamilyFallback: _arFonts,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            s.en,
+            textDirection: TextDirection.ltr,
+            style: const TextStyle(
+              fontSize: 15,
+              color: Colors.white,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            'سوورەی ${s.n} • ${s.makki ? 'مەککی' : 'مەدەنی'} • ${s.count} ئایەت',
+            style: const TextStyle(fontSize: 12.5, color: Color(0xCCFFFFFF)),
+          ),
+          const SizedBox(height: 12),
+          _PlayAllButton(s.n),
+        ],
+      ),
+    );
+  }
+}
+
+class _Bismillah extends StatelessWidget {
+  const _Bismillah();
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 18, horizontal: 12),
+      child: Text(
+        'بِسْمِ ٱللَّهِ ٱلرَّحْمَٰنِ ٱلرَّحِيمِ',
+        textAlign: TextAlign.center,
+        style: TextStyle(
+          fontSize: settings.arabicSize,
+          color: _gold,
+          fontFamilyFallback: _arFonts,
+        ),
+      ),
+    );
+  }
+}
+
+class _AyahCard extends StatelessWidget {
+  final Ayah a;
+  final int surah;
+  const _AyahCard(this.a, this.surah);
+
+  @override
+  Widget build(BuildContext context) {
+    final t = settings.tr;
+    final text = a.tr(t);
+    final double trSize = (settings.arabicSize * 0.56).clamp(13.0, 24.0).toDouble();
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
+      decoration: BoxDecoration(
+        color: _cardColor(context),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: _lineColor(context)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          ListenableBuilder(
+            listenable: audio,
+            builder: (context, _) {
+              final active = audio.surah == surah && audio.ayah == a.n;
+              return Row(
+                children: [
+                  _Badge(a.n, size: 30),
+                  const Spacer(),
+                  IconButton(
+                    tooltip: 'نیشانەکردن',
+                    onPressed: () => settings.toggleMark(surah, a.n),
+                    icon: Icon(
+                      settings.isMarked(surah, a.n)
+                          ? Icons.bookmark
+                          : Icons.bookmark_border,
+                      color: _gold,
+                      size: 28,
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'گوێگرتن',
+                    onPressed: () =>
+                        active ? audio.toggle() : audio.play(surah, a.n),
+                    icon: Icon(
+                      active && audio.playing
+                          ? Icons.pause_circle
+                          : Icons.play_circle,
+                      color: _gold,
+                      size: 36,
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+          const SizedBox(height: 6),
+          _AyahArabic(a, surah),
+          if (t != Tr.none) ...[
+            const SizedBox(height: 8),
+            Divider(height: 1, color: _lineColor(context)),
+            const SizedBox(height: 10),
+            Text(
+              (text == null || text.isEmpty) ? '(ئەم وەرگێڕانە بۆ ئەم ئایەتە بەردەست نییە)' : text,
+              textDirection: TextDirection.rtl,
+              textAlign: TextAlign.start,
+              style: TextStyle(
+                fontSize: trSize,
+                height: 1.7,
+                color: _mutedColor(context),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _NavRow extends StatelessWidget {
+  final int n;
+  const _NavRow(this.n);
+
+  void _go(BuildContext context, int to) {
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute<void>(builder: (_) => SurahPage(number: to)),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 14, 12, 0),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          if (n > 1)
+            OutlinedButton.icon(
+              onPressed: () => _go(context, n - 1),
+              icon: const Icon(Icons.arrow_back),
+              label: Text('سوورەتی پێشوو (${n - 1})'),
+            )
+          else
+            const SizedBox.shrink(),
+          if (n < 114)
+            OutlinedButton.icon(
+              onPressed: () => _go(context, n + 1),
+              icon: const Icon(Icons.arrow_forward),
+              label: Text('سوورەتی دواتر (${n + 1})'),
+            )
+          else
+            const SizedBox.shrink(),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------- data: assets/quran/<n>.json ----------
+const List<Tr> kTrOptions = [Tr.puxt, Tr.asan, Tr.none];
+
+final Map<int, List<Ayah>> _cache = {};
+Map<String, dynamic>? _all;
+
+Map<String, dynamic> _parseAll(String t) =>
+    jsonDecode(t) as Map<String, dynamic>;
+
+Future<Map<String, dynamic>> loadAll() async {
+  final cached = _all;
+  if (cached != null) return cached;
+  final txt = await rootBundle.loadString('quran.json');
+  final m = await compute(_parseAll, txt);
+  _all = m;
+  return m;
+}
+
+Ayah _ayahFrom(Map<String, dynamic> m) => Ayah(
+      m['n'] as int,
+      m['ar'] as String,
+      m['puxt'] as String?,
+      m['asan'] as String?,
+    );
+
+Future<List<Ayah>> loadSurah(int n) async {
+  final hit = _cache[n];
+  if (hit != null) return hit;
+  final all = await loadAll();
+  final list = (all['$n'] as List<dynamic>)
+      .map((e) => _ayahFrom(e as Map<String, dynamic>))
+      .toList();
+  _cache[n] = list;
+  return list;
+}
+
+const List<SurahInfo> kSurahs = [
+  SurahInfo(1, "الفاتحة", "Al-Fatihah", true, 7),
+  SurahInfo(2, "البقرة", "Al-Baqarah", false, 286),
+  SurahInfo(3, "آل عمران", "Ali 'Imran", false, 200),
+  SurahInfo(4, "النساء", "An-Nisa", false, 176),
+  SurahInfo(5, "المائدة", "Al-Ma'idah", false, 120),
+  SurahInfo(6, "الأنعام", "Al-An'am", true, 165),
+  SurahInfo(7, "الأعراف", "Al-A'raf", true, 206),
+  SurahInfo(8, "الأنفال", "Al-Anfal", false, 75),
+  SurahInfo(9, "التوبة", "At-Tawbah", false, 129),
+  SurahInfo(10, "يونس", "Yunus", true, 109),
+  SurahInfo(11, "هود", "Hud", true, 123),
+  SurahInfo(12, "يوسف", "Yusuf", true, 111),
+  SurahInfo(13, "الرعد", "Ar-Ra'd", false, 43),
+  SurahInfo(14, "إبراهيم", "Ibrahim", true, 52),
+  SurahInfo(15, "الحجر", "Al-Hijr", true, 99),
+  SurahInfo(16, "النحل", "An-Nahl", true, 128),
+  SurahInfo(17, "الإسراء", "Al-Isra", true, 111),
+  SurahInfo(18, "الكهف", "Al-Kahf", true, 110),
+  SurahInfo(19, "مريم", "Maryam", true, 98),
+  SurahInfo(20, "طه", "Ta-Ha", true, 135),
+  SurahInfo(21, "الأنبياء", "Al-Anbiya", true, 112),
+  SurahInfo(22, "الحج", "Al-Hajj", false, 78),
+  SurahInfo(23, "المؤمنون", "Al-Mu'minun", true, 118),
+  SurahInfo(24, "النور", "An-Nur", false, 64),
+  SurahInfo(25, "الفرقان", "Al-Furqan", true, 77),
+  SurahInfo(26, "الشعراء", "Ash-Shu'ara", true, 227),
+  SurahInfo(27, "النمل", "An-Naml", true, 93),
+  SurahInfo(28, "القصص", "Al-Qasas", true, 88),
+  SurahInfo(29, "العنكبوت", "Al-'Ankabut", true, 69),
+  SurahInfo(30, "الروم", "Ar-Rum", true, 60),
+  SurahInfo(31, "لقمان", "Luqman", true, 34),
+  SurahInfo(32, "السجدة", "As-Sajdah", true, 30),
+  SurahInfo(33, "الأحزاب", "Al-Ahzab", false, 73),
+  SurahInfo(34, "سبأ", "Saba", true, 54),
+  SurahInfo(35, "فاطر", "Fatir", true, 45),
+  SurahInfo(36, "يس", "Ya-Sin", true, 83),
+  SurahInfo(37, "الصافات", "As-Saffat", true, 182),
+  SurahInfo(38, "ص", "Sad", true, 88),
+  SurahInfo(39, "الزمر", "Az-Zumar", true, 75),
+  SurahInfo(40, "غافر", "Ghafir", true, 85),
+  SurahInfo(41, "فصلت", "Fussilat", true, 54),
+  SurahInfo(42, "الشورى", "Ash-Shuraa", true, 53),
+  SurahInfo(43, "الزخرف", "Az-Zukhruf", true, 89),
+  SurahInfo(44, "الدخان", "Ad-Dukhan", true, 59),
+  SurahInfo(45, "الجاثية", "Al-Jathiyah", true, 37),
+  SurahInfo(46, "الأحقاف", "Al-Ahqaf", true, 35),
+  SurahInfo(47, "محمد", "Muhammad", false, 38),
+  SurahInfo(48, "الفتح", "Al-Fath", false, 29),
+  SurahInfo(49, "الحجرات", "Al-Hujurat", false, 18),
+  SurahInfo(50, "ق", "Qaf", true, 45),
+  SurahInfo(51, "الذاريات", "Adh-Dhariyat", true, 60),
+  SurahInfo(52, "الطور", "At-Tur", true, 49),
+  SurahInfo(53, "النجم", "An-Najm", true, 62),
+  SurahInfo(54, "القمر", "Al-Qamar", true, 55),
+  SurahInfo(55, "الرحمن", "Ar-Rahman", false, 78),
+  SurahInfo(56, "الواقعة", "Al-Waqi'ah", true, 96),
+  SurahInfo(57, "الحديد", "Al-Hadid", false, 29),
+  SurahInfo(58, "المجادلة", "Al-Mujadila", false, 22),
+  SurahInfo(59, "الحشر", "Al-Hashr", false, 24),
+  SurahInfo(60, "الممتحنة", "Al-Mumtahanah", false, 13),
+  SurahInfo(61, "الصف", "As-Saff", false, 14),
+  SurahInfo(62, "الجمعة", "Al-Jumu'ah", false, 11),
+  SurahInfo(63, "المنافقون", "Al-Munafiqun", false, 11),
+  SurahInfo(64, "التغابن", "At-Taghabun", false, 18),
+  SurahInfo(65, "الطلاق", "At-Talaq", false, 12),
+  SurahInfo(66, "التحريم", "At-Tahrim", false, 12),
+  SurahInfo(67, "الملك", "Al-Mulk", true, 30),
+  SurahInfo(68, "القلم", "Al-Qalam", true, 52),
+  SurahInfo(69, "الحاقة", "Al-Haqqah", true, 52),
+  SurahInfo(70, "المعارج", "Al-Ma'arij", true, 44),
+  SurahInfo(71, "نوح", "Nuh", true, 28),
+  SurahInfo(72, "الجن", "Al-Jinn", true, 28),
+  SurahInfo(73, "المزمل", "Al-Muzzammil", true, 20),
+  SurahInfo(74, "المدثر", "Al-Muddaththir", true, 56),
+  SurahInfo(75, "القيامة", "Al-Qiyamah", true, 40),
+  SurahInfo(76, "الإنسان", "Al-Insan", false, 31),
+  SurahInfo(77, "المرسلات", "Al-Mursalat", true, 50),
+  SurahInfo(78, "النبأ", "An-Naba", true, 40),
+  SurahInfo(79, "النازعات", "An-Nazi'at", true, 46),
+  SurahInfo(80, "عبس", "'Abasa", true, 42),
+  SurahInfo(81, "التكوير", "At-Takwir", true, 29),
+  SurahInfo(82, "الإنفطار", "Al-Infitar", true, 19),
+  SurahInfo(83, "المطففين", "Al-Mutaffifin", true, 36),
+  SurahInfo(84, "الإنشقاق", "Al-Inshiqaq", true, 25),
+  SurahInfo(85, "البروج", "Al-Buruj", true, 22),
+  SurahInfo(86, "الطارق", "At-Tariq", true, 17),
+  SurahInfo(87, "الأعلى", "Al-A'la", true, 19),
+  SurahInfo(88, "الغاشية", "Al-Ghashiyah", true, 26),
+  SurahInfo(89, "الفجر", "Al-Fajr", true, 30),
+  SurahInfo(90, "البلد", "Al-Balad", true, 20),
+  SurahInfo(91, "الشمس", "Ash-Shams", true, 15),
+  SurahInfo(92, "الليل", "Al-Layl", true, 21),
+  SurahInfo(93, "الضحى", "Ad-Duha", true, 11),
+  SurahInfo(94, "الشرح", "Ash-Sharh", true, 8),
+  SurahInfo(95, "التين", "At-Tin", true, 8),
+  SurahInfo(96, "العلق", "Al-'Alaq", true, 19),
+  SurahInfo(97, "القدر", "Al-Qadr", true, 5),
+  SurahInfo(98, "البينة", "Al-Bayyinah", false, 8),
+  SurahInfo(99, "الزلزلة", "Az-Zalzalah", false, 8),
+  SurahInfo(100, "العاديات", "Al-'Adiyat", true, 11),
+  SurahInfo(101, "القارعة", "Al-Qari'ah", true, 11),
+  SurahInfo(102, "التكاثر", "At-Takathur", true, 8),
+  SurahInfo(103, "العصر", "Al-'Asr", true, 3),
+  SurahInfo(104, "الهمزة", "Al-Humazah", true, 9),
+  SurahInfo(105, "الفيل", "Al-Fil", true, 5),
+  SurahInfo(106, "قريش", "Quraysh", true, 4),
+  SurahInfo(107, "الماعون", "Al-Ma'un", true, 7),
+  SurahInfo(108, "الكوثر", "Al-Kawthar", true, 3),
+  SurahInfo(109, "الكافرون", "Al-Kafirun", true, 6),
+  SurahInfo(110, "النصر", "An-Nasr", false, 3),
+  SurahInfo(111, "المسد", "Al-Masad", true, 5),
+  SurahInfo(112, "الإخلاص", "Al-Ikhlas", true, 4),
+  SurahInfo(113, "الفلق", "Al-Falaq", true, 5),
+  SurahInfo(114, "الناس", "An-Nas", true, 6),
+];
+
+
+// ============================================================
+//  Reciters + audio (audio streamed from everyayah.com)
+// ============================================================
+// A folder entry may list several everyayah.com folders separated by "|":
+// the first one that answers is used (see AudioCtl._folder).
+const List<List<String>> kReciters = [
+  ['Alafasy_128kbps', 'مشاری العفاسی'],
+  ['Abdul_Basit_Murattal_192kbps', 'عبدالباسط عبدالصمد'],
+  ['Abdurrahmaan_As-Sudais_192kbps', 'عبدالرحمن السدیس'],
+  ['MaherAlMuaiqly128kbps', 'ماهر المعیقلی'],
+  ['Saood_ash-Shuraym_128kbps', 'سعود الشریم'],
+  ['Minshawy_Murattal_128kbps', 'محمد صدیق المنشاوی'],
+  ['S:https://cdn.mp3quran.net/audio/ahmad-ajmi/r1/{S}.mp3', 'أحمد العجمي'],
+  ['Ghamadi_40kbps', 'سعد الغامدي'],
+  ['S:https://cdn.mp3quran.net/audio/raad-kurdi/r1/{S}.mp3', 'رعد الكردي'],
+  // 'S:' = ONE mp3 per surah (not per ayah); {S} becomes 001..114
+  ['S:https://cdn.mp3quran.net/audio/peshawa-kurdi/r1/{S}.mp3', 'پێشەوا الكردي'],
+];
+
+List<List<String>> allReciters() => [...kReciters, ...settings.custom];
+
+String reciterName() {
+  for (final r in allReciters()) {
+    if (r[0] == settings.rec) return r[1];
+  }
+  return settings.rec;
+}
+
+/// Downloaded teacher audio (prefetch) may use at most this much storage.
+const int kAudioCacheMaxBytes = 50 * 1024 * 1024;
+
+/// Files not used for this long are removed even when the cache is small.
+const Duration kAudioCacheMaxAge = Duration(days: 7);
+
+class _CachedFile {
+  final File file;
+  final int size;
+  final DateTime time; // last use (refreshed whenever the file is played)
+  const _CachedFile(this.file, this.size, this.time);
+}
+
+class AudioCtl extends ChangeNotifier {
+  final AudioPlayer _p = AudioPlayer();
+  int surah = 0;
+  int ayah = 0;
+  bool all = false;
+  bool playing = false;
+  bool error = false;
+  bool correcting = false; // playing a coach correction (always Alafasy)
+  bool whole = false; // playing ONE file for the whole surah (no per-ayah tracking)
+  bool previewing = false; // playing a muezzin sample from settings
+  bool azkar = false; // playing the azkar audio (assets/audio/azkar.mp3)
+  String azkarSet = ''; // 'm' morning / 'e' evening
+  bool timed = false; // whole-surah file whose ayah start times are known
+  List<int>? _starts; // start (ms) of every ayah inside the whole-surah file
+  int _gen = 0; // bumped on every play()/stop() so a late answer is ignored
+  String? _appId;
+  int _base = 1;
+
+  AudioCtl() {
+    _p.playerStateStream.listen((s) {
+      if (s.processingState == ProcessingState.completed) {
+        stop();
+        return;
+      }
+      playing = s.playing;
+      notifyListeners();
+    });
+    _p.currentIndexStream.listen((i) {
+      if (i != null && surah != 0 && !whole) {
+        ayah = _base + i;
+        notifyListeners();
+      }
+    });
+    _p.playbackEventStream.listen((_) {}, onError: (Object e, StackTrace st) {
+      error = true;
+      notifyListeners();
+    });
+    _p.positionStream.listen((pos) {
+      final st = _starts;
+      if (!whole || !timed || st == null || surah == 0) return;
+      final ms = pos.inMilliseconds;
+      var lo = 0, hi = st.length - 1, idx = 0;
+      while (lo <= hi) {
+        final mid = (lo + hi) >> 1;
+        if (st[mid] <= ms + 250) {
+          idx = mid;
+          lo = mid + 1;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      if (ayah != idx + 1) {
+        ayah = idx + 1;
+        notifyListeners();
+      }
+    });
+  }
+
+  // ---------- ayah start times inside a whole-surah file (mp3quran) ----------
+  List<dynamic>? _reads; // mp3quran reciters that have ayah timing
+  final Map<String, int?> _readIdCache = {};
+  final Map<String, List<double>> _rawTimings = {}; // 'read:surah' -> starts + lastEnd
+
+  Future<String> _getText(String url) async {
+    final req = await _http
+        .getUrl(Uri.parse(url))
+        .timeout(const Duration(seconds: 8));
+    final res = await req.close().timeout(const Duration(seconds: 10));
+    if (res.statusCode != 200) {
+      await res.drain<void>();
+      throw StateError('http ${res.statusCode}');
+    }
+    return res.transform(utf8.decoder).join().timeout(const Duration(seconds: 15));
+  }
+
+  /// Arabic text without marks, with the letter variants folded together.
+  static String _normAr(String t) {
+    final b = StringBuffer();
+    for (final c in t.runes) {
+      if ((c >= 0x064B && c <= 0x065F) || c == 0x0640 || c == 0x0670) continue;
+      switch (c) {
+        case 0x0623:
+        case 0x0625:
+        case 0x0622:
+        case 0x0671:
+          b.writeCharCode(0x0627);
+          break;
+        case 0x0649:
+        case 0x06CC:
+          b.writeCharCode(0x064A);
+          break;
+        case 0x06A9:
+          b.writeCharCode(0x0643);
+          break;
+        case 0x0629:
+          b.writeCharCode(0x0647);
+          break;
+        default:
+          b.writeCharCode(c);
+      }
+    }
+    return b.toString();
+  }
+
+  /// Name parts that identify a whole-surah reciter in mp3quran's timing list.
+  static List<List<String>> _timingKeys(String rec) {
+    if (rec.contains('ahmad-ajmi')) return [['عجمي']];
+    if (rec.contains('raad-kurdi')) return [['رعد', 'كردي']];
+    if (rec.contains('peshawa-kurdi')) {
+      return [['شاوا'], ['شهوا'], ['شاو', 'كردي']];
+    }
+    return const [];
+  }
+
+  Future<int?> _readId(String rec) async {
+    if (_readIdCache.containsKey(rec)) return _readIdCache[rec];
+    final keys = _timingKeys(rec);
+    if (keys.isEmpty) return null;
+    int? id;
+    try {
+      var reads = _reads;
+      if (reads == null) {
+        final body =
+            jsonDecode(await _getText('https://mp3quran.net/api/v3/ayat_timing/reads'));
+        if (body is List) {
+          reads = body;
+        } else if (body is Map) {
+          for (final v in body.values) {
+            if (v is List) {
+              reads = v;
+              break;
+            }
+          }
+        }
+        _reads = reads;
+      }
+      for (final r in reads ?? const <dynamic>[]) {
+        if (r is! Map) continue;
+        final name = _normAr('${r['name']}');
+        if (keys.any((alt) => alt.every(name.contains))) {
+          id = int.tryParse('${r['id']}');
+          break;
+        }
+      }
+    } catch (_) {
+      return null; // network problem: do not remember it
+    }
+    _readIdCache[rec] = id;
+    return id;
+  }
+
+  /// Exact ayah start times (ms) from mp3quran, or null when this reciter /
+  /// recording has none (or they do not fit the file that is playing).
+  Future<List<int>?> _timingFor(int s, Duration? dur) async {
+    try {
+      final id = await _readId(settings.rec);
+      if (id == null) return null;
+      final count = kSurahs[s - 1].count;
+      final key = '$id:$s';
+      var raw = _rawTimings[key];
+      if (raw == null) {
+        final body = jsonDecode(
+            await _getText('https://mp3quran.net/api/v3/ayat_timing?surah=$s&read=$id'));
+        List<dynamic>? rows;
+        if (body is List) {
+          rows = body;
+        } else if (body is Map) {
+          for (final v in body.values) {
+            if (v is List) {
+              rows = v;
+              break;
+            }
+          }
+        }
+        if (rows == null) return null;
+        final st = List<double?>.filled(count + 1, null);
+        var lastEnd = 0.0;
+        for (final r in rows) {
+          if (r is! Map) continue;
+          final n = int.tryParse('${r['ayah']}');
+          final a = num.tryParse('${r['start_time']}');
+          final e = num.tryParse('${r['end_time']}');
+          if (e != null && e > lastEnd) lastEnd = e.toDouble();
+          if (n == null || a == null || n < 1 || n > count) continue;
+          st[n] = a.toDouble();
+        }
+        for (var i = 1; i <= count; i++) {
+          if (st[i] == null) return null;
+        }
+        raw = [for (var i = 1; i <= count; i++) st[i]!, lastEnd];
+        _rawTimings[key] = raw;
+      }
+      final lastEnd = raw[raw.length - 1];
+      var scale = 1.0; // the API gives milliseconds; accept seconds as well
+      if (dur != null && dur.inMilliseconds > 0 && lastEnd > 0) {
+        final d = dur.inMilliseconds.toDouble();
+        if ((lastEnd / d - 1).abs() < 0.15) {
+          scale = 1;
+        } else if ((lastEnd * 1000 / d - 1).abs() < 0.15) {
+          scale = 1000;
+        } else {
+          return null; // timing belongs to a different recording
+        }
+      }
+      return [for (var i = 0; i < count; i++) (raw[i] * scale).round()];
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Fallback when there is no timing: guess where each ayah starts from the
+  /// number of letters (only used to jump near the chosen ayah).
+  Future<List<int>?> _estimateStarts(int s, Duration? dur) async {
+    if (dur == null || dur.inMilliseconds <= 0) return null;
+    try {
+      final list = await loadSurah(s);
+      if (list.isEmpty) return null;
+      final d = dur.inMilliseconds.toDouble();
+      final lead = (s == 1 || s == 9) ? 0.0 : math.min(7000.0, d * 0.15);
+      final ws = <double>[
+        for (final a in list)
+          a.ar.runes.where((c) => c >= 0x0621 && c <= 0x064A).length + 3.0
+      ];
+      final total = ws.fold<double>(0, (x, y) => x + y);
+      final body = d - lead;
+      var acc = 0.0;
+      final out = <int>[];
+      for (final w in ws) {
+        out.add((lead + body * acc / total).round());
+        acc += w;
+      }
+      return out;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  String _url(String folder, int s, int a) =>
+      'https://everyayah.com/data/$folder/${s.toString().padLeft(3, '0')}${a.toString().padLeft(3, '0')}.mp3';
+
+  final Map<String, String> _folders = <String, String>{};
+
+  /// The everyayah.com folder to use for a reciter. An entry can list several
+  /// folders ("a|b|c"): the first one that really answers is used and
+  /// remembered. null = none of them has audio.
+  Future<String?> _folder(String rec) async {
+    final hit = _folders[rec];
+    if (hit != null) return hit;
+    final list = rec.split('|');
+    if (list.length == 1) return rec;
+    for (final f in list) {
+      try {
+        final req = await _http
+            .getUrl(Uri.parse('https://everyayah.com/data/$f/001001.mp3'))
+            .timeout(const Duration(seconds: 10));
+        req.headers.set('Range', 'bytes=0-0');
+        final res = await req.close().timeout(const Duration(seconds: 10));
+        await res.drain<void>();
+        if (res.statusCode == 200 || res.statusCode == 206) {
+          _folders[rec] = f;
+          return f;
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  Future<void> play(int s, int a, {bool all = false}) async {
+    azkar = false;
+    surah = s;
+    ayah = a;
+    this.all = all;
+    _base = a;
+    error = false;
+    correcting = false;
+    whole = settings.rec.startsWith('S:');
+    previewing = false;
+    timed = false;
+    _starts = null;
+    final gen = ++_gen;
+    notifyListeners();
+    if (whole) {
+      // ONE mp3 for the whole surah. The start time of the chosen ayah comes
+      // from mp3quran's ayah timing, then the player jumps there.
+      ayah = 0;
+      this.all = true;
+      try {
+        final url = settings.rec
+            .substring(2)
+            .replaceAll('{S}', s.toString().padLeft(3, '0'));
+        final dur = await _p.setAudioSource(ConcatenatingAudioSource(children: [
+          AudioSource.uri(
+            Uri.parse(url),
+            tag: MediaItem(
+              id: '$s',
+              title: kSurahs[s - 1].ar,
+              artist: reciterName(),
+            ),
+          ),
+        ])) ??
+            _p.duration;
+        if (gen != _gen) return;
+        notifyListeners();
+        if (a <= 1) {
+          // from the beginning: start at once, learn the times meanwhile
+          _p.play().catchError((Object _) {
+            error = true;
+            notifyListeners();
+          });
+        }
+        var starts = await _timingFor(s, dur);
+        if (gen != _gen) return;
+        final exact = starts != null;
+        starts ??= a > 1 ? await _estimateStarts(s, dur) : null;
+        if (gen != _gen) return;
+        if (starts != null && exact) {
+          _starts = starts;
+          timed = true;
+          ayah = a > 1 ? a : 1;
+        }
+        if (a > 1 && starts != null && a <= starts.length) {
+          await _p.seek(Duration(milliseconds: math.max(0, starts[a - 1] - 200)));
+          if (gen != _gen) return;
+        }
+        notifyListeners();
+        if (a > 1) {
+          _p.play().catchError((Object _) {
+            error = true;
+            notifyListeners();
+          });
+        }
+      } catch (_) {
+        error = true;
+        notifyListeners();
+      }
+      return;
+    }
+    if (a < 1) {
+      a = 1; // switching from a whole-surah reciter
+      ayah = 1;
+      _base = 1;
+    }
+    try {
+      final folder = await _folder(settings.rec);
+      if (folder == null) {
+        error = true; // this reciter has no audio on the server
+        notifyListeners();
+        return;
+      }
+      final last = all ? kSurahs[s - 1].count : a;
+      final items = <AudioSource>[
+        for (var i = a; i <= last; i++)
+          AudioSource.uri(
+            Uri.parse(_url(folder, s, i)),
+            tag: MediaItem(
+              id: '$s:$i',
+              title: '${kSurahs[s - 1].ar} • $i',
+              artist: reciterName(),
+            ),
+          ),
+      ];
+      await _p.setAudioSource(ConcatenatingAudioSource(children: items));
+      _p.play().catchError((Object _) {
+        error = true;
+        notifyListeners();
+      });
+    } catch (_) {
+      error = true;
+      notifyListeners();
+    }
+  }
+
+  /// One ayah in Mishary Alafasy's voice, used by the recitation coach.
+  int corrMs = 0; // estimated length of the slice being replayed (0 = whole rest of the ayah)
+
+  Future<void> playCorrection(int s, int a,
+      {double from = 0, double to = 0}) async {
+    corrMs = 0;
+    azkar = false;
+    whole = false;
+    timed = false;
+    _starts = null;
+    _gen++;
+    surah = s;
+    ayah = a;
+    all = false;
+    _base = a;
+    error = false;
+    correcting = true;
+    notifyListeners();
+    try {
+      var cached = _ayahCache['${s}_$a'];
+      if (cached != null && !File(cached).existsSync()) {
+        _ayahCache.remove('${s}_$a'); // the system cleaned it up: use the network
+        cached = null;
+      }
+      if (cached == null) {
+        final disk = '${Directory.systemTemp.path}/ay_${s}_$a.mp3';
+        try {
+          final f = File(disk); // complete files only (.part is renamed at the end)
+          if (f.existsSync() && f.lengthSync() > 0) {
+            cached = disk;
+            _ayahCache['${s}_$a'] = disk;
+          }
+        } catch (_) {}
+      }
+      if (cached != null) _touch(cached);
+      final tag = MediaItem(
+        id: '$s:$a',
+        title: '${kSurahs[s - 1].ar} • $a',
+        artist: 'مشاری العفاسی',
+      );
+      // 1) bundled inside the app (works with no internet at all),
+      // 2) already downloaded, 3) the network
+      final bundled = await _bundledCoach(s, a);
+      final dur = await _p.setAudioSource(ConcatenatingAudioSource(children: [
+        bundled != null
+            ? AudioSource.asset(bundled, tag: tag)
+            : AudioSource.uri(
+                cached != null ? Uri.file(cached) : Uri.parse(_coachUrl(s, a)),
+                tag: tag,
+              ),
+      ]));
+      // start a little before the wrong word (estimated from letter count)
+      if (from > 0 && dur != null) {
+        final ms = (dur.inMilliseconds * from).round() - 500;
+        if (ms > 0) await _p.seek(Duration(milliseconds: ms));
+      }
+      // only the slice around the wrong word (estimated), not the whole ayah
+      if (to > from && dur != null) {
+        corrMs = ((to - from) * dur.inMilliseconds).round() + 1000;
+      }
+      _p.play().catchError((Object _) {
+        error = true;
+        notifyListeners();
+      });
+    } catch (_) {
+      error = true;
+      notifyListeners();
+    }
+  }
+
+  final HttpClient _http = HttpClient()
+    ..connectionTimeout = const Duration(seconds: 6)
+    ..maxConnectionsPerHost = 6;
+
+  // Coach voice (one ayah per file), downloaded ahead of time so a correction
+  // starts at once from a local file instead of waiting for the network.
+  final Map<String, String> _ayahCache = {}; // 's_a' -> local mp3 (oldest first)
+  final Set<String> _ayahLoading = {};
+
+  // Teacher's voice bundled in the app: assets/coach/SSSAAA.mp3 (surah + ayah,
+  // 3 digits each). Missing files are fine: the app falls back to the cache and
+  // then to the network. Answers are remembered, so each file is probed once.
+  final Map<String, bool> _bundledHas = {};
+
+  Future<String?> _bundledCoach(int s, int a) async {
+    final path =
+        'assets/coach/${s.toString().padLeft(3, '0')}${a.toString().padLeft(3, '0')}.mp3';
+    final known = _bundledHas[path];
+    if (known == false) return null;
+    if (known == true) return path;
+    try {
+      await rootBundle.load(path);
+      _bundledHas[path] = true;
+      return path;
+    } catch (_) {
+      _bundledHas[path] = false;
+      return null;
+    }
+  }
+
+  String _coachUrl(int s, int a) =>
+      'https://everyayah.com/data/$kCoachReciter/${s.toString().padLeft(3, '0')}${a.toString().padLeft(3, '0')}.mp3';
+
+  bool _trimming = false; // one clean-up at a time
+  final Set<String> _writing = {}; // files being downloaded right now
+
+  /// Keeps the downloaded audio under [kAudioCacheMaxBytes]: the least recently
+  /// used files go first, and anything older than [kAudioCacheMaxAge] goes
+  /// anyway. Also removes files that earlier sessions or older app versions
+  /// left in the temp folder. Files in [keepPaths] are never removed.
+  Future<void> trimCache({Set<String> keepPaths = const {}}) async {
+    if (_trimming) return;
+    _trimming = true;
+    try {
+      final files = <_CachedFile>[];
+      await for (final e in Directory.systemTemp.list()) {
+        if (e is! File) continue;
+        final name = e.uri.pathSegments.last;
+        // '.mp3.part' = a download that never finished (older session)
+        final ours = (name.startsWith('ay_') || name.startsWith('w_')) &&
+            (name.endsWith('.mp3') || name.endsWith('.mp3.part'));
+        if (!ours) continue;
+        final st = await e.stat();
+        files.add(_CachedFile(e, st.size, st.modified));
+      }
+      files.sort((x, y) => x.time.compareTo(y.time)); // oldest first
+      var total = 0;
+      for (final f in files) {
+        total += f.size;
+      }
+      final now = DateTime.now();
+      for (final f in files) {
+        final tooOld = now.difference(f.time) > kAudioCacheMaxAge;
+        if (!tooOld && total <= kAudioCacheMaxBytes) break; // the rest is newer
+        if (keepPaths.contains(f.file.path) || _writing.contains(f.file.path)) {
+          continue;
+        }
+        try {
+          await f.file.delete();
+          total -= f.size;
+        } catch (_) {}
+        _ayahCache.removeWhere((_, p) => p == f.file.path);
+      }
+    } catch (_) {
+    } finally {
+      _trimming = false;
+    }
+  }
+
+  /// Marks a cached file as just used, so it is the last one to be removed.
+  Future<void> _touch(String path) async {
+    try {
+      await File(path).setLastModified(DateTime.now());
+    } catch (_) {}
+  }
+
+  /// Downloads [url] into [path]. The data goes to a '.part' file first and is
+  /// renamed only when complete, so a broken download never leaves a half file
+  /// that could be played or that wastes space.
+  Future<bool> _download(String url, String path) async {
+    final part = File('$path.part');
+    _writing.add(path);
+    _writing.add(part.path);
+    try {
+      final req = await _http.getUrl(Uri.parse(url));
+      final res = await req.close();
+      if (res.statusCode != 200) {
+        await res.drain<void>();
+        return false;
+      }
+      await res.timeout(const Duration(seconds: 20)).pipe(part.openWrite());
+      await part.rename(path);
+      return true;
+    } catch (_) {
+      try {
+        if (part.existsSync()) await part.delete();
+      } catch (_) {}
+      return false;
+    } finally {
+      _writing.remove(path);
+      _writing.remove(part.path);
+    }
+  }
+
+  Future<void> prefetchAyah(int s, int a) async {
+    final key = '${s}_$a';
+    if (_ayahCache.containsKey(key) || _ayahLoading.contains(key)) return;
+    if (await _bundledCoach(s, a) != null) return;
+    _ayahLoading.add(key);
+    try {
+      final path = '${Directory.systemTemp.path}/ay_$key.mp3';
+      if (await _download(_coachUrl(s, a), path)) {
+        _ayahCache[key] = path;
+        await trimCache(keepPaths: {path});
+      }
+    } catch (_) {
+    } finally {
+      _ayahLoading.remove(key);
+    }
+  }
+
+  String reciterLabel() => correcting ? 'مشاری العفاسی • ڕاستکردنەوە' : reciterName();
+
+  Future<void> toggle() async {
+    if (_p.playing) {
+      await _p.pause();
+    } else {
+      _p.play().catchError((Object _) {});
+    }
+  }
+
+  void next() {
+    if (whole) {
+      final st = _starts;
+      if (timed && st != null && ayah >= 1 && ayah < st.length) {
+        ayah = ayah + 1;
+        notifyListeners();
+        _p.seek(Duration(milliseconds: st[ayah - 1]));
+        return;
+      }
+      if (surah < 114) play(surah + 1, 1, all: true); // next surah
+      return;
+    }
+    if (surah != 0 && ayah < kSurahs[surah - 1].count) {
+      play(surah, ayah + 1, all: all);
+    }
+  }
+
+  void prev() {
+    if (whole) {
+      final st = _starts;
+      if (timed && st != null && ayah > 1 && ayah <= st.length) {
+        ayah = ayah - 1;
+        notifyListeners();
+        _p.seek(Duration(milliseconds: ayah == 1 ? 0 : st[ayah - 1]));
+        return;
+      }
+      if (surah > 1) play(surah - 1, 1, all: true); // previous surah
+      return;
+    }
+    if (surah != 0 && ayah > 1) play(surah, ayah - 1, all: all);
+  }
+
+  Future<void> stop() async {
+    _gen++;
+    azkar = false;
+    azkarSet = '';
+    surah = 0;
+    ayah = 0;
+    all = false;
+    whole = false;
+    timed = false;
+    _starts = null;
+    previewing = false;
+    playing = false;
+    error = false;
+    correcting = false;
+    notifyListeners();
+    try {
+      await _p.stop();
+    } catch (_) {}
+  }
+
+  /// Android package name (the main process is named after it).
+  Future<String?> _pkg() async {
+    if (_appId != null) return _appId;
+    try {
+      final b = await File('/proc/self/cmdline').readAsBytes();
+      final end = b.indexOf(0);
+      _appId = String.fromCharCodes(end < 0 ? b : b.sublist(0, end)).trim();
+    } catch (_) {}
+    return _appId;
+  }
+
+  /// The azkar recording is copied once from the app assets to a real file
+  /// (the background player plays files most reliably).
+  Future<String> _azkarFile() async {
+    final f = File('${Directory.systemTemp.path}/azkar_peshawa.mp3');
+    if (!f.existsSync() || f.lengthSync() < 1000000) {
+      final d = await rootBundle.load('assets/audio/azkar.mp3');
+      await f.writeAsBytes(
+          d.buffer.asUint8List(d.offsetInBytes, d.lengthInBytes),
+          flush: true);
+    }
+    return f.path;
+  }
+
+  /// Plays the azkar recording (the same file for morning 'm' and evening 'e').
+  Future<void> playAzkar(String set) async {
+    try {
+      await _p.stop();
+    } catch (_) {}
+    surah = 0;
+    ayah = 0;
+    all = false;
+    whole = false;
+    timed = false;
+    _starts = null;
+    _gen++;
+    correcting = false;
+    previewing = false;
+    error = false;
+    azkar = true;
+    azkarSet = set;
+    notifyListeners();
+    try {
+      final path = await _azkarFile();
+      await _p.setAudioSource(AudioSource.uri(
+        Uri.file(path),
+        tag: MediaItem(
+          id: 'azkar_$set',
+          title: set == 'm' ? 'زیکری بەیانیان' : 'زیکری ئێواران',
+          artist: 'پێشەوا قادر الکردی',
+        ),
+      ));
+      _p.play().catchError((Object _) {
+        azkar = false;
+        error = true;
+        notifyListeners();
+      });
+    } catch (_) {
+      azkar = false;
+      error = true;
+      notifyListeners();
+    }
+  }
+
+  /// Plays the muezzin's file (res/raw/<raw>.mp3) so it can be heard in settings.
+  Future<void> previewAdhan(String raw, String title) async {
+    try {
+      await _p.stop();
+    } catch (_) {}
+    azkar = false;
+    surah = 0;
+    ayah = 0;
+    all = false;
+    whole = false;
+    timed = false;
+    _starts = null;
+    _gen++;
+    correcting = false;
+    error = false;
+    previewing = true;
+    notifyListeners();
+    try {
+      final pkg = await _pkg();
+      if (pkg == null || pkg.isEmpty) throw StateError('no package name');
+      await _p.setAudioSource(AudioSource.uri(
+        Uri.parse('android.resource://$pkg/raw/$raw'),
+        tag: MediaItem(id: 'adhan_$raw', title: title),
+      ));
+      _p.play().catchError((Object _) {});
+    } catch (_) {
+      previewing = false;
+      // fall back to a real notification with this muezzin's sound
+      AdhanScheduler.testNow(raw: raw);
+    }
+  }
+}
+
+final AudioCtl audio = AudioCtl();
+
+class PlayerBar extends StatelessWidget {
+  final bool openSettings;
+  const PlayerBar({super.key, this.openSettings = true});
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: Listenable.merge([audio, settings]),
+      builder: (context, _) {
+        if (audio.surah == 0) return const SizedBox.shrink();
+        final info = kSurahs[audio.surah - 1];
+        return Material(
+          color: _green,
+          child: SafeArea(
+            top: false,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: InkWell(
+                      onTap: openSettings
+                          ? () => Navigator.of(context).push(
+                                MaterialPageRoute<void>(
+                                    builder: (_) => const SettingsPage()),
+                              )
+                          : null,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            audio.whole && !audio.timed
+                                ? info.ar
+                                : '${info.ar} • ئایەتی ${audio.ayah}',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 16,
+                              fontWeight: FontWeight.bold,
+                              fontFamilyFallback: _arFonts,
+                            ),
+                          ),
+                          Text(
+                            audio.error
+                                ? 'دەنگەکە نەکرایەوە. ئینتەرنێت بپشکنە'
+                                : audio.reciterLabel(),
+                            style: const TextStyle(
+                                color: Color(0xCCFFFFFF), fontSize: 12.5),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  Directionality(
+                    textDirection: TextDirection.ltr,
+                    child: Row(
+                      children: [
+                        IconButton(
+                          color: Colors.white,
+                          onPressed: audio.prev,
+                          icon: const Icon(Icons.skip_previous),
+                        ),
+                        IconButton(
+                          color: Colors.white,
+                          onPressed: audio.toggle,
+                          icon: Icon(
+                              audio.playing ? Icons.pause : Icons.play_arrow),
+                        ),
+                        IconButton(
+                          color: Colors.white,
+                          onPressed: audio.next,
+                          icon: const Icon(Icons.skip_next),
+                        ),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    color: Colors.white,
+                    onPressed: audio.stop,
+                    icon: const Icon(Icons.close),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _PlayAllButton extends StatelessWidget {
+  final int n;
+  const _PlayAllButton(this.n);
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: audio,
+      builder: (context, _) {
+        final on = audio.surah == n && audio.all;
+        return FilledButton.icon(
+          style: FilledButton.styleFrom(
+            backgroundColor: const Color(0xFFF0C14B),
+            foregroundColor: const Color(0xFF1B2A1F),
+          ),
+          onPressed: () => on ? audio.toggle() : audio.play(n, 1, all: true),
+          icon: Icon(on && audio.playing ? Icons.pause : Icons.play_arrow),
+          label: Text(on && audio.playing ? 'ڕاگرتن' : 'گوێگرتن'),
+        );
+      },
+    );
+  }
+}
+
+// ---------- settings page ----------
+class SettingsPage extends StatefulWidget {
+  const SettingsPage({super.key});
+
+  @override
+  State<SettingsPage> createState() => _SettingsPageState();
+}
+
+class _SettingsPageState extends State<SettingsPage> {
+  bool _recOpen = false; // the reciter list is folded until the header is tapped
+  bool _mzOpen = false; // the muezzin list is folded until the header is tapped
+
+  /// Tappable header of the muezzin list (same look as the reciter header).
+  Widget _mzHeader(BuildContext c) => Padding(
+        padding: const EdgeInsets.fromLTRB(4, 22, 4, 6),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(12),
+          onTap: () => setState(() => _mzOpen = !_mzOpen),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
+            child: Row(
+              children: [
+                const Text(
+                  'بانگبێژ',
+                  style: TextStyle(
+                      fontSize: 17, fontWeight: FontWeight.bold, color: _gold),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _mzOpen
+                      ? const SizedBox.shrink()
+                      : Text(
+                          _muezzinName(adhanPrefs.muezzin),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 14,
+                            color: _mutedColor(c),
+                            fontFamilyFallback: _arFonts,
+                          ),
+                        ),
+                ),
+                AnimatedRotation(
+                  turns: _mzOpen ? 0.5 : 0,
+                  duration: const Duration(milliseconds: 200),
+                  child: const Icon(Icons.expand_more, color: _gold),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+
+  /// One row per fard prayer: on = the Adhan sound, off = nothing.
+  Widget _prayerRow(BuildContext c, int slot) {
+    const idx = [0, 2, 3, 4, 5]; // PrayerDay.list positions
+    final on = adhanPrefs.mode[slot] != 0;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Material(
+        color: _cardColor(c),
+        clipBehavior: Clip.antiAlias,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(14),
+          side: BorderSide(color: _lineColor(c)),
+        ),
+        child: ListTile(
+          leading: Container(
+            width: 42,
+            height: 42,
+            decoration: BoxDecoration(
+              color: const Color(0x26D9A21B),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Icon(kPrayerIcons[idx[slot]], color: _gold),
+          ),
+          title: Text(
+            kPrayerShort[idx[slot]],
+            style: TextStyle(
+                fontSize: 17,
+                fontWeight: FontWeight.w600,
+                color: _inkColor(c)),
+          ),
+          trailing: Switch(
+            value: on,
+            activeColor: _gold,
+            onChanged: (v) async {
+              await adhanPrefs.setMode(slot, v ? 3 : 0);
+              if (v) await AdhanScheduler.ensurePermissions();
+            },
+          ),
+          onTap: () async {
+            await adhanPrefs.setMode(slot, on ? 0 : 3);
+            if (!on) await AdhanScheduler.ensurePermissions();
+          },
+        ),
+      ),
+    );
+  }
+
+  /// Tappable header of the reciter list: shows the chosen reciter while folded.
+  Widget _recHeader(BuildContext c) => Padding(
+        padding: const EdgeInsets.fromLTRB(4, 22, 4, 6),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(12),
+          onTap: () => setState(() => _recOpen = !_recOpen),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
+            child: Row(
+              children: [
+                const Text(
+                  'قورئان خوێن',
+                  style: TextStyle(
+                      fontSize: 17, fontWeight: FontWeight.bold, color: _gold),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _recOpen
+                      ? const SizedBox.shrink()
+                      : Text(
+                          reciterName(),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 14,
+                            color: _mutedColor(c),
+                            fontFamilyFallback: _arFonts,
+                          ),
+                        ),
+                ),
+                AnimatedRotation(
+                  turns: _recOpen ? 0.5 : 0,
+                  duration: const Duration(milliseconds: 200),
+                  child: const Icon(Icons.expand_more, color: _gold),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+
+  @override
+  void dispose() {
+    if (audio.previewing) Future.microtask(audio.stop); // stop the muezzin sample
+    super.dispose();
+  }
+
+  void _select(String f) {
+    settings.setRec(f);
+    if (audio.surah != 0) audio.play(audio.surah, audio.ayah, all: audio.all);
+  }
+
+  Widget _head(String t) => Padding(
+        padding: const EdgeInsets.fromLTRB(4, 22, 4, 6),
+        child: Text(
+          t,
+          style: const TextStyle(
+              fontSize: 17, fontWeight: FontWeight.bold, color: _gold),
+        ),
+      );
+
+  Widget _opt(BuildContext c, String label, bool on, VoidCallback tap,
+      {Widget? trailing, bool arabic = false, String? sub}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Material(
+        color: _cardColor(c),
+        clipBehavior: Clip.antiAlias,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(14),
+          side: BorderSide(color: on ? _gold : _lineColor(c)),
+        ),
+        child: ListTile(
+          onTap: tap,
+          leading: Icon(
+              on ? Icons.radio_button_checked : Icons.radio_button_off,
+              color: _gold),
+          title: Text(
+            label,
+            style: TextStyle(
+              fontSize: arabic ? 19 : 16,
+              color: _inkColor(c),
+              fontFamilyFallback: _arFonts,
+            ),
+          ),
+          subtitle: sub == null
+              ? null
+              : Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Text(sub,
+                      style: TextStyle(
+                          fontSize: 12.5, height: 1.6, color: _mutedColor(c))),
+                ),
+          trailing: trailing,
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: Listenable.merge([settings, adhanPrefs]),
+      builder: (context, _) {
+        return Scaffold(
+          bottomNavigationBar: const PlayerBar(openSettings: false),
+          appBar: AppBar(
+            title: const Text('ڕێکخستنەکان',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+          body: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 820),
+              child: ListView(
+                padding: const EdgeInsets.fromLTRB(12, 0, 12, 32),
+                children: [
+                  _recHeader(context),
+                  AnimatedSize(
+                    duration: const Duration(milliseconds: 220),
+                    alignment: Alignment.topCenter,
+                    child: Column(
+                      children: [
+                        if (_recOpen)
+                          for (final r in allReciters())
+                            _opt(
+                              context,
+                              r[1],
+                              settings.rec == r[0],
+                              () => _select(r[0]),
+                              arabic: true,
+                              trailing: settings.custom.any((x) => x[0] == r[0])
+                                  ? IconButton(
+                                      onPressed: () =>
+                                          settings.removeReciter(r[0]),
+                                      icon: const Icon(Icons.close),
+                                    )
+                                  : null,
+                            ),
+                      ],
+                    ),
+                  ),
+                  _mzHeader(context),
+                  AnimatedSize(
+                    duration: const Duration(milliseconds: 220),
+                    alignment: Alignment.topCenter,
+                    child: Column(
+                      children: [
+                        if (_mzOpen) ...[
+                          for (final m in kMuezzins)
+                            _opt(
+                              context,
+                              m[1],
+                              adhanPrefs.muezzin == m[0],
+                              () {
+                                adhanPrefs.setMuezzin(m[0]);
+                                audio.previewAdhan(m[0], m[1]); // hear it
+                              },
+                              arabic: true,
+                            ),
+                          _head('ئاگادارکردنەوەی کاتەکانی بانگ'),
+                          for (var k = 0; k < 5; k++) _prayerRow(context, k),
+                          const _AdhanPermButton(),
+                        ],
+                      ],
+                    ),
+                  ),
+                  _head('تەفسیری قورئان (پەنجە بنێ بە ژمارەی ئایەتەکان)'),
+                  for (final t in kTrOptions)
+                    _opt(context, _trLabels[t] ?? '', settings.tr == t,
+                        () => settings.setTr(t)),
+                  _head('ڕەنگی پاشبنەمای لاپەڕەی قورئان'),
+                  Wrap(
+                    spacing: 14,
+                    runSpacing: 12,
+                    children: [
+                      for (var i = 0; i < _kPageBgs.length; i++)
+                        GestureDetector(
+                          onTap: () => settings.setPageBg(i),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Container(
+                                width: 58,
+                                height: 58,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  gradient: RadialGradient(
+                                      colors: [_kPageBgs[i].top, _kPageBgs[i].edge]),
+                                  border: Border.all(
+                                    color: settings.pageBg == i
+                                        ? _gold
+                                        : _kPageBgs[i].frame,
+                                    width: settings.pageBg == i ? 3.2 : 1.2,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(_kPageBgs[i].name,
+                                  style: TextStyle(
+                                      fontSize: 12.5, color: _mutedColor(context))),
+                            ],
+                          ),
+                        ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+
+// ============================================================
+//  Continue reading / bookmarks / search
+// ============================================================
+class _ContinueCard extends StatelessWidget {
+  const _ContinueCard();
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<int>(
+      valueListenable: settings.lastTick,
+      builder: (context, _, __) {
+        final s = settings.lastSurah;
+        if (s < 1 || s > 114) return const SizedBox.shrink();
+        final info = kSurahs[s - 1];
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+          child: Material(
+            color: _green,
+            borderRadius: BorderRadius.circular(14),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(14),
+              onTap: () => Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) =>
+                      SurahPage(number: s, initialAyah: settings.lastAyah),
+                ),
+              ),
+              child: Padding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                child: Row(
+                  children: [
+                    const Icon(Icons.menu_book, color: Color(0xFFF0C14B)),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'بەردەوامبوون لە خوێندنەوە',
+                            style: TextStyle(
+                                color: Color(0xCCFFFFFF), fontSize: 12.5),
+                          ),
+                          Text(
+                            '${info.ar} • ئایەتی ${settings.lastAyah}',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 19,
+                              fontWeight: FontWeight.bold,
+                              fontFamilyFallback: _arFonts,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const Icon(Icons.arrow_back, color: Colors.white),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class BookmarksPage extends StatelessWidget {
+  const BookmarksPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: settings,
+      builder: (context, _) {
+        final items = settings.marks.reversed.toList();
+        return Scaffold(
+          bottomNavigationBar: const PlayerBar(),
+          appBar: AppBar(
+            title: const Text('نیشانەکان',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+          body: items.isEmpty
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Text(
+                      'هێشتا هیچ ئایەتێکت نیشان نەکردووە. لە ناو سوورەت، دوگمەی نیشانە لەسەر ئایەتێک دابگرە.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                          fontSize: 15, height: 1.8, color: _mutedColor(context)),
+                    ),
+                  ),
+                )
+              : Center(
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 820),
+                    child: ListView.builder(
+                      padding: const EdgeInsets.fromLTRB(12, 8, 12, 24),
+                      itemCount: items.length,
+                      itemBuilder: (context, i) => _BookmarkTile(items[i]),
+                    ),
+                  ),
+                ),
+        );
+      },
+    );
+  }
+}
+
+class _BookmarkTile extends StatelessWidget {
+  final String k;
+  const _BookmarkTile(this.k);
+
+  @override
+  Widget build(BuildContext context) {
+    final parts = k.split(':');
+    final s = (int.tryParse(parts[0]) ?? 1).clamp(1, 114).toInt();
+    final a = int.tryParse(parts.length > 1 ? parts[1] : '1') ?? 1;
+    final info = kSurahs[s - 1];
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Material(
+        color: _cardColor(context),
+        clipBehavior: Clip.antiAlias,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(14),
+          side: BorderSide(color: _lineColor(context)),
+        ),
+        child: InkWell(
+          onTap: () => Navigator.of(context).push(
+            MaterialPageRoute<void>(
+              builder: (_) => SurahPage(number: s, initialAyah: a),
+            ),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(14, 10, 6, 10),
+            child: Row(
+              children: [
+                Expanded(
+                  child: FutureBuilder<List<Ayah>>(
+                    future: loadSurah(s),
+                    builder: (context, snap) {
+                      Ayah? ay;
+                      final list = snap.data;
+                      if (list != null) {
+                        for (final x in list) {
+                          if (x.n == a) ay = x;
+                        }
+                      }
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '${info.ar} • ئایەتی $a',
+                            style: const TextStyle(
+                              fontSize: 18,
+                              color: _gold,
+                              fontWeight: FontWeight.bold,
+                              fontFamilyFallback: _arFonts,
+                            ),
+                          ),
+                          if (ay != null) ...[
+                            const SizedBox(height: 6),
+                            Text(
+                              ay.ar,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              textDirection: TextDirection.rtl,
+                              style: TextStyle(
+                                fontSize: 20,
+                                height: 1.8,
+                                color: _inkColor(context),
+                                fontFamilyFallback: _arFonts,
+                              ),
+                            ),
+                            if ((ay.puxt ?? '').isNotEmpty)
+                              Text(
+                                ay.puxt!,
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 14,
+                                  height: 1.6,
+                                  color: _mutedColor(context),
+                                ),
+                              ),
+                          ],
+                        ],
+                      );
+                    },
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'سڕینەوە',
+                  onPressed: () => settings.toggleMark(s, a),
+                  icon: const Icon(Icons.delete_outline),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------- search ----------
+final RegExp _diac = RegExp('[\u064B-\u065F\u0670\u06D6-\u06ED\u0640]');
+final RegExp _alefs = RegExp('[\u0622\u0623\u0625\u0671]');
+
+String _norm(String s) {
+  var t = s.replaceAll(_diac, '').replaceAll(_alefs, '\u0627');
+  t = t
+      .replaceAll('\u0649', '\u06CC')
+      .replaceAll('\u064A', '\u06CC')
+      .replaceAll('\u0643', '\u06A9')
+      .replaceAll('\u0629', '\u0647')
+      .replaceAll('\u06D5', '\u0647');
+  return t.toLowerCase();
+}
+
+List<String> _buildIndex(Map<String, dynamic> all) {
+  final out = <String>[];
+  for (var n = 1; n <= 114; n++) {
+    final l = all['$n'] as List<dynamic>;
+    for (final e in l) {
+      final m = e as Map<String, dynamic>;
+      out.add(_norm(
+          '${m['ar'] ?? ''} ${m['puxt'] ?? ''} ${m['asan'] ?? ''}'));
+    }
+  }
+  return out;
+}
+
+class SearchPage extends StatefulWidget {
+  const SearchPage({super.key});
+
+  @override
+  State<SearchPage> createState() => _SearchPageState();
+}
+
+class _SearchPageState extends State<SearchPage> {
+  final TextEditingController _c = TextEditingController();
+  List<String> _index = [];
+  final List<List<int>> _pos = [];
+  List<List<int>> _res = [];
+  bool _loading = true;
+  String _q = '';
+  Timer? _t;
+
+  @override
+  void initState() {
+    super.initState();
+    _init();
+  }
+
+  @override
+  void dispose() {
+    _t?.cancel();
+    _c.dispose();
+    super.dispose();
+  }
+
+  Future<void> _init() async {
+    final all = await loadAll();
+    final idx = await compute(_buildIndex, all);
+    for (var n = 1; n <= 114; n++) {
+      final c = (all['$n'] as List<dynamic>).length;
+      for (var i = 0; i < c; i++) {
+        _pos.add([n, i]);
+      }
+    }
+    if (!mounted) return;
+    setState(() {
+      _index = idx;
+      _loading = false;
+    });
+    if (_c.text.trim().length >= 2) _run(_c.text);
+  }
+
+  void _onChanged(String v) {
+    _t?.cancel();
+    _t = Timer(const Duration(milliseconds: 300), () => _run(v));
+  }
+
+  void _run(String v) {
+    final q = _norm(v.trim());
+    final out = <List<int>>[];
+    if (q.length >= 2) {
+      for (var i = 0; i < _index.length && out.length < 80; i++) {
+        if (_index[i].contains(q)) out.add(_pos[i]);
+      }
+    }
+    setState(() {
+      _q = q;
+      _res = out;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: settings,
+      builder: (context, _) {
+        final tr = settings.tr == Tr.none ? Tr.puxt : settings.tr;
+        return Scaffold(
+          bottomNavigationBar: const PlayerBar(),
+          appBar: AppBar(
+            title: const Text('گەڕان لە ئایەتەکان',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+          body: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 820),
+              child: Column(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+                    child: TextField(
+                      controller: _c,
+                      autofocus: true,
+                      onChanged: _onChanged,
+                      decoration: InputDecoration(
+                        hintText: 'وشەیەک بنووسە (کوردی، عەرەبی، English)...',
+                        prefixIcon: const Icon(Icons.search),
+                        filled: true,
+                        fillColor: _cardColor(context),
+                        contentPadding: const EdgeInsets.symmetric(vertical: 12),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(14),
+                          borderSide: BorderSide(color: _lineColor(context)),
+                        ),
+                      ),
+                    ),
+                  ),
+                  if (_loading)
+                    const Padding(
+                      padding: EdgeInsets.all(28),
+                      child: CircularProgressIndicator(),
+                    )
+                  else if (_q.length >= 2 && _res.isEmpty)
+                    Padding(
+                      padding: const EdgeInsets.all(28),
+                      child: Text('هیچ ئایەتێک نەدۆزرایەوە',
+                          style: TextStyle(color: _mutedColor(context))),
+                    )
+                  else
+                    Expanded(
+                      child: ListView.builder(
+                        padding: const EdgeInsets.fromLTRB(12, 4, 12, 24),
+                        itemCount: _res.length,
+                        itemBuilder: (context, i) {
+                          final s = _res[i][0];
+                          final ay = _ayahFrom(
+                              (_all![ '$s' ] as List<dynamic>)[_res[i][1]]
+                                  as Map<String, dynamic>);
+                          final info = kSurahs[s - 1];
+                          final t = ay.tr(tr) ?? '';
+                          return Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 4),
+                            child: Material(
+                              color: _cardColor(context),
+                              clipBehavior: Clip.antiAlias,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(14),
+                                side: BorderSide(color: _lineColor(context)),
+                              ),
+                              child: InkWell(
+                                onTap: () => Navigator.of(context).push(
+                                  MaterialPageRoute<void>(
+                                    builder: (_) => SurahPage(
+                                        number: s, initialAyah: ay.n),
+                                  ),
+                                ),
+                                child: Padding(
+                                  padding: const EdgeInsets.fromLTRB(14, 10, 14, 12),
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        '${info.ar} • ئایەتی ${ay.n}',
+                                        style: const TextStyle(
+                                          fontSize: 17,
+                                          color: _gold,
+                                          fontWeight: FontWeight.bold,
+                                          fontFamilyFallback: _arFonts,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 6),
+                                      Text(
+                                        ay.ar,
+                                        maxLines: 2,
+                                        overflow: TextOverflow.ellipsis,
+                                        textDirection: TextDirection.rtl,
+                                        style: TextStyle(
+                                          fontSize: 20,
+                                          height: 1.8,
+                                          color: _inkColor(context),
+                                          fontFamilyFallback: _arFonts,
+                                        ),
+                                      ),
+                                      if (t.isNotEmpty)
+                                        Text(
+                                          t,
+                                          maxLines: 3,
+                                          overflow: TextOverflow.ellipsis,
+                                          textDirection: TextDirection.rtl,
+                                          style: TextStyle(
+                                            fontSize: 14,
+                                            height: 1.6,
+                                            color: _mutedColor(context),
+                                          ),
+                                        ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+
+// ============================================================
+//  Recitation coach (1/2) - pure logic: normalise, match, align
+// ============================================================
+const Map<int, int> _arFold = {
+  0x0622: 0x0627, 0x0623: 0x0627, 0x0625: 0x0627, 0x0671: 0x0627, // آ أ إ ٱ -> ا
+  0x0672: 0x0627, 0x0673: 0x0627,
+  0x0649: 0x064A, 0x06CC: 0x064A, 0x0626: 0x064A, // ى ی ئ -> ي
+  0x0624: 0x0648, // ؤ -> و
+  0x0629: 0x0647, 0x06D5: 0x0647, // ة ە -> ه
+  0x06A9: 0x0643, // ک -> ك
+};
+final RegExp _arStrip = RegExp(
+    '[ؐ-ًؚ-ٰٟۖ-ۭـ࣓-ࣿ​-‏]');
+final RegExp _arMatres = RegExp('[اوي]');
+
+/// Letters only: no harakat / Quranic marks, alef-forms, ya-forms, hamza folded.
+String _arNorm(String s) {
+  final sb = StringBuffer();
+  for (final r in s.replaceAll(_arStrip, '').runes) {
+    if (r == 0x0621) continue; // standalone hamza
+    final f = _arFold[r] ?? r;
+    if (f >= 0x0621 && f <= 0x064A) sb.writeCharCode(f);
+  }
+  return sb.toString();
+}
+
+/// Skeleton for comparing CONNECTED recitation with the expected text: letters
+/// only (no harakat), long-vowel letters (ا و ي) removed because a recogniser
+/// spells them unreliably, and a doubled letter written once (shadda, merged
+/// lam of al-). It has no spaces, so it does not matter where the recogniser
+/// put (or forgot) a word boundary.
+String _connSkel(String s) {
+  final sb = StringBuffer();
+  var last = -1;
+  for (final r in _arNorm(s).replaceAll(_arMatres, '').runes) {
+    if (r == last) continue;
+    sb.writeCharCode(r);
+    last = r;
+  }
+  return sb.toString();
+}
+
+/// Every letter of the whole Quran as one space-free chain (the same skeleton
+/// the coach uses for the open surah), so the coach can tell WHICH surah and
+/// ayah the reader is in, not only where inside the open surah. Built once in
+/// the background from quran.json (a few surahs per step, the screen stays
+/// smooth); until it is ready the coach simply searches the open surah.
+class _QuranIndex {
+  static _QuranIndex? ready;
+  static Future<void>? _job;
+
+  /// Every word of the Quran (letters only, long-vowel letters removed): tells
+  /// a REAL Quran word (what the reader said instead) from recogniser noise.
+  static Set<String>? vocab;
+
+  final Uint16List text; // the letters
+  final Uint8List surahOf; // surah number of each letter
+  final Int32List where; // ayah * 1024 + word inside the ayah (0-based)
+  final Int32List _ends; // work row of the matcher, kept between calls
+  final Int64List _peq = Int64List(0x50); // letter -> pattern mask
+
+  _QuranIndex._(this.text, this.surahOf, this.where)
+      : _ends = Int32List(text.length + 1);
+
+  /// Starts building the index (once). Safe to call at every session.
+  static void warmUp() {
+    if (!kGlobalFinder || ready != null || _job != null) return;
+    _job = _build().catchError((Object _) {
+      _job = null; // try again at the next session
+    });
+  }
+
+  static Future<void> _build() async {
+    final all = await loadAll();
+    final ws = RegExp(r'\s+');
+    final letters = <int>[];
+    final surahs = <int>[];
+    final where = <int>[];
+    final vocabSet = <String>{};
+    for (var sn = 1; sn <= 114; sn++) {
+      final list = all['$sn'] as List<dynamic>?;
+      if (list == null) continue;
+      for (final e in list) {
+        final m = e as Map<String, dynamic>;
+        final n = m['n'] as int;
+        var wi = 0;
+        for (final tok in (m['ar'] as String).split(ws)) {
+          if (tok.isEmpty) continue;
+          final w = _arNorm(tok);
+          if (w.isEmpty) continue; // same words as the coach's own chain
+          vocabSet.add(w.replaceAll(_arMatres, ''));
+          for (final c in _connSkel(w).codeUnits) {
+            letters.add(c);
+            surahs.add(sn);
+            where.add(n * 1024 + wi);
+          }
+          wi++;
+        }
+      }
+      if (sn % 6 == 0) await Future<void>.delayed(Duration.zero);
+    }
+    vocab = vocabSet;
+    ready = _QuranIndex._(Uint16List.fromList(letters),
+        Uint8List.fromList(surahs), Int32List.fromList(where));
+  }
+
+  /// Best place of [pat] (a letter chain, at most 60 letters) in the whole
+  /// Quran: [end index (exclusive), edits, edits of the best OTHER place], or
+  /// null. The same bit-parallel approximate matcher as the open-surah search.
+  List<int>? locate(String pat) {
+    final n = pat.length;
+    final m = text.length;
+    if (n == 0 || m == 0 || n > 60) return null;
+    final peq = _peq;
+    for (var i = 0; i < peq.length; i++) {
+      peq[i] = 0;
+    }
+    for (var i = 0; i < n; i++) {
+      final c = pat.codeUnitAt(i) - 0x621;
+      if (c >= 0 && c < peq.length) peq[c] |= 1 << i;
+    }
+    final mask = (1 << n) - 1;
+    final high = 1 << (n - 1);
+    var pv = mask;
+    var mv = 0;
+    var score = n;
+    final ends = _ends;
+    ends[0] = n;
+    for (var j = 1; j <= m; j++) {
+      final c = text[j - 1] - 0x621;
+      final eq = (c >= 0 && c < peq.length) ? peq[c] : 0;
+      final xv = eq | mv;
+      final xh = ((((eq & pv) + pv) ^ pv) | eq) & mask;
+      var ph = (mv | ~(xh | pv)) & mask;
+      final mh = pv & xh;
+      if ((ph & high) != 0) {
+        score++;
+      } else if ((mh & high) != 0) {
+        score--;
+      }
+      ph = (ph << 1) & mask;
+      pv = (((mh << 1) & mask) | ~(xv | ph)) & mask;
+      mv = ph & xv;
+      ends[j] = score;
+    }
+    var bj = 1;
+    for (var j = 2; j <= m; j++) {
+      if (ends[j] < ends[bj]) bj = j;
+    }
+    var other = n;
+    for (var j = 1; j <= m; j++) {
+      if ((j - bj).abs() > n + 2 && ends[j] < other) other = ends[j];
+    }
+    return [bj, ends[bj], other];
+  }
+}
+
+/// [expected] (a skeleton) is inside [heard] (a skeleton). Exact on purpose;
+/// the only slack is the first letter of a longer phrase, which recognisers
+/// often lose when the reader joins it to the sound before (the ب of بِسْمِ).
+bool _connContains(String heard, String expected, int level) {
+  if (expected.length < 4) return false; // too short to prove anything
+  if (heard.contains(expected)) return true;
+  if (level >= 3) return false; // strict: exact only
+  if (expected.length >= 6 && heard.contains(expected.substring(1))) return true;
+  // easy: one wrong or missing letter in a long chain is forgiven
+  return level == 1 && expected.length >= 8 && _bestSubstringDist(heard, expected) <= 1;
+}
+
+/// Fewest edits that turn [pat] into some part of [text].
+int _bestSubstringDist(String text, String pat) {
+  if (pat.isEmpty) return 0;
+  final n = pat.length;
+  var prev = List<int>.generate(n + 1, (i) => i);
+  var cur = List<int>.filled(n + 1, 0); // cur[0] stays 0: free start
+  var best = prev[n];
+  for (var j = 1; j <= text.length; j++) {
+    final tj = text.codeUnitAt(j - 1);
+    for (var i = 1; i <= n; i++) {
+      final c = pat.codeUnitAt(i - 1) == tj ? 0 : 1;
+      var v = prev[i - 1] + c;
+      if (prev[i] + 1 < v) v = prev[i] + 1;
+      if (cur[i - 1] + 1 < v) v = cur[i - 1] + 1;
+      cur[i] = v;
+    }
+    if (cur[n] < best) best = cur[n];
+    final t = prev;
+    prev = cur;
+    cur = t;
+  }
+  return best;
+}
+
+int _lev(String a, String b) {
+  if (a == b) return 0;
+  if (a.isEmpty) return b.length;
+  if (b.isEmpty) return a.length;
+  var prev = List<int>.generate(b.length + 1, (i) => i);
+  var cur = List<int>.filled(b.length + 1, 0);
+  for (var i = 1; i <= a.length; i++) {
+    cur[0] = i;
+    for (var j = 1; j <= b.length; j++) {
+      final c = a.codeUnitAt(i - 1) == b.codeUnitAt(j - 1) ? 0 : 1;
+      var v = cur[j - 1] + 1;
+      if (prev[j] + 1 < v) v = prev[j] + 1;
+      if (prev[j - 1] + c < v) v = prev[j - 1] + c;
+      cur[j] = v;
+    }
+    final t = prev;
+    prev = cur;
+    cur = t;
+  }
+  return prev[b.length];
+}
+
+double _sim(String a, String b) {
+  final m = a.length > b.length ? a.length : b.length;
+  if (m == 0) return 0;
+  return 1 - _lev(a, b) / m;
+}
+
+/// Tolerant word comparison (speech recognisers spell Arabic differently
+/// from the Uthmani script, e.g. العالمين / العلمين).
+bool _sameWord(String h, String e, double thr) {
+  if (h.isEmpty || e.isEmpty) return false;
+  if (h == e) return true;
+  final sh = h.replaceAll(_arMatres, '');
+  final se = e.replaceAll(_arMatres, '');
+  if (sh.length >= 2 && sh == se) return true;
+  final m = h.length > e.length ? h.length : e.length;
+  if (m <= 2) return false;
+  if ((h.length - e.length).abs() > m * (1 - thr)) return false;
+  return 1 - _lev(h, e) / m >= thr;
+}
+
+// ============================================================
+//  Phonetic layer - Shamsi/Qamari assimilation + Wasl chaining
+//  Pure Dart (no packages). kPhoneticLayer = false switches it off
+//  everywhere, and the coach then behaves exactly as it did before.
+//
+//  1. Shamsi / Qamari: the lam of "al-" is not pronounced before a sun
+//     letter and the sun letter is doubled instead:
+//        ٱلرَّحْمَٰنِ  ->  "ar-rahman"  (not "al-rahman")
+//     Before a moon letter the lam stays:  ٱلْحَمْدُ -> "al-hamd".
+//     The vowelled text decides (bare lam + shadda on the next letter);
+//     words like ٱلَّذِينَ / ٱلَّيْلِ, whose lam carries its own shadda,
+//     are therefore never mistaken for a sun-letter article.
+//  2. Wasl: the alef of wasl (ٱ) is silent when the word is joined to the
+//     word before it, so the words are compared as one space-free chain:
+//        بِسْمِ ٱللَّهِ  ->  "bismillah"
+//  Words that come from a speech recogniser have no vowel marks, so the
+//  same rules are applied there letter by letter (_forms).
+// ============================================================
+const bool kPhoneticLayer = true;
+
+/// Pronunciation of one Quran word, derived from its vowelled (Uthmani) text.
+class PhoneticWord {
+  /// The original token, e.g. ٱلرَّحْمَٰنِ
+  final String surface;
+
+  /// Letters only, identical to _arNorm(surface).
+  final String ortho;
+
+  /// How the word sounds when it is said alone: the lam of al- before a sun
+  /// letter is gone, letters with shadda are doubled, letters that are never
+  /// pronounced (the alef after waw al-jama'a, the alef of wasl after a
+  /// prefix such as و ب ف) are left out.  ٱلرَّحْمَٰنِ -> "اررحمن"
+  final String sounded;
+
+  /// Like [sounded], but only the doublings that normal Arabic spelling also
+  /// shows (al- + sun letter, merged lam of الليل). This is the form that
+  /// can be compared with recogniser text.
+  final String spell;
+
+  /// Starts with al- (possibly after a prefix letter).
+  final bool hasArticle;
+
+  /// The lam of al- is merged into the following sun letter.
+  final bool assimilated;
+
+  /// Starts with the alef of wasl: that alef is silent when the word is
+  /// joined to the previous word.
+  final bool waslStart;
+
+  /// Ends with a long-vowel letter (ا و ي) that is shortened when the next
+  /// word starts with the alef of wasl (فِى ٱلْأَرْضِ is said "fil ard").
+  final bool endsWithMadd;
+
+  /// Indexes into [ortho] of the letters that are never pronounced (the
+  /// assimilated lam of al-, the wasl alef after a prefix).
+  final Set<int> silent;
+
+  PhoneticWord({
+    required this.surface,
+    required this.ortho,
+    required this.sounded,
+    required this.spell,
+    required this.hasArticle,
+    required this.assimilated,
+    required this.waslStart,
+    required this.endsWithMadd,
+    required this.silent,
+  });
+}
+
+class _Gl {
+  final int base;
+  final Set<int> marks = <int>{};
+  _Gl(this.base);
+}
+
+class _Form {
+  final String text;
+  final bool article; // al- hypothesis of a word without prefix letter
+  const _Form(this.text, this.article);
+}
+
+class QuranPhonetics {
+  QuranPhonetics._();
+
+  static const int _waslaAlef = 0x0671;
+  static const int _lam = 0x0644;
+  static const int _shadda = 0x0651;
+  static const int _silentMark = 0x06DF; // small high zero: letter not read
+  static const String _alefS = '\u0627';
+  static const String _sun = 'تثدذرزسشصضطظلن';
+  static const String _prefixChars = 'وفبكلت';
+  static const Set<int> _prefixCodes = {
+    0x0648, 0x0641, 0x0628, 0x0643, 0x0644, 0x062A, // و ف ب ك ل ت
+  };
+  // words whose first lam is part of the word itself (al-ladhi, at-ti):
+  // the lam is doubled, it is NOT an assimilated article
+  static const Set<String> _relative = {
+    'الذي',
+    'الذين',
+    'التي',
+    'الذان',
+    'التان',
+  };
+  static const Set<int> _vowelMarks = {
+    0x064B, 0x064C, 0x064D, 0x064E, 0x064F, 0x0650, 0x0651, 0x0652, 0x06DF,
+  };
+  static const Set<int> _tanween = {0x064B, 0x064C, 0x064D};
+
+  static bool _isMark(int r) =>
+      (r >= 0x0610 && r <= 0x061A) ||
+      (r >= 0x064B && r <= 0x065F) ||
+      r == 0x0670 ||
+      (r >= 0x06D6 && r <= 0x06ED) ||
+      r == 0x0640 ||
+      (r >= 0x08D3 && r <= 0x08FF) ||
+      (r >= 0x200B && r <= 0x200F);
+
+  /// Folded letter code, or 0 when the character does not count
+  /// (same rules as _arNorm).
+  static int _letter(int r) {
+    if (r == 0x0621) return 0;
+    final f = _arFold[r] ?? r;
+    return (f >= 0x0621 && f <= 0x064A) ? f : 0;
+  }
+
+  static bool _hasAny(Set<int> a, Set<int> b) {
+    for (final x in b) {
+      if (a.contains(x)) return true;
+    }
+    return false;
+  }
+
+  // ---------- 1. analysis of a vowelled word ----------
+
+  /// Analyses one vowelled token (as it is written in quran.json).
+  static PhoneticWord analyze(String token) {
+    final gl = <_Gl>[];
+    for (final r in token.runes) {
+      if (_isMark(r)) {
+        if (gl.isNotEmpty) gl.last.marks.add(r);
+      } else {
+        gl.add(_Gl(r));
+      }
+    }
+    final n = gl.length;
+
+    // al- at the start (after at most two prefix letters). In the Uthmani
+    // script its alef is always the alef of wasl.
+    var ai = -1;
+    for (var i = 0; i < n && i <= 2; i++) {
+      if (gl[i].base == _waslaAlef) {
+        if (i + 1 < n && gl[i + 1].base == _lam) ai = i;
+        break;
+      }
+      if (!_prefixCodes.contains(gl[i].base)) break;
+    }
+
+    final ortho = StringBuffer();
+    final sounded = StringBuffer();
+    final spell = StringBuffer();
+    final silent = <int>{};
+    var assimilated = false;
+    var oi = 0;
+    for (var k = 0; k < n; k++) {
+      final g = gl[k];
+      final f = _letter(g.base);
+      if (f == 0) continue;
+      final c = String.fromCharCode(f);
+      ortho.write(c);
+      final idx = oi;
+      oi++;
+      // bare lam of al- followed by a letter with shadda: sun letter, the
+      // lam is not pronounced
+      if (ai >= 0 &&
+          k == ai + 1 &&
+          g.marks.isEmpty &&
+          k + 1 < n &&
+          gl[k + 1].marks.contains(_shadda) &&
+          _letter(gl[k + 1].base) != 0) {
+        silent.add(idx);
+        assimilated = true;
+        continue;
+      }
+      // alef of wasl right after a prefix letter (وَٱلشَّمْسِ): never sounded
+      if (ai > 0 && k == ai) {
+        silent.add(idx);
+        continue;
+      }
+      final dbl = g.marks.contains(_shadda);
+      // the letter that carries the doubling of an al- merge: the sun letter
+      // after the silent lam, or the lam of ٱلَّذِي / ٱلَّيْلِ
+      final merged = ai >= 0 &&
+          dbl &&
+          ((k == ai + 1 && f == _lam) || (k == ai + 2 && assimilated));
+      if (!g.marks.contains(_silentMark)) sounded.write(dbl ? c + c : c);
+      spell.write(dbl && merged ? c + c : c);
+    }
+
+    var madd = false;
+    var last = -1;
+    for (var k = n - 1; k >= 0; k--) {
+      if (_letter(gl[k].base) != 0) {
+        last = k;
+        break;
+      }
+    }
+    if (last > 0) {
+      final lf = _letter(gl[last].base);
+      final m = gl[last].marks;
+      final pm = gl[last - 1].marks;
+      if ((lf == 0x0627 || lf == 0x0648 || lf == 0x064A) &&
+          !_hasAny(m, _vowelMarks)) {
+        final need = lf == 0x0627 ? 0x064E : (lf == 0x0648 ? 0x064F : 0x0650);
+        madd = pm.contains(need) || (lf == 0x0627 && !_hasAny(pm, _tanween));
+      }
+    }
+
+    return PhoneticWord(
+      surface: token,
+      ortho: ortho.toString(),
+      sounded: sounded.toString(),
+      spell: spell.toString(),
+      hasArticle: ai >= 0,
+      assimilated: assimilated,
+      waslStart: n > 0 && gl[0].base == _waslaAlef,
+      endsWithMadd: madd,
+      silent: silent,
+    );
+  }
+
+  // ---------- 2. chains (wasl: no spaces between words) ----------
+
+  /// The words written as one string without spaces. The alef of wasl is
+  /// dropped for every word that is joined to the one before it; with
+  /// [sounded] (full pronunciation) a long vowel in front of it is shortened
+  /// as well. [startOfUtterance] false means the first word is also joined
+  /// to something the reader said before.
+  static String chain(
+    List<PhoneticWord> ws, {
+    bool sounded = true,
+    bool startOfUtterance = true,
+    bool elideMadd = true,
+  }) {
+    final parts = <String>[];
+    for (var i = 0; i < ws.length; i++) {
+      var t = sounded ? ws[i].sounded : ws[i].spell;
+      final joined = i > 0 || !startOfUtterance;
+      if (joined && ws[i].waslStart && t.startsWith(_alefS)) {
+        t = t.substring(1);
+        if (sounded &&
+            elideMadd &&
+            i > 0 &&
+            parts.isNotEmpty &&
+            ws[i - 1].endsWithMadd &&
+            parts.last.isNotEmpty) {
+          parts[parts.length - 1] =
+              parts.last.substring(0, parts.last.length - 1);
+        }
+      }
+      parts.add(t);
+    }
+    return parts.join();
+  }
+
+  // ---------- 3. recogniser text (no vowel marks) ----------
+
+  static final Map<String, List<_Form>> _formsCache = <String, List<_Form>>{};
+
+  /// Possible pronunciations of a plain skeleton: [0] is the skeleton itself,
+  /// [1] (when it looks like al- + noun) has the lam merged into a sun letter.
+  static List<_Form> _forms(String sk) {
+    final hit = _formsCache[sk];
+    if (hit != null) return hit;
+    if (_formsCache.length > 30000) _formsCache.clear();
+    final out = <_Form>[_Form(sk, false)];
+    var at = -1;
+    for (var p = 0; p <= 2 && p + 1 < sk.length; p++) {
+      if (p > 0 && !_prefixChars.contains(sk[p - 1])) break;
+      if (sk[p] == _alefS && sk[p + 1] == '\u0644') {
+        at = p;
+        break;
+      }
+    }
+    if (at >= 0) {
+      final base = sk.substring(at);
+      if (base.length >= 4) {
+        final head = sk.substring(0, at) + (at == 0 ? _alefS : '');
+        String text;
+        if (_relative.contains(base)) {
+          text = head + '\u0644\u0644' + base.substring(2);
+        } else if (_sun.contains(base[2])) {
+          text = head + base[2] + base[2] + base.substring(3);
+        } else {
+          text = head + base.substring(1);
+        }
+        out.add(_Form(text, at == 0));
+      }
+    }
+    _formsCache[sk] = out;
+    return out;
+  }
+
+  /// Extra word test used next to _sameWord: [h] (heard) and [e] (expected)
+  /// are plain skeletons; [alts] are the expected word's own pronunciations
+  /// taken from its vowelled text. True when they agree once al- is merged
+  /// into the sun letter. The plain-with-plain case is left to _sameWord.
+  static bool sameSpelling(String h, String e, double thr,
+      [Iterable<String>? alts]) {
+    final fh = _forms(h);
+    final ce = <String>[];
+    for (final f in _forms(e)) {
+      ce.add(f.text);
+    }
+    if (alts != null) {
+      for (final a in alts) {
+        ce.add(a);
+        final fa = _forms(a);
+        for (var i = 1; i < fa.length; i++) {
+          ce.add(fa[i].text);
+        }
+      }
+    }
+    for (var i = 0; i < fh.length; i++) {
+      for (var j = 0; j < ce.length; j++) {
+        if (i == 0 && j == 0) continue;
+        if (fh[i].text == ce[j] || _sameWord(fh[i].text, ce[j], thr)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /// Every way the heard words can be written as one space-free chain.
+  static List<String> heardChains(List<String> tokens) {
+    var combos = <String>[''];
+    for (var j = 0; j < tokens.length; j++) {
+      final fs = <String>[];
+      for (final f in _forms(tokens[j])) {
+        var t = f.text;
+        if (j > 0 && f.article && t.startsWith(_alefS)) t = t.substring(1);
+        if (!fs.contains(t)) fs.add(t);
+        if (j > 0 && t.length > 1 && t.startsWith(_alefS)) {
+          final d = t.substring(1);
+          if (!fs.contains(d)) fs.add(d);
+        }
+      }
+      final next = <String>[];
+      for (final c in combos) {
+        for (final t in fs) {
+          next.add(c + t);
+        }
+      }
+      combos = next;
+    }
+    return combos;
+  }
+
+  /// The heard words (plain skeletons) and the expected words give exactly the
+  /// same chain, wherever the recogniser put its spaces. Exact on purpose: a
+  /// wrong word inside a long chain must never be averaged away.
+  static bool chainEquals(List<String> heard, List<PhoneticWord> expected) {
+    var e = chain(expected, sounded: false);
+    if (e.startsWith(_alefS)) e = e.substring(1);
+    if (e.length < 4) return false;
+    for (final h in heardChains(heard)) {
+      final hh = h.startsWith(_alefS) ? h.substring(1) : h;
+      if (hh == e) return true;
+    }
+    return false;
+  }
+}
+
+
+class AlignEvent {
+  final int g; // global word index of the mistake
+  final bool skipped; // true: word(s) left out, false: wrong word
+  final String heard;
+  final String expected; // normalised expected word
+  const AlignEvent(this.g, this.skipped, this.heard, [this.expected = '']);
+}
+
+/// Which letters of the expected word were read wrongly (letter-by-letter).
+class LetterDiff {
+  final Set<int> bad; // indexes into the normalised expected word
+  final List<String> notes; // Kurdish explanation, one line per letter
+  const LetterDiff(this.bad, this.notes);
+}
+
+bool _isMatres(String ch) => ch == 'ا' || ch == 'و' || ch == 'ي';
+
+/// true = easy / balanced levels also correct a letter that was replaced by a
+/// look-alike one (علیهم heard as عليكم). false = the old forgiving behaviour.
+const bool kLetterMixGuard = true;
+
+/// true = easy / balanced levels flag a word when the reader said a DIFFERENT
+/// letter in it (not only look-alike pairs): the word counts exactly as heard.
+const bool kAnyLetterGuard = true;
+
+/// true = level 1 (easy) uses the engine's normal word matching instead of the
+/// forgiving one, so a misread word is not confirmed by the engine itself.
+const bool kEasyUsesNormalMatching = true;
+
+/// true = easy / balanced levels also correct a changed vowel (kasra heard as
+/// damma: رَبِّهِمْ read as رَبِّهُمْ). The word turns red and only the wrong
+/// harakah is marked.
+const bool kVowelMixGuard = true;
+
+const Map<int, String> _vowelNameKu = <int, String>{
+  0x064E: 'فەتحە (ـَ)',
+  0x064F: 'زەمە (ـُ)',
+  0x0650: 'کەسرە (ـِ)',
+};
+
+/// Letters a reader really mixes up (not only the recogniser's spelling).
+const List<String> _kMixGroups = [
+  'هحخ', 'هك', 'سصث', 'تط', 'دض', 'ذزظ', 'ضظ', 'قك', 'عغ',
+];
+
+bool _mixable(String a, String b) {
+  if (a == b) return false;
+  for (final g in _kMixGroups) {
+    if (g.contains(a) && g.contains(b)) return true;
+  }
+  return false;
+}
+
+/// [heard] and [expected] are normalised words. When, ignoring ا و ي, they are
+/// the same except for ONE letter replaced by a look-alike one, returns
+/// [expected letter, heard letter]; otherwise null.
+List<String>? _mixSlip(String heard, String expected, {bool any = false}) {
+  if (!kLetterMixGuard) return null;
+  final h = heard.replaceAll(_arMatres, '');
+  final e = expected.replaceAll(_arMatres, '');
+  if (e.length < 3 || h.length != e.length) return null;
+  List<String>? hit;
+  for (var i = 0; i < e.length; i++) {
+    if (h[i] == e[i]) continue;
+    if (hit != null) return null;
+    // any = easy / balanced: ANY other consonant counts as a misread word, but
+    // the last letter is left alone (idgham / iqlab / stopping change it)
+    if (!_mixable(e[i], h[i]) && !(any && i < e.length - 1)) return null;
+    hit = [e[i], h[i]];
+  }
+  return hit;
+}
+
+/// Compares the heard word with the expected one letter by letter.
+/// Long-vowel letters (ا و ي) are ignored because recognisers spell them
+/// inconsistently.
+LetterDiff _letterDiff(String heard, String expected, [Set<int>? silent]) {
+  final n = expected.length;
+  final m = heard.length;
+  final d = List<List<int>>.generate(n + 1, (_) => List<int>.filled(m + 1, 0));
+  for (var i = 0; i <= n; i++) {
+    d[i][0] = i;
+  }
+  for (var j = 0; j <= m; j++) {
+    d[0][j] = j;
+  }
+  for (var i = 1; i <= n; i++) {
+    for (var j = 1; j <= m; j++) {
+      final c = expected[i - 1] == heard[j - 1] ? 0 : 1;
+      var v = d[i - 1][j - 1] + c;
+      if (d[i - 1][j] + 1 < v) v = d[i - 1][j] + 1;
+      if (d[i][j - 1] + 1 < v) v = d[i][j - 1] + 1;
+      d[i][j] = v;
+    }
+  }
+  final bad = <int>{};
+  final notes = <String>[];
+  var i = n;
+  var j = m;
+  while (i > 0 || j > 0) {
+    if (i > 0 &&
+        j > 0 &&
+        d[i][j] == d[i - 1][j - 1] + (expected[i - 1] == heard[j - 1] ? 0 : 1)) {
+      if (expected[i - 1] != heard[j - 1] &&
+          !_isMatres(expected[i - 1]) &&
+          !_isMatres(heard[j - 1]) &&
+          !(silent != null && silent.contains(i - 1))) {
+        bad.add(i - 1);
+        notes.add('پیتی «${expected[i - 1]}» وەک «${heard[j - 1]}» بیستراوە');
+      }
+      i--;
+      j--;
+    } else if (i > 0 && d[i][j] == d[i - 1][j] + 1) {
+      if (!_isMatres(expected[i - 1]) &&
+          !(silent != null && silent.contains(i - 1))) {
+        bad.add(i - 1);
+        notes.add('پیتی «${expected[i - 1]}» نەبیستراوە');
+      }
+      i--;
+    } else {
+      if (j > 0 && !_isMatres(heard[j - 1])) {
+        notes.add('پیتی زیادەی «${heard[j - 1]}»');
+      }
+      j--;
+    }
+  }
+  return LetterDiff(bad, notes.reversed.toList());
+}
+
+class _Cluster {
+  String text;
+  final int idx; // index into the normalised word, -1 = no letter
+  _Cluster(this.text, this.idx);
+}
+
+/// Splits a vowelled Arabic word into letter + its marks, with the index the
+/// letter has in _arNorm(word).
+List<_Cluster> _clusters(String token) {
+  final out = <_Cluster>[];
+  var idx = 0;
+  for (final r in token.runes) {
+    final ch = String.fromCharCode(r);
+    var contributes = false;
+    if (!_arStrip.hasMatch(ch) && r != 0x0621) {
+      final f = _arFold[r] ?? r;
+      contributes = f >= 0x0621 && f <= 0x064A;
+    }
+    if (contributes || out.isEmpty) {
+      out.add(_Cluster(ch, contributes ? idx : -1));
+      if (contributes) idx++;
+    } else {
+      out.last.text += ch;
+    }
+  }
+  return out;
+}
+
+// ---------- granular error marks: the exact letter / sign inside a word ----------
+const int _kShadda = 0x0651;
+bool _isSignRune(int r) => (r >= 0x064B && r <= 0x0653) || r == 0x0670;
+bool _isVowelRune(int r) => r == 0x064E || r == 0x064F || r == 0x0650;
+bool _isTanweenRune(int r) => r >= 0x064B && r <= 0x064D;
+int _foldRune(int r) => _arFold[r] ?? r;
+
+/// Key of one faulty glyph inside a word: position of its letter cluster and
+/// the sign (a harakah, shaddah, tanween, madd sign), or 0 = the letter itself.
+int _faultKey(int pos, int code) => pos * 0x10000 + code;
+
+/// The signs (harakat, shaddah, tanween, madd signs) written on one cluster.
+List<int> _signsOf(_Cluster c) {
+  final out = <int>[];
+  var first = true;
+  for (final r in c.text.runes) {
+    if (first) {
+      first = false;
+      continue;
+    }
+    if (_isSignRune(r)) out.add(r);
+  }
+  return out;
+}
+
+/// What kind of sign the engine's tajweed error is about (best effort: the
+/// error maps are searched for the rule's name, Arabic or English).
+Set<String> _faultKinds(List<dynamic>? errs) {
+  final out = <String>{};
+  if (errs == null) return out;
+  final madd = RegExp(r'madd|(?<![\u0621-\u064A])ال?مد(?![\u0621-\u064A])');
+  for (final e in errs) {
+    final t = '$e'.toLowerCase();
+    if (madd.hasMatch(t)) out.add('madd');
+    if (t.contains('shadd') ||
+        t.contains('tashdid') ||
+        t.contains('ghunna') ||
+        t.contains('idgham') ||
+        t.contains('شدة') ||
+        t.contains('تشديد') ||
+        t.contains('غنة') ||
+        t.contains('إدغام') ||
+        t.contains('ادغام')) {
+      out.add('shadda');
+    }
+    if (t.contains('tanw') || t.contains('تنوين') || t.contains('تنوین')) {
+      out.add('tanween');
+    }
+  }
+  return out;
+}
+
+/// Faulty glyphs of the expected word for the given kinds of error.
+Set<int> _kindFaults(List<_Cluster> cl, Set<String> kinds) {
+  final out = <int>{};
+  if (kinds.isEmpty) return out;
+  for (var p = 0; p < cl.length; p++) {
+    final sg = _signsOf(cl[p]);
+    if (kinds.contains('shadda') && sg.contains(_kShadda)) {
+      out.add(_faultKey(p, _kShadda));
+    }
+    if (kinds.contains('tanween')) {
+      for (final r in sg) {
+        if (_isTanweenRune(r)) out.add(_faultKey(p, r));
+      }
+    }
+    if (kinds.contains('madd')) {
+      for (final r in sg) {
+        if (r == 0x0653 || r == 0x0670) out.add(_faultKey(p, r));
+      }
+      // the long-vowel letter that carries the madd: ا after fatha,
+      // و after damma, ي after kasra
+      if (p > 0) {
+        final base = _foldRune(cl[p].text.runes.first);
+        final prev = _signsOf(cl[p - 1]);
+        final carries = (base == 0x0627 && prev.contains(0x064E)) ||
+            (base == 0x0648 && prev.contains(0x064F)) ||
+            (base == 0x064A && prev.contains(0x0650));
+        final plainLetter = !sg.any((r) => _isVowelRune(r) || r == _kShadda);
+        if (carries && plainLetter) out.add(_faultKey(p, 0));
+      }
+    }
+  }
+  return out;
+}
+
+/// Where in [text] the pattern [pat] fits best (fewest edits): [start, end
+/// (exclusive), edits]. Among equal fits the latest one wins: the word was
+/// said just now.
+List<int> _approxLocate(String text, String pat) {
+  final n = pat.length;
+  final m = text.length;
+  if (n == 0 || m == 0) return [0, 0, n];
+  var prev = List<int>.generate(n + 1, (i) => i);
+  var cur = List<int>.filled(n + 1, 0); // cur[0] stays 0: free start
+  var bestCost = prev[n];
+  var bestEnd = 0;
+  for (var j = 1; j <= m; j++) {
+    final tj = text.codeUnitAt(j - 1);
+    for (var i = 1; i <= n; i++) {
+      final c = pat.codeUnitAt(i - 1) == tj ? 0 : 1;
+      var v = prev[i - 1] + c;
+      if (prev[i] + 1 < v) v = prev[i] + 1;
+      if (cur[i - 1] + 1 < v) v = cur[i - 1] + 1;
+      cur[i] = v;
+    }
+    if (cur[n] <= bestCost) {
+      bestCost = cur[n];
+      bestEnd = j;
+    }
+    final t = prev;
+    prev = cur;
+    cur = t;
+  }
+  if (bestEnd == 0) return [0, 0, n];
+  // the start: run the same search backwards from the end
+  final rp = String.fromCharCodes(pat.codeUnits.reversed);
+  final rt = String.fromCharCodes(text.substring(0, bestEnd).codeUnits.reversed);
+  for (var i = 0; i <= n; i++) {
+    prev[i] = i;
+    cur[i] = 0;
+  }
+  var len = bestEnd;
+  for (var j = 1; j <= rt.length; j++) {
+    final tj = rt.codeUnitAt(j - 1);
+    for (var i = 1; i <= n; i++) {
+      final c = rp.codeUnitAt(i - 1) == tj ? 0 : 1;
+      var v = prev[i - 1] + c;
+      if (prev[i] + 1 < v) v = prev[i] + 1;
+      if (cur[i - 1] + 1 < v) v = cur[i - 1] + 1;
+      cur[i] = v;
+    }
+    if (cur[n] == bestCost) {
+      len = j;
+      break;
+    }
+    final t = prev;
+    prev = cur;
+    cur = t;
+  }
+  return [bestEnd - len, bestEnd, bestCost];
+}
+
+/// Pairs (expected cluster, heard cluster) that carry the same letter.
+List<List<int>> _alignClusters(List<_Cluster> e, List<_Cluster> h) {
+  int base(_Cluster c) => _foldRune(c.text.runes.first);
+  final n = e.length;
+  final m = h.length;
+  final d = List<List<int>>.generate(n + 1, (_) => List<int>.filled(m + 1, 0));
+  for (var i = 0; i <= n; i++) {
+    d[i][0] = i;
+  }
+  for (var j = 0; j <= m; j++) {
+    d[0][j] = j;
+  }
+  for (var i = 1; i <= n; i++) {
+    for (var j = 1; j <= m; j++) {
+      final c = base(e[i - 1]) == base(h[j - 1]) ? 0 : 1;
+      var v = d[i - 1][j - 1] + c;
+      if (d[i - 1][j] + 1 < v) v = d[i - 1][j] + 1;
+      if (d[i][j - 1] + 1 < v) v = d[i][j - 1] + 1;
+      d[i][j] = v;
+    }
+  }
+  final out = <List<int>>[];
+  var i = n;
+  var j = m;
+  while (i > 0 && j > 0) {
+    final same = base(e[i - 1]) == base(h[j - 1]);
+    if (d[i][j] == d[i - 1][j - 1] + (same ? 0 : 1)) {
+      if (same) out.add([i - 1, j - 1]);
+      i--;
+      j--;
+    } else if (d[i][j] == d[i - 1][j] + 1) {
+      i--;
+    } else {
+      j--;
+    }
+  }
+  return out.reversed.toList();
+}
+
+/// The pieces of one letter cluster: the letter and each of its signs, with
+/// only the faulty ones in red; the rest of the word keeps its normal colour.
+List<TextSpan> _signSpans(_Cluster c, int p, Set<int> faults, TextStyle plain,
+    TextStyle hot, Color host) {
+  final runes = c.text.runes.toList();
+  var markFault = false;
+  for (var k = 1; k < runes.length; k++) {
+    if (faults.contains(_faultKey(p, runes[k]))) markFault = true;
+  }
+  final letterFault = faults.contains(_faultKey(p, 0));
+  final out = <TextSpan>[
+    TextSpan(
+      text: String.fromCharCode(runes[0]),
+      style: letterFault
+          ? hot.copyWith(backgroundColor: const Color(0x66E53935))
+          // a tiny sign is hard to see: its letter gets a faint pointer
+          : (markFault ? plain.copyWith(backgroundColor: host) : plain),
+    ),
+  ];
+  for (var k = 1; k < runes.length; k++) {
+    out.add(TextSpan(
+      text: String.fromCharCode(runes[k]),
+      style: faults.contains(_faultKey(p, runes[k]))
+          ? hot.copyWith(fontWeight: FontWeight.normal)
+          : plain,
+    ));
+  }
+  return out;
+}
+
+/// Follows the reader through the flat list of expected words.
+/// st[i]: 0 not read yet, 1 read correctly, 2 mistake.
+class RecitationAligner {
+  final List<String> words;
+  final List<int> st;
+  int cursor;
+  bool locked = false;
+  int level = 1; // 0 lenient, 1 normal, 2 strict
+  int rev = 0; // bumps on every visible change
+  int _hint;
+  int _miss = 0;
+  final List<String> _pending = [];
+  final List<String> _recent = [];
+  final List<String> _dropped = [];
+
+  /// Pronunciation of [words] taken from the vowelled text (null: layer off).
+  final List<PhoneticWord>? phon;
+  final Map<String, List<String>> _alt;
+
+  RecitationAligner(this.words, {int hint = 0, this.phon})
+      : st = List<int>.filled(words.length, 0),
+        cursor = hint,
+        _hint = hint,
+        _alt = _altMap(words, phon);
+
+  /// skeleton -> pronunciations that differ from it (الليل for اليل)
+  static Map<String, List<String>> _altMap(
+      List<String> words, List<PhoneticWord>? ph) {
+    final m = <String, List<String>>{};
+    if (ph == null || ph.length != words.length) return m;
+    for (var i = 0; i < words.length; i++) {
+      final s = ph[i].spell;
+      if (ph[i].ortho != words[i] || s == words[i]) continue;
+      final l = m.putIfAbsent(words[i], () => <String>[]);
+      if (!l.contains(s)) l.add(s);
+    }
+    return m;
+  }
+
+  bool get finished => cursor >= words.length;
+  double get _thr =>
+      level == 0 ? 0.6 : (level == 1 ? 0.7 : (level == 2 ? 0.8 : 0.88));
+  bool get _instant => level >= 3; // flag a wrong word without waiting
+  bool _same(String h, String e) {
+    if (_sameWord(h, e, _thr)) return true;
+    if (!kPhoneticLayer) return false;
+    return QuranPhonetics.sameSpelling(h, e, _thr, _alt[e]);
+  }
+
+  /// Easy / balanced forgive spelling noise, but not a letter replaced by a
+  /// look-alike one (علیهم -> علیکم). Strict (3) is exact already.
+  bool _sameStrict(String h, String e) {
+    if (!_same(h, e)) return false;
+    if (level >= 3 || h == e) return true;
+    final alts = _alt[e];
+    if (alts != null && alts.contains(h)) return true;
+    return _mixSlip(h, e) == null;
+  }
+
+  /// [heard words used, expected words covered] when the next heard words,
+  /// read as one space-free chain, equal the next expected words.
+  List<int>? _chainMatch() {
+    final ph = phon;
+    if (ph == null || ph.length != words.length) return null;
+    for (var tot = 3; tot <= 6; tot++) {
+      for (var k = 1; k <= 3; k++) {
+        final m = tot - k;
+        if (m < 1 || m > 3) continue;
+        if (k > _pending.length || cursor + m > words.length) continue;
+        if (QuranPhonetics.chainEquals(
+            _pending.sublist(0, k), ph.sublist(cursor, cursor + m))) {
+          return <int>[k, m];
+        }
+      }
+    }
+    return null;
+  }
+
+  /// Feed newly stable (already normalised) words. Returns the first mistake.
+  AlignEvent? feed(List<String> heard, {required bool isFinal}) {
+    _pending.addAll(heard);
+    for (var guard = 0; guard < 8; guard++) {
+      if (!locked) _locate();
+      if (!locked) return null;
+      final ev = _process(isFinal);
+      if (ev != null) return ev;
+      if (locked) return null;
+    }
+    return null;
+  }
+
+  /// Correct word heard in a still-changing partial result: accept at once.
+  bool acceptTentative(String h) {
+    if (!locked || _pending.isNotEmpty || cursor >= words.length) return false;
+    if (!_sameStrict(h, words[cursor])) return false;
+    _ok(cursor);
+    cursor++;
+    rev++;
+    _miss = 0;
+    return true;
+  }
+
+  /// After a correction: user repeats the ayah [start, end).
+  void rewindTo(int start, int end) {
+    for (var k = start; k < end && k < st.length; k++) {
+      if (st[k] != 2) st[k] = 0;
+    }
+    cursor = start;
+    locked = true;
+    _pending.clear();
+    _recent.clear();
+    _dropped.clear();
+    _miss = 0;
+    rev++;
+  }
+
+  void _ok(int i) {
+    if (i >= 0 && i < st.length && st[i] != 1) {
+      st[i] = 1;
+      rev++;
+    }
+  }
+
+  // --- find where in the surah the reader is (3 consecutive words) ---
+  void _locate() {
+    while (_pending.isNotEmpty && !locked) {
+      _recent.add(_pending.removeAt(0));
+      if (_recent.length > 3) _recent.removeAt(0);
+      if (_recent.length < 3) continue;
+      var best = -1;
+      var bestScore = 1 << 30;
+      for (var p = 0; p + 2 < words.length; p++) {
+        if (_same(_recent[0], words[p]) &&
+            _same(_recent[1], words[p + 1]) &&
+            _same(_recent[2], words[p + 2])) {
+          final score = p >= _hint ? p - _hint : (_hint - p) * 3;
+          if (score < bestScore) {
+            bestScore = score;
+            best = p;
+          }
+        }
+      }
+      if (best >= 0) {
+        _ok(best);
+        _ok(best + 1);
+        _ok(best + 2);
+        cursor = best + 3;
+        locked = true;
+        _miss = 0;
+        _recent.clear();
+        _dropped.clear();
+        rev++;
+      }
+    }
+  }
+
+  AlignEvent? _process(bool isFinal) {
+    while (_pending.isNotEmpty && cursor < words.length) {
+      final h = _pending[0];
+      final e = words[cursor];
+      final n = words.length;
+
+      // 1. correct word
+      if (_sameStrict(h, e)) {
+        _ok(cursor);
+        cursor++;
+        rev++;
+        _pending.removeAt(0);
+        _miss = 0;
+        continue;
+      }
+      // 2. recogniser split one word in two (يا + أيها)
+      if (_pending.length > 1 && _same(h + _pending[1], e)) {
+        _ok(cursor);
+        cursor++;
+        rev++;
+        _pending.removeRange(0, 2);
+        _miss = 0;
+        continue;
+      }
+      // 3. recogniser glued two words together
+      if (cursor + 1 < n && _same(h, e + words[cursor + 1])) {
+        _ok(cursor);
+        _ok(cursor + 1);
+        cursor += 2;
+        rev++;
+        _pending.removeAt(0);
+        _miss = 0;
+        continue;
+      }
+
+      // 3b. phonetic chain: the heard words and the expected words as one
+      // space-free string (wasl alef dropped, al- merged into a sun letter)
+      if (kPhoneticLayer && phon != null) {
+        final c = _chainMatch();
+        if (c != null) {
+          for (var k = 0; k < c[1]; k++) {
+            _ok(cursor + k);
+          }
+          cursor += c[1];
+          rev++;
+          _pending.removeRange(0, c[0]);
+          _miss = 0;
+          continue;
+        }
+      }
+
+      // Need one more heard word to tell the cases below apart.
+      if (_pending.length < 2 && !isFinal && !_instant) break;
+      final next = _pending.length > 1 ? _pending[1] : null;
+      // instant mode: h may only be the first half of a split word - wait
+      if (_instant &&
+          !isFinal &&
+          next == null &&
+          h.length >= 2 &&
+          e.length > h.length &&
+          (e.startsWith(h) || e.endsWith(h))) {
+        break;
+      }
+
+      // 4. words skipped: h matches an expected word 1..3 ahead (+ confirmed)
+      var skip = 0;
+      for (var j = 1; j <= 3 && cursor + j < n; j++) {
+        if (!_same(h, words[cursor + j])) continue;
+        final confirmed = next == null ||
+            cursor + j + 1 >= n ||
+            _same(next, words[cursor + j + 1]);
+        if (confirmed) {
+          skip = j;
+          break;
+        }
+      }
+      if (skip > 0) {
+        final flag = level == 2 || (level == 1 && skip >= 2);
+        final at = cursor;
+        for (var k = 0; k < skip; k++) {
+          st[at + k] = flag ? 2 : 1;
+        }
+        _ok(at + skip);
+        cursor = at + skip + 1;
+        rev++;
+        _pending.removeAt(0);
+        _miss = 0;
+        if (flag) return AlignEvent(at, true, '', words[at]);
+        continue;
+      }
+
+      // 5. wrong word: the next heard word is the expected word after it
+      if (next != null && cursor + 1 < n && _same(next, words[cursor + 1])) {
+        final at = cursor;
+        st[at] = 2;
+        cursor++;
+        rev++;
+        _pending.removeAt(0);
+        _miss = 0;
+        return AlignEvent(at, false, h, words[at]);
+      }
+      // 5b. last word of an utterance, clearly a mispronunciation of e
+      if (next == null &&
+          (isFinal || _instant) &&
+          level >= 1 &&
+          _sim(h, e) >= 0.4) {
+        final at = cursor;
+        st[at] = 2;
+        cursor++;
+        rev++;
+        _pending.removeAt(0);
+        _miss = 0;
+        return AlignEvent(at, false, h, words[at]);
+      }
+
+      // 6. noise, or the reader jumped somewhere else
+      _dropped.add(_pending.removeAt(0));
+      if (_dropped.length > 3) _dropped.removeAt(0);
+      if (++_miss >= 4) {
+        locked = false;
+        _hint = cursor;
+        _recent
+          ..clear()
+          ..addAll(_dropped);
+        _dropped.clear();
+        _miss = 0;
+        rev++;
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
+
+// ============================================================
+//  Recitation coach (2/2) - microphone, correction audio, state
+//  Listens while the toggle is ON, compares what you recite with the
+//  ayah text, and plays the correct ayah (Alafasy) when you make a mistake.
+// ============================================================
+const String kCoachReciter = 'Alafasy_128kbps'; // مشاری العفاسی
+// The three tiers (index 0 = level 1). All of them keep the same teacher:
+// error detection, red word, 3-word window and the teacher's audio. They only
+// differ in how strict the phonetic matching is.
+const List<String> kCoachLevels = [
+  'سووک و ئاسایی',
+  'مامناوەند (پێشنیارکراو)',
+  'قورس و ورد',
+];
+const List<String> kCoachLevelHints = [
+  'خوێندنەوەی ڕەوان. هەڵەی بچووکی حەرەکات و تەجوید ناوەستێنێت، و تەنها هەڵەی ڕاستەقینەی وشە ڕاست دەکرێتەوە. ئەگەر پیتێک بگۆڕدرێت بە پیتێکی تر (وەک ه/ك، س/ص، ت/ط) وشەکە سوور دەبێت و مامۆستا ڕاستی دەکاتەوە.',
+  'حەرەکاتی سەرەکی دەپشکنێت. لەگەڵ هەڵە، سێ وشەکە (پێش، هەڵە، دوای) پیشان دەدرێن و مامۆستا دەیانڵێتەوە. هەڵەی تەجویدی سەرەکی (مەدی لازم و متصل، غوننە، ئیدغام، ئیخفا...) ڕادەگرێت، بەڵام وردەکاری وەک قەڵقەلە و ماوەی مەدی جایز نا. لەگەڵ هەر هەڵەیەک وانەی پەیوەندیدار پیشان دەدرێت. هەر پیتێک بگۆڕدرێت بە پیتێکی تر (وەک ه/ك) وشەکە سوور دەبێت.',
+  'تەجوید، مەد، شەدە و دەنگ بە وردی دەپشکنێت و تا ڕاست نەبێت ناڕوات. چاوەڕێی کۆتایی وشە دەکات، بۆیە کەمێک خاوترە. ماوەی مەد، کاتی غوننە و قەڵقەلە بە وردی دەپشکنرێن، بەڵام ئەو شێوازانەی وانەکان ڕێگەیان پێداوە (وەک مەدی عارض بە ٢، ٤ یان ٦ حەرەکە) هەڵە نابن.',
+];
+
+final GlobalKey<ScaffoldMessengerState> appMessenger =
+    GlobalKey<ScaffoldMessengerState>();
+
+/// A recited word further than this many words from the one the app expects
+/// means the reader jumped to another place of the surah (free-flow).
+const int kJumpWords = 12;
+
+/// The microphone switches itself off when the engine processed no speech
+/// for this long (saves battery and the engine's CPU).
+const Duration kMicIdleTimeout = Duration(seconds: 60);
+
+// ============================================================
+//  Performance monitor: latency + frame metrics for the live coach.
+//  Hot path = fixed ring buffers and one Stopwatch (no allocation per sample).
+//  Show it on the phone: long-press the microphone dot in the coach panel.
+// ============================================================
+/// Nominal length of one audio processing cycle (one microphone chunk), ms.
+const int kAudioCycleMs = 480;
+
+/// false = no timing at all.
+/// The coach finds the reader's place in the WHOLE Quran (surah + ayah), not
+/// only inside the open surah. Set to false to go back to the old behaviour.
+const bool kGlobalFinder = true;
+const bool kPerfMonitor = false;
+
+/// true = a full report goes to the log (logcat) every 15 s while coaching.
+const bool kPerfLog = false;
+
+class _PerfMetric {
+  _PerfMetric(this.budgetUs);
+
+  /// A sample above this counts as "over" (0 = no budget).
+  final int budgetUs;
+  final Int32List _ring = Int32List(64);
+  final Int32List _scratch = Int32List(64);
+  int _next = 0;
+  int count = 0;
+  int over = 0;
+  int maxUs = 0;
+  int sumUs = 0;
+
+  void add(int us) {
+    if (us < 0) us = 0;
+    if (us > 0x7fffffff) us = 0x7fffffff;
+    _ring[_next] = us;
+    _next = (_next + 1) & 63;
+    count++;
+    sumUs += us;
+    if (us > maxUs) maxUs = us;
+    if (budgetUs > 0 && us > budgetUs) over++;
+  }
+
+  int get avgUs => count == 0 ? 0 : sumUs ~/ count;
+
+  /// 95th percentile of the last 64 samples.
+  int get p95Us {
+    final n = count < 64 ? count : 64;
+    if (n == 0) return 0;
+    for (var i = 0; i < 64; i++) {
+      _scratch[i] = i < n ? _ring[i] : 0x7fffffff;
+    }
+    _scratch.sort();
+    return _scratch[((n - 1) * 95) ~/ 100];
+  }
+
+  void reset() {
+    _next = 0;
+    count = 0;
+    over = 0;
+    maxUs = 0;
+    sumUs = 0;
+  }
+}
+
+class PerfMonitor {
+  PerfMonitor._();
+
+  final Stopwatch _clock = Stopwatch()..start();
+
+  /// Monotonic microseconds (no DateTime allocation).
+  int now() => _clock.elapsedMicroseconds;
+
+  // ---- the 480 ms audio cycle ----
+  /// Time between two microphone chunks (late = more than 1.5 cycles).
+  final _PerfMetric chunkGap = _PerfMetric(kAudioCycleMs * 1500);
+
+  /// Time the UI isolate spends inside feedAudioChunk (> 8 ms steals a frame).
+  final _PerfMetric feed = _PerfMetric(8000);
+
+  /// The whole microphone callback of one chunk.
+  final _PerfMetric cycle = _PerfMetric(8000);
+
+  /// Time from the last fed chunk to a word event from the engine.
+  final _PerfMetric lag = _PerfMetric(kAudioCycleMs * 1000);
+
+  // ---- app side ----
+  /// The app's handling of one word event (colouring, phonetic check ...).
+  final _PerfMetric wordEv = _PerfMetric(8000);
+
+  // ---- dynamic ayah re-anchoring across the surah ----
+  /// A whole free-flow search + jump (only runs that really searched).
+  final _PerfMetric reanchor = _PerfMetric(8000);
+
+  /// Only the surah-wide letter search.
+  final _PerfMetric locate = _PerfMetric(4000);
+
+  /// Putting the engine back on a word (resetBuffer + setTargetSurah + jump).
+  final _PerfMetric resync = _PerfMetric(8000);
+
+  /// Listening started -> first position found.
+  final _PerfMetric firstAnchor = _PerfMetric(0);
+
+  // ---- UI ----
+  /// Building the coloured text of one ayah.
+  final _PerfMetric marksBuild = _PerfMetric(4000);
+  final _PerfMetric frameBuild = _PerfMetric(16000);
+  final _PerfMetric frameRaster = _PerfMetric(16000);
+
+  late final List<_PerfMetric> _all = [
+    chunkGap, feed, cycle, lag, wordEv, reanchor, locate, resync,
+    firstAnchor, marksBuild, frameBuild, frameRaster,
+  ];
+
+  int chunks = 0;
+  int fed = 0;
+  int frames = 0;
+  int slowFrames = 0; // frame took more than 16.7 ms
+  int frozenFrames = 0; // frame took more than 700 ms
+  int reanchorJumps = 0; // free-flow search moved the reader
+  int engineAnchors = 0; // the engine's own re-anchor moved the reader
+  int uiRebuilt = 0; // ayah texts rebuilt
+  int uiSkipped = 0; // ayah texts left alone (nothing changed in them)
+  int skelLen = 0; // letters of the surah the search runs over
+
+  int _lastChunkUs = -1;
+  int _lastFedUs = -1;
+  int _listenUs = -1;
+  int _lastHudUs = 0;
+  int _lastLogUs = 0;
+  bool hudOn = false;
+  bool _framesOn = false;
+  final ValueNotifier<String> hud = ValueNotifier<String>('');
+  late final void Function(List<ui.FrameTiming>) _framesCb = _onFrames;
+
+  void reset() {
+    for (final m in _all) {
+      m.reset();
+    }
+    chunks = 0;
+    fed = 0;
+    frames = 0;
+    slowFrames = 0;
+    frozenFrames = 0;
+    reanchorJumps = 0;
+    engineAnchors = 0;
+    uiRebuilt = 0;
+    uiSkipped = 0;
+    _lastChunkUs = -1;
+    _lastFedUs = -1;
+    _listenUs = -1;
+    _lastHudUs = now();
+    _lastLogUs = _lastHudUs;
+  }
+
+  /// A coaching session starts.
+  void start() {
+    if (!kPerfMonitor) return;
+    reset();
+    if (!_framesOn) {
+      WidgetsBinding.instance.addTimingsCallback(_framesCb);
+      _framesOn = true;
+    }
+  }
+
+  /// A coaching session ends.
+  void stop() {
+    if (!kPerfMonitor) return;
+    if (_framesOn) {
+      WidgetsBinding.instance.removeTimingsCallback(_framesCb);
+      _framesOn = false;
+    }
+    if (kPerfLog && chunks > 0) debugPrint(report());
+    hud.value = '';
+  }
+
+  void toggleHud() {
+    hudOn = !hudOn;
+    hud.value = hudOn ? summary() : '';
+  }
+
+  void markListening() => _listenUs = now();
+
+  void resetChunkClock() {
+    _lastChunkUs = -1;
+    _lastFedUs = -1;
+  }
+
+  /// A microphone chunk arrived at [t].
+  void noteChunk(int t) {
+    if (!kPerfMonitor) return;
+    chunks++;
+    final last = _lastChunkUs;
+    _lastChunkUs = t;
+    if (last >= 0) {
+      final gap = t - last;
+      if (gap < 5000000) chunkGap.add(gap); // longer = mic was restarted
+    }
+    if (t - _lastHudUs >= 1000000) {
+      _lastHudUs = t;
+      if (hudOn) hud.value = summary();
+    }
+    if (kPerfLog && t - _lastLogUs >= 15000000) {
+      _lastLogUs = t;
+      debugPrint(report());
+    }
+  }
+
+  /// The chunk that arrived at [t0] was fed to the engine between [t1] and [t2].
+  void noteFed(int t0, int t1, int t2) {
+    if (!kPerfMonitor) return;
+    fed++;
+    feed.add(t2 - t1);
+    cycle.add(t2 - t0);
+    _lastFedUs = t2;
+  }
+
+  void noteWordEvent(int t) {
+    if (!kPerfMonitor) return;
+    final f = _lastFedUs;
+    if (f >= 0 && t - f < 5000000) lag.add(t - f);
+  }
+
+  void noteAnchor({required bool first, required bool byEngine, required bool moved}) {
+    if (!kPerfMonitor) return;
+    if (first && _listenUs >= 0) {
+      firstAnchor.add(now() - _listenUs);
+      _listenUs = -1;
+    }
+    if (byEngine && moved) engineAnchors++;
+  }
+
+  void _onFrames(List<ui.FrameTiming> timings) {
+    for (final ft in timings) {
+      frames++;
+      frameBuild.add(ft.buildDuration.inMicroseconds);
+      frameRaster.add(ft.rasterDuration.inMicroseconds);
+      final total = ft.totalSpan.inMicroseconds;
+      if (total > 16700) slowFrames++;
+      if (total > 700000) frozenFrames++;
+    }
+  }
+
+  static String _f1(int us) => (us / 1000).toStringAsFixed(1);
+  static String _f0(int us) => (us / 1000).round().toString();
+
+  /// Four short lines for the phone screen (shown by a long-press on the mic).
+  String summary() {
+    return 'cycle ${_f0(chunkGap.avgUs)}/${_f0(chunkGap.p95Us)}ms late ${chunkGap.over} n$chunks\n'
+        'feed ${_f1(feed.avgUs)}/${_f1(feed.p95Us)}/${_f1(feed.maxUs)}ms >8:${feed.over} lag ${_f0(lag.avgUs)}ms\n'
+        'word ${_f1(wordEv.avgUs)}/${_f1(wordEv.maxUs)} anch ${_f1(reanchor.maxUs)}($reanchorJumps/${reanchor.count}) loc ${_f1(locate.p95Us)}\n'
+        'ui $uiRebuilt/${uiRebuilt + uiSkipped} mk ${_f1(marksBuild.p95Us)} jank $slowFrames/$frames b${_f1(frameBuild.p95Us)} r${_f1(frameRaster.p95Us)}';
+  }
+
+  /// Full report (avg / p95 / max in ms) for the log.
+  String report() {
+    final sb = StringBuffer(
+        '[perf] cycle=${kAudioCycleMs}ms surah=$skelLen letters chunks=$chunks fed=$fed\n');
+    void row(String name, _PerfMetric m) {
+      sb.write('[perf] ${name.padRight(10)} n=${m.count} avg=${_f1(m.avgUs)} '
+          'p95=${_f1(m.p95Us)} max=${_f1(m.maxUs)} over=${m.over}\n');
+    }
+
+    row('chunkGap', chunkGap);
+    row('feed', feed);
+    row('cycle', cycle);
+    row('lag', lag);
+    row('wordEv', wordEv);
+    row('reanchor', reanchor);
+    row('locate', locate);
+    row('resync', resync);
+    row('firstAnchor', firstAnchor);
+    row('marksBuild', marksBuild);
+    row('frameBuild', frameBuild);
+    row('frameRaster', frameRaster);
+    sb.write('[perf] frames=$frames slow=$slowFrames frozen=$frozenFrames '
+        'jumps=$reanchorJumps engineAnchors=$engineAnchors '
+        'uiRebuilt=$uiRebuilt uiSkipped=$uiSkipped');
+    return sb.toString();
+  }
+}
+
+final PerfMonitor perf = PerfMonitor._();
+
+/// The status line only needs the first tag and the last words: a long
+/// transcript must not be shaped and laid out again on every update.
+String _capHeard(String v) =>
+    v.length <= 120 ? v : '${v.substring(0, 24)}…${v.substring(v.length - 90)}';
+
+final Map<String, List<_Cluster>> _clusterCache = <String, List<_Cluster>>{};
+
+/// [_clusters] with a small cache: the same word is split again on every
+/// redraw of a wrong word (regex + one String per rune). The cached lists are
+/// never changed by the callers.
+List<_Cluster> _clustersCached(String token) {
+  if (token.length > 48) return _clusters(token);
+  final hit = _clusterCache[token];
+  if (hit != null) return hit;
+  if (_clusterCache.length >= 256) _clusterCache.clear();
+  final cl = _clusters(token);
+  _clusterCache[token] = cl;
+  return cl;
+}
+
+enum CoachState { off, starting, listening, paused, correcting }
+
+class CoachMarks {
+  final List<String> tokens;
+  final List<int> marks; // 0 unread, 1 correct, 2 mistake, 3 current word, 4 tajweed slip, 5 guidance (context of a mistake)
+  final Map<int, Set<int>> letters; // token index -> wrong letter indexes
+  final Map<int, Set<int>> signs; // token index -> faulty glyph keys (see _faultKey)
+  const CoachMarks(this.tokens, this.marks,
+      [this.letters = const {}, this.signs = const {}]);
+}
+
+/// What the panel said about one wrong word, kept so that tapping the red
+/// word later shows the same note again.
+class _WordNote {
+  final String message;
+  final String tip;
+  final int severity; // 1 minor (yellow), 2 major (red)
+  final int lessonId;
+  final String lessonLabel;
+  const _WordNote(
+      this.message, this.tip, this.severity, this.lessonId, this.lessonLabel);
+}
+
+class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
+  final stt.SpeechToText _stt = stt.SpeechToText();
+  final ValueNotifier<String> heardText = ValueNotifier<String>('');
+  /// Live microphone level 0..1 and when it was set, plus the last time the
+  /// recogniser heard words: they only drive the mic animation in the app bar.
+  final ValueNotifier<double> micLevel = ValueNotifier<double>(0);
+  DateTime micLevelAt = DateTime(2000);
+  DateTime voiceAt = DateTime(2000);
+  bool _ready = false;
+  String? _locale;
+
+  bool on = false;
+  CoachState state = CoachState.off;
+  String message = '';
+  int surah = 0;
+
+  List<Ayah> _ayahs = const [];
+  List<List<String>> _tokens = const [];
+  List<List<bool>> _isWord = const [];
+  List<int> _starts = const [0];
+  List<int> _wayah = const [];
+  RecitationAligner? _al;
+
+  int _consumed = 0;
+  List<String> _lastHeard = const [];
+  List<PhoneticWord> _phon = const <PhoneticWord>[];
+  bool _flushed = true;
+  String _lastFinal = '';
+  DateTime _lastFinalAt = DateTime(2000);
+  int _fails = 0;
+  bool _correcting = false;
+  bool _corrArmed = false;
+  bool _wasLocked = false;
+  Timer? _restart;
+  Timer? _safety;
+  Timer? _idle;
+  Timer? _stall; // neural: reader did not continue after a correction
+  Timer? _posTimer; // saves the recitation position a moment after it changes
+  Timer? _micWatch; // switches the microphone off after a minute without speech
+  DateTime _lastSpeechAt = DateTime.now(); // last time the engine processed speech
+  int _savedG = -1;
+  bool _observing = false; // lifecycle observer stays on, to resume after a lock
+  bool _resumeAfterBg = false; // the app was sent to the background mid-session
+  List<Ayah>? _lastAyahs;
+  // audio focus: a phone call or another app's audio pauses the session
+  asn.AudioSession? _session;
+  StreamSubscription<asn.AudioInterruptionEvent>? _intSub;
+  StreamSubscription<void>? _noisySub;
+  Timer? _intRetry;
+  bool _interrupted = false;
+  bool _resuming = false; // a resume is already running (event + retry timer)
+  // free-flow: the reader may start at, or jump to, any ayah of the surah
+  bool _anchored = false; // a word was confirmed: the position is known
+  DateTime _lastGreenAt = DateTime(2000); // last word the engine confirmed
+  DateTime _lastLocateAt = DateTime(2000);
+  DateTime _lastGlobalAt = DateTime(2000); // last whole-Quran search
+  bool _switching = false; // moving the session to another surah
+  rq.QuranRepository? _nRepo;
+  /// The reading page listens: the reader is in another surah (surah, ayah).
+  void Function(int surah, int ayah)? onForeignSurah;
+  String _skel = ''; // every word of the surah as one space-free letter chain
+  List<int> _skelWord = const []; // chain index -> word number
+  Uint16List _skelU16 = Uint16List(0); // the chain as code units (search)
+  Int32List _locEnds = Int32List(1); // search result row, kept between calls
+  final Int64List _peq = Int64List(0x50); // search: letter -> pattern mask
+  String _heardSkelSrc = ''; // memo of _connSkel(transcript)
+  String _heardSkel = '';
+  Int32List _appToGlobal = Int32List(0); // app word number -> engine index
+  bool _intDuringStart = false; // a call came while the engine was loading
+  DateTime _lastChunkAt = DateTime(2000); // last audio chunk from the microphone
+  DateTime _selfAudioUntil = DateTime(2000); // grace after our own teacher audio
+  /// True while the teacher's own audio runs (or just ended). Android reports
+  /// that as "audio focus lost", which is not a call and must not end the session.
+  bool get _ownAudio =>
+      _correcting ||
+      audio.correcting ||
+      DateTime.now().isBefore(_selfAudioUntil);
+  // Contextual error window: previous word, wrong word, next word (global
+  // word indexes inside one ayah). -1 = no window.
+  int _ctxLo = -1, _ctxHi = -1, _ctxG = -1;
+  // neural (offline acoustic model) mode
+  bool _neural = false;
+  rq.ReciteQuran? _nTracker;
+  rq.AudioProcessor? _nMic;
+  StreamSubscription<rq.WordMatchedEvent>? _nSub;
+  StreamSubscription<String>? _nTrSub;
+  String _dbgEv = ''; // last engine event / resync, shown under the status
+  String _dbgTr = '';
+  int _verG = -1; // word just accepted, still watched for a late transcript
+  DateTime _verAt = DateTime(2000);
+  final Map<int, rq.ContinuousQuranWord> _byGlobal = {};
+  List<rq.ContinuousQuranWord> _nWords = const [];
+  final Map<int, int> _wordFails = {}; // global word -> mistakes in a row
+  int _wBase = 1; // is wordInAyah 0- or 1-based in the package
+  DateTime _unmuteAt = DateTime(2000);
+  final Map<int, Set<int>> _badLetters = {};
+  final Map<int, Set<int>> _badSigns = {}; // word -> faulty glyphs (see _faultKey)
+  // Lesson the reader should review for the last mistake (see TajweedBridge).
+  // 0 = no lesson. Cleared when the word is read correctly or the coach stops.
+  int guideLessonId = 0;
+  String guideLabel = '';
+  int _guideG = -1;
+  // Teacher layer (see TajweedTeacher): red = major, yellow = minor error.
+  final RecitationScorer scorer = RecitationScorer();
+  final Set<int> _scoredWords = <int>{}; // each word costs points only once
+  bool _voiceMissing = false; // the teacher's audio could not be played
+  int teacherSeverity = 0; // 0 none, 1 minor (yellow), 2 major (red)
+  String teacherTip = ''; // short "how to fix" sentence for the panel
+  // Notes of the wrong words (global word index) and the one being re-shown
+  // after the reader tapped a red word.
+  final Map<int, _WordNote> _notes = {};
+  _WordNote? review;
+  Timer? _reviewTimer;
+
+  /// The reader tapped token [tokenIdx] of ayah [ayahN]: when that word is
+  /// still marked wrong (red / yellow), its note is shown again in the panel.
+  bool showNoteAt(int surahNo, int ayahN, int tokenIdx) {
+    final al = _al;
+    if (!on || al == null || surah != surahNo || _correcting) return false;
+    final ai = _ayahIndexOf(ayahN);
+    if (ai < 0 || tokenIdx < 0 || tokenIdx >= _isWord[ai].length) return false;
+    if (!_isWord[ai][tokenIdx]) return false;
+    var wi = 0;
+    for (var t = 0; t < tokenIdx; t++) {
+      if (_isWord[ai][t]) wi++;
+    }
+    final g = _starts[ai] + wi;
+    if (g < 0 || g >= al.st.length) return false;
+    if (al.st[g] != 2 && al.st[g] != 4) return false;
+    final n = _notes[g];
+    if (n == null) return false;
+    review = n;
+    _reviewTimer?.cancel();
+    _reviewTimer = Timer(const Duration(seconds: 12), clearReview);
+    notifyListeners();
+    return true;
+  }
+
+  void clearReview() {
+    _reviewTimer?.cancel();
+    _reviewTimer = null;
+    if (review == null) return;
+    review = null;
+    notifyListeners();
+  }
+  int _micChunks = 0; // diagnostics: chunks the microphone produced
+  int _fed = 0; // diagnostics: chunks given to the engine
+
+  // ---------- public ----------
+  /// Ayah number the reader is currently at (0 when idle).
+  int get cursorAyah {
+    final al = _al;
+    if (al == null || _wayah.isEmpty) return 0;
+    final g = al.cursor >= _wayah.length ? _wayah.length - 1 : al.cursor;
+    return _ayahs[_wayah[g]].n;
+  }
+
+  /// Ayah to scroll to: only once the reader's place is known (otherwise the
+  /// page would jump to ayah 1 when the mic is switched on).
+  int get followAyah => _anchored ? cursorAyah : 0;
+
+  /// The session always starts free (no forced resume position).
+  Future<void> start(int surahNo, List<Ayah> ayahs) async {
+    if (on) return;
+    on = true;
+    perf.start();
+    _intDuringStart = false;
+    scorer.clear();
+    _scoredWords.clear();
+    teacherSeverity = 0;
+    teacherTip = '';
+    surah = surahNo;
+    _fails = 0;
+    _lastAyahs = ayahs;
+    _savedG = -1;
+    // The screen must not dim or lock while the teacher listens.
+    try {
+      WakelockPlus.enable();
+    } catch (_) {}
+    // Free-flow: no forced resume position. The reader may start at any ayah
+    // of the surah; the engine (auto re-anchor) and the position finder
+    // (_tryFreeFlowJump) find the place by listening.
+    _resetFreeFlow();
+    _QuranIndex.warmUp(); // whole-Quran finder: ready within a moment
+    _build(ayahs, 1, 0);
+    _set(CoachState.starting, 'مایکرۆفۆن ئامادە دەکرێت...');
+    if (!_observing) {
+      WidgetsBinding.instance.addObserver(this);
+      _observing = true;
+    }
+    audio.addListener(_onAudio);
+    if (audio.surah != 0) await audio.stop(); // the mic must not hear the speaker
+    _neural = true; // all three levels use the offline engine
+    await _initSession(); // audio focus: calls pause the session safely
+    audio.trimCache(); // keep the downloaded audio under its size limit
+    final ok = _neural ? await _initNeural() : await _init();
+    if (!on) return;
+    if (!ok) {
+      await stop(msg: message);
+      return;
+    }
+    if (_intDuringStart) {
+      // a call arrived while loading: close the microphone and wait for it
+      _intDuringStart = false;
+      await _pauseForInterruption();
+      return;
+    }
+    if (_neural) {
+      perf.markListening();
+      _prefetchAhead();
+      _set(CoachState.listening, 'گوێم لێتە - لە هەر ئایەتێکەوە دەستپێبکە بخوێنە');
+      _startMicWatch();
+      return;
+    }
+    _startMicWatch();
+    await _listen();
+  }
+
+  /// A new session never inherits the place of the previous one. The cursor is
+  /// not put back on the old stopping point (that position is only kept for the
+  /// "continue reading" card): the reader may start at ANY ayah, and the first
+  /// heard words anchor the session there (_onNeuralWordImpl / _tryFreeFlowJump).
+  void _resetFreeFlow() {
+    _anchored = false;
+    _lastGreenAt = DateTime.now();
+    _lastLocateAt = DateTime(2000);
+    _savedG = -1;
+    _wordFails.clear();
+    _badLetters.clear();
+    _badSigns.clear();
+    _ctxLo = _ctxHi = _ctxG = -1;
+    _lastFinal = '';
+    _lastFinalAt = DateTime(2000);
+    _heardSkelSrc = '';
+    _heardSkel = '';
+    _dbgTr = '';
+    _dbgEv = '';
+    _unmuteAt = DateTime(2000);
+    _stall?.cancel();
+    _idle?.cancel();
+    heardText.value = '';
+  }
+
+  /// The engine processed speech (a transcript or a word result): the
+  /// inactivity clock starts again.
+  void _noteSpeech() => _lastSpeechAt = DateTime.now();
+
+  /// Switches the microphone off after [kMicIdleTimeout] without speech. The
+  /// clock only runs while the microphone really listens: not while loading,
+  /// during a correction, the teacher's own audio or a phone call.
+  void _startMicWatch() {
+    _lastSpeechAt = DateTime.now();
+    _micWatch?.cancel();
+    _micWatch = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (!on) {
+        _micWatch?.cancel();
+        return;
+      }
+      final now = DateTime.now();
+      if (state == CoachState.starting ||
+          _correcting ||
+          _interrupted ||
+          audio.playing ||
+          _ownAudio) {
+        _lastSpeechAt = now;
+        return;
+      }
+      if (now.difference(_lastSpeechAt) >= kMicIdleTimeout) {
+        stop(msg: 'مایکرۆفۆن خۆکارانە کوژایەوە، چونکە ١ خولەک هیچ دەنگێک نەبیسترا.');
+      }
+    });
+  }
+
+  Future<void> stop({String msg = ''}) async {
+    if (!on && state == CoachState.off) return;
+    _flushPos(); // keep the exact ayah and word for the next session
+    _posTimer?.cancel();
+    _anchored = false;
+    _intRetry?.cancel();
+    _interrupted = false;
+    _intDuringStart = false;
+    try {
+      WakelockPlus.disable();
+    } catch (_) {}
+    final wasCorrecting = _correcting;
+    on = false;
+    micLevel.value = 0;
+    perf.stop();
+    _correcting = false;
+    _corrArmed = false;
+    _restart?.cancel();
+    _safety?.cancel();
+    _idle?.cancel();
+    _stall?.cancel();
+    _micWatch?.cancel();
+    _micWatch = null;
+    _ctxLo = _ctxHi = _ctxG = -1;
+    _badLetters.clear();
+    _badSigns.clear();
+    _notes.clear();
+    review = null;
+    _reviewTimer?.cancel();
+    _reviewTimer = null;
+    guideLessonId = 0;
+    guideLabel = '';
+    _guideG = -1;
+    audio.removeListener(_onAudio);
+    state = CoachState.off;
+    message = '';
+    heardText.value = '';
+    _al = null;
+    notifyListeners();
+    try {
+      await _stt.cancel();
+    } catch (_) {}
+    await _teardownNeural();
+    if (wasCorrecting && audio.surah != 0) await audio.stop();
+    await _releaseSession();
+    if (msg.isNotEmpty) {
+      appMessenger.currentState
+          ?.showSnackBar(SnackBar(content: Text(msg)));
+    }
+  }
+
+  // ---------- audio focus: calls and other apps ----------
+  /// Holds the audio focus while the teacher listens, so Android/iOS tell us
+  /// when a call or another app takes the audio away.
+  Future<void> _initSession() async {
+    try {
+      final s = await asn.AudioSession.instance;
+      await s.configure(asn.AudioSessionConfiguration(
+        avAudioSessionCategory: asn.AVAudioSessionCategory.playAndRecord,
+        avAudioSessionCategoryOptions:
+            asn.AVAudioSessionCategoryOptions.allowBluetooth |
+                asn.AVAudioSessionCategoryOptions.defaultToSpeaker,
+        androidAudioAttributes: const asn.AndroidAudioAttributes(
+          contentType: asn.AndroidAudioContentType.speech,
+          usage: asn.AndroidAudioUsage.media,
+        ),
+        androidAudioFocusGainType: asn.AndroidAudioFocusGainType.gain,
+      ));
+      await s.setActive(true);
+      if (_session == null) {
+        _session = s;
+        _intSub = s.interruptionEventStream.listen(_onInterruption);
+        _noisySub = s.becomingNoisyEventStream.listen((_) => _onRouteChange());
+      }
+    } catch (_) {
+      // without audio focus the coach still works, it just cannot pause itself
+    }
+  }
+
+  /// Takes the audio focus back after the teacher's audio. Refused during a
+  /// real phone call (then false: the session waits for the call to end).
+  Future<bool> _reclaimFocus() async {
+    final s = _session;
+    if (s == null) return true; // no audio session: nothing to check
+    try {
+      return await s.setActive(true);
+    } catch (_) {
+      return true;
+    }
+  }
+
+  /// Gives the audio focus back (normal listening to the Quran afterwards).
+  Future<void> _releaseSession() async {
+    try {
+      final s = _session;
+      if (s == null) return;
+      await s.setActive(false);
+      await s.configure(asn.AudioSessionConfiguration.music());
+    } catch (_) {}
+  }
+
+  void _onInterruption(asn.AudioInterruptionEvent e) {
+    if (!on) return;
+    if (state == CoachState.starting) {
+      // the engine is still loading: remember the call, start() pauses as
+      // soon as it is ready (the microphone must not open in a call)
+      if (e.begin) {
+        if (e.type != asn.AudioInterruptionType.duck) _intDuringStart = true;
+      } else {
+        _intDuringStart = false;
+      }
+      return;
+    }
+    if (e.begin) {
+      if (e.type == asn.AudioInterruptionType.duck) return; // a short prompt
+      // the teacher's own audio took the focus: only the microphone input is
+      // muted meanwhile, the session goes on (_endCorrection checks the focus)
+      if (_ownAudio) return;
+      if (e.type == asn.AudioInterruptionType.unknown) {
+        // the audio focus was taken for good (another app, a sound...):
+        // never close the session and show nothing. Take the focus back and
+        // open the microphone again, silently.
+        _reclaimAfterFocusLoss();
+        return;
+      }
+      _pauseForInterruption();
+    } else {
+      _resumeFromInterruption();
+    }
+  }
+
+  bool _reclaiming = false;
+
+  /// Silent recovery after the audio focus was lost for good: no message, the
+  /// session stays on. If the focus is refused (a real call is going on) the
+  /// normal pause starts and retries by itself until the call is over.
+  Future<void> _reclaimAfterFocusLoss() async {
+    if (_reclaiming) return;
+    _reclaiming = true;
+    try {
+      await Future.delayed(const Duration(milliseconds: 400));
+      if (!on || _interrupted || _correcting || _ownAudio) return;
+      if (state == CoachState.starting) return;
+      final got = await _reclaimFocus();
+      if (!on || _interrupted || _correcting) return;
+      if (!got) {
+        await _pauseForInterruption();
+        return;
+      }
+      await _restartMic();
+      _unmuteAt = DateTime.now();
+    } finally {
+      _reclaiming = false;
+    }
+  }
+
+  /// Headphones unplugged / Bluetooth changed: the microphone has another
+  /// source now, so open it again.
+  Future<void> _onRouteChange() async {
+    if (!on || _interrupted || _correcting || state == CoachState.starting) {
+      return;
+    }
+    await _restartMic();
+    _unmuteAt = DateTime.now();
+  }
+
+  /// A call (or similar) started: close the microphone safely, keep the
+  /// position, wait for the end.
+  Future<void> _pauseForInterruption({String? msg}) async {
+    if (_interrupted || !on) return;
+    _interrupted = true;
+    _flushPos();
+    _stall?.cancel();
+    _safety?.cancel();
+    _idle?.cancel();
+    _restart?.cancel();
+    _correcting = false;
+    _corrArmed = false;
+    if (audio.surah != 0) {
+      try {
+        await audio.stop();
+      } catch (_) {}
+    }
+    final old = _nMic;
+    _nMic = null;
+    if (old != null) {
+      try {
+        await (old as dynamic).stop();
+      } catch (_) {}
+      try {
+        await (old as dynamic).dispose();
+      } catch (_) {}
+    }
+    if (!on) return;
+    _set(CoachState.paused,
+        msg ?? 'وەستا - پەیوەندی تەلەفۆن یان دەنگێکی دیکە. کە تەواو بوو، خۆی بەردەوام دەبێت.');
+    // the end event can get lost: ask for the audio focus again now and then
+    _intRetry?.cancel();
+    _intRetry = Timer.periodic(const Duration(seconds: 3), (_) => _tryResume());
+  }
+
+  Future<void> _tryResume() async {
+    if (!on || !_interrupted) {
+      _intRetry?.cancel();
+      return;
+    }
+    var ok = false;
+    try {
+      final s = _session ?? await asn.AudioSession.instance;
+      ok = await s.setActive(true);
+    } catch (_) {}
+    if (ok) await _resumeFromInterruption();
+  }
+
+  /// The call ended: microphone on again, engine back on the saved word.
+  Future<void> _resumeFromInterruption() async {
+    if (!_interrupted || !on || _resuming) return;
+    _resuming = true;
+    try {
+      _set(CoachState.listening, 'ئامادەبە...');
+      _resyncTracker();
+      final ok = await _restartMic();
+      if (!on) return;
+      if (!ok) {
+        // the call may still hold the microphone: stay paused, the retry
+        // timer tries again in a few seconds
+        _set(CoachState.paused, 'مایکرۆفۆن هێشتا ئامادە نییە - چاوەڕێ دەکەم...');
+        return;
+      }
+      _interrupted = false;
+      _intRetry?.cancel();
+      _unmuteAt = DateTime.now();
+      // before the reader's place is known the cursor is only the start of the
+      // surah (الم): do not tell the reader to continue from there
+      final ph = !_anchored ? '' : (_ctxLo >= 0 ? _ctxPhrase() : _cursorWord());
+      _set(CoachState.listening,
+          ph.isNotEmpty ? 'بەردەوام بە لە: «$ph»' : 'گوێم لێتە - دەستپێبکە بخوێنە');
+    } finally {
+      _resuming = false;
+    }
+  }
+
+  /// Called when the reading page is closed.
+  void detach(int surahNo) {
+    _resumeAfterBg = false;
+    if (on && surah == surahNo) scheduleMicrotask(() => stop());
+  }
+
+  @override
+  void notifyListeners() {
+    super.notifyListeners();
+    _trackPos();
+  }
+
+  /// Every change of the cursor schedules a save (one write per pause, not one
+  /// per word).
+  void _trackPos() {
+    final al = _al;
+    if (!on || al == null || _wayah.isEmpty || state == CoachState.starting) {
+      return;
+    }
+    if (al.cursor == _savedG) return;
+    _savedG = al.cursor;
+    _posTimer?.cancel();
+    _posTimer = Timer(const Duration(milliseconds: 600), _flushPos);
+  }
+
+  /// Writes the current ayah and word to the phone now.
+  void _flushPos() {
+    _posTimer?.cancel();
+    final al = _al;
+    if (al == null || _wayah.isEmpty || surah == 0) return;
+    if (state == CoachState.starting) return;
+    if (!_anchored) return; // nothing recited yet: keep the old position
+    if (al.cursor >= _wayah.length) {
+      settings.saveCoachPos(surah, 0, 0); // surah finished: nothing to resume
+      return;
+    }
+    final g = al.cursor < 0 ? 0 : al.cursor;
+    final ai = _wayah[g];
+    settings.saveCoachPos(surah, _ayahs[ai].n, g - _starts[ai]);
+  }
+
+  /// Cheap fingerprint of everything [marksFor] would draw for one ayah
+  /// (0 = drawn normally). It allocates nothing: an ayah's widget rebuilds only
+  /// when this number changes, so a word confirmed in one ayah no longer
+  /// re-lays-out every other ayah on screen.
+  int markSignature(int surahNo, int ayahN) {
+    final al = _al;
+    if (!on || al == null || surah != surahNo || state == CoachState.starting) {
+      return 0;
+    }
+    final ai = _ayahIndexOf(ayahN);
+    if (ai < 0) return 0;
+    final s = _starts[ai];
+    final e = _starts[ai + 1];
+    final cur = al.cursor;
+    var touched = cur >= s && cur < e;
+    var h = 17;
+    for (var k = s; k < e; k++) {
+      final st = al.st[k];
+      if (st != 0) touched = true;
+      var v = st;
+      if (k == cur) v += 8;
+      if (_ctxLo >= 0 && k >= _ctxLo && k <= _ctxHi) v += k == _ctxG ? 32 : 16;
+      final bl = _badLetters[k];
+      if (bl != null && bl.isNotEmpty) v += 64 * _setSig(bl);
+      final bs = _badSigns[k];
+      if (bs != null && bs.isNotEmpty) v += 4096 * _setSig(bs);
+      h = (h * 31 + v) & 0x3fffffff;
+    }
+    return touched ? (h | 0x40000000) : 0;
+  }
+
+  static int _setSig(Set<int> s) {
+    var x = s.length;
+    for (final r in s) {
+      x = (x * 31 + r) & 0xffff;
+    }
+    return x + 1;
+  }
+
+  /// Per-word colours for one ayah (null = draw it normally).
+  CoachMarks? marksFor(int surahNo, int ayahN) {
+    final al = _al;
+    if (!on || al == null || surah != surahNo || state == CoachState.starting) {
+      return null;
+    }
+    final ai = _ayahIndexOf(ayahN);
+    if (ai < 0) return null;
+    final s = _starts[ai];
+    final e = _starts[ai + 1];
+    final cur = al.cursor;
+    var touched = cur >= s && cur < e;
+    if (!touched) {
+      for (var k = s; k < e; k++) {
+        if (al.st[k] != 0) {
+          touched = true;
+          break;
+        }
+      }
+    }
+    if (!touched) return null;
+    final toks = _tokens[ai];
+    final out = List<int>.filled(toks.length, 0);
+    final letters = <int, Set<int>>{};
+    final signs = <int, Set<int>>{};
+    var wi = 0;
+    for (var t = 0; t < toks.length; t++) {
+      if (!_isWord[ai][t]) continue;
+      final g = s + wi;
+      wi++;
+      out[t] = al.st[g] == 2
+          ? 2
+          : (al.st[g] == 4 ? 4 : (g == cur ? 3 : al.st[g]));
+      if (al.st[g] == 2) {
+        final bl = _badLetters[g];
+        if (bl != null && bl.isNotEmpty) letters[t] = bl;
+      }
+      if (al.st[g] == 2 || al.st[g] == 4) {
+        final bs = _badSigns[g];
+        if (bs != null && bs.isNotEmpty) signs[t] = bs;
+      }
+      // contextual error window: the wrong word red, its neighbours in the
+      // guidance colour, until each of them has been read again correctly
+      if (_ctxLo >= 0 && g >= _ctxLo && g <= _ctxHi && al.st[g] != 1) {
+        out[t] = g == _ctxG ? 2 : 5;
+      }
+    }
+    return CoachMarks(toks, out, letters, signs);
+  }
+
+  // ---------- setup ----------
+  void _set(CoachState s, String m) {
+    state = s;
+    message = m;
+    _reviewTimer?.cancel();
+    _reviewTimer = null;
+    review = null;
+    notifyListeners();
+  }
+
+  void _build(List<Ayah> ayahs, int hintAyah, [int hintWord = 0]) {
+    _ayahs = ayahs;
+    final tokens = <List<String>>[];
+    final isWord = <List<bool>>[];
+    final starts = <int>[];
+    final wayah = <int>[];
+    final words = <String>[];
+    final phon = <PhoneticWord>[];
+    for (var i = 0; i < ayahs.length; i++) {
+      final toks = ayahs[i].ar.split(RegExp(r'\s+')).where((t) => t.isNotEmpty).toList();
+      final flags = <bool>[];
+      starts.add(words.length);
+      for (final t in toks) {
+        final w = _arNorm(t);
+        flags.add(w.isNotEmpty);
+        if (w.isNotEmpty) {
+          words.add(w);
+          phon.add(QuranPhonetics.analyze(t));
+          wayah.add(i);
+        }
+      }
+      tokens.add(toks);
+      isWord.add(flags);
+    }
+    starts.add(words.length);
+    _tokens = tokens;
+    _isWord = isWord;
+    _starts = starts;
+    _wayah = wayah;
+    var hint = 0;
+    for (var i = 0; i < ayahs.length; i++) {
+      if (ayahs[i].n == hintAyah) {
+        var w = hintWord;
+        final span = starts[i + 1] - starts[i];
+        if (w >= span) w = span - 1;
+        if (w < 0) w = 0;
+        hint = starts[i] + w;
+      }
+    }
+    _phon = phon;
+    // the whole surah as one space-free chain, for the free-flow finder
+    final sk = StringBuffer();
+    final skw = <int>[];
+    for (var k = 0; k < words.length; k++) {
+      final c = _connSkel(words[k]);
+      for (var q = 0; q < c.length; q++) {
+        skw.add(k);
+      }
+      sk.write(c);
+    }
+    _skel = sk.toString();
+    _skelWord = Int32List.fromList(skw);
+    _skelU16 = Uint16List.fromList(_skel.codeUnits);
+    _locEnds = Int32List(_skelU16.length + 1);
+    _appToGlobal = Int32List(0);
+    perf.skelLen = _skelU16.length;
+    final al = RecitationAligner(words,
+        hint: hint, phon: kPhoneticLayer ? phon : null);
+    al.level = settings.coachLevel;
+    _al = al;
+    _wasLocked = false;
+    _consumed = 0;
+    _lastHeard = const [];
+    _flushed = true;
+    _corrArmed = false;
+    _correcting = false;
+    _badLetters.clear();
+    _badSigns.clear();
+  }
+
+  String _cursorWord() {
+    final al = _al;
+    if (al == null || al.cursor >= _wayah.length) return '';
+    return _wordText(_wayah[al.cursor], al.cursor);
+  }
+
+  int _ayahIndexOf(int n) {
+    if (n - 1 >= 0 && n - 1 < _ayahs.length && _ayahs[n - 1].n == n) return n - 1;
+    for (var i = 0; i < _ayahs.length; i++) {
+      if (_ayahs[i].n == n) return i;
+    }
+    return -1;
+  }
+
+  String _wordText(int ai, int g) {
+    final target = g - _starts[ai];
+    var wi = 0;
+    for (var t = 0; t < _tokens[ai].length; t++) {
+      if (!_isWord[ai][t]) continue;
+      if (wi == target) return _tokens[ai][t];
+      wi++;
+    }
+    return '';
+  }
+
+  Future<bool> _init() async {
+    if (_ready && _locale != null) return true;
+    try {
+      _ready = await _stt.initialize(onStatus: _onStatus, onError: _onError);
+    } catch (_) {
+      _ready = false;
+    }
+    if (!_ready) {
+      message = 'ڕێگەپێدانی مایکرۆفۆن نەدرا، یان ناسینەوەی دەنگ لەسەر ئەم مۆبایلە بەردەست نییە.';
+      return false;
+    }
+    String? pick;
+    try {
+      final locs = await _stt.locales();
+      for (final l in locs) {
+        final id = l.localeId.replaceAll('_', '-').toLowerCase();
+        if (id == 'ar-sa') {
+          pick = l.localeId;
+          break;
+        }
+      }
+      if (pick == null) {
+        for (final l in locs) {
+          if (l.localeId.toLowerCase().startsWith('ar')) {
+            pick = l.localeId;
+            break;
+          }
+        }
+      }
+    } catch (_) {}
+    // If the phone does not list Arabic, still try ar-SA: Google can often
+    // recognise it online even when it is not in the locale list.
+    pick ??= 'ar-SA';
+    _locale = pick;
+    return true;
+  }
+
+  // ---------- listening loop ----------
+  String _listeningText() {
+    final al = _al;
+    if (al != null && al.locked) {
+      return 'گوێم لێتە - ئایەتی $cursorAyah';
+    }
+    return 'دەگەڕێم بۆ شوێنی خوێندنەوەکەت... دەستپێبکە بخوێنە';
+  }
+
+  Future<void> _listen() async {
+    if (!on || _correcting || _stt.isListening) return;
+    if (audio.playing) {
+      _set(CoachState.paused, 'گوێگرتن ڕاگیراوە تا دەنگەکە دەوەستێت');
+      return;
+    }
+    _consumed = 0;
+    _lastHeard = const [];
+    _flushed = true;
+    try {
+      await _stt.listen(
+        onResult: _onResult,
+        localeId: _locale,
+        listenFor: const Duration(minutes: 2),
+        pauseFor: const Duration(seconds: 8),
+        partialResults: true,
+        cancelOnError: false,
+      );
+      if (on && !_correcting) _set(CoachState.listening, _listeningText());
+    } catch (_) {
+      _fails++;
+      if (_fails >= 6) {
+        await stop(msg: 'نەتوانرا گوێ لە دەنگ بگیرێت. مایکرۆفۆن و ئینتەرنێت بپشکنە.');
+        return;
+      }
+      _scheduleRestart(const Duration(milliseconds: 800));
+    }
+  }
+
+  void _scheduleRestart(Duration d) {
+    _restart?.cancel();
+    _restart = Timer(d, () {
+      if (on && !_correcting && state != CoachState.starting) _listen();
+    });
+  }
+
+  void _onStatus(String s) {
+    if (!on || _correcting || _neural) return;
+    if (s == 'done' || s == 'notListening' || s == 'doneNoResult') {
+      _flushPending();
+      if (on && !_correcting) _scheduleRestart(const Duration(milliseconds: 350));
+    }
+  }
+
+  void _onError(SpeechRecognitionError e) {
+    if (!on || _correcting || _neural) return;
+    final m = e.errorMsg;
+    if (m.contains('permission')) {
+      stop(msg: 'ڕێگەپێدانی مایکرۆفۆن نەدراوە. لە ڕێکخستنەکانی مۆبایل بیدە بە ئەپەکە.');
+      return;
+    }
+    if (m.contains('language')) {
+      stop(msg: 'زمانی عەرەبی بۆ ناسینەوەی دەنگ بەردەست نییە.');
+      return;
+    }
+    if (m != 'error_no_match' && m != 'error_speech_timeout') _fails++;
+    if (_fails >= 6) {
+      stop(msg: 'ناسینەوەی دەنگ کار ناکات. ئینتەرنێت بپشکنە و دووبارە هەوڵبدەرەوە.');
+      return;
+    }
+    _flushPending();
+    if (on && !_correcting) {
+      _scheduleRestart(Duration(milliseconds: m == 'error_busy' ? 900 : 400));
+    }
+  }
+
+  void _onResult(SpeechRecognitionResult r) {
+    if (!on || _correcting || _al == null) return;
+    _fails = 0;
+    final text = r.recognizedWords.trim();
+    if (r.finalResult) {
+      final now = DateTime.now();
+      if (text == _lastFinal && now.difference(_lastFinalAt) < const Duration(seconds: 2)) {
+        return;
+      }
+      _lastFinal = text;
+      _lastFinalAt = now;
+    }
+    heardText.value = text;
+    if (text.isNotEmpty) {
+      _noteSpeech();
+      voiceAt = DateTime.now();
+    }
+    final words = text.isEmpty ? <String>[] : text.split(RegExp(r'\s+'));
+    _lastHeard = words;
+    _flushed = r.finalResult;
+    _idle?.cancel();
+    // The last word of a partial result may still change: wait for the next one.
+    _consume(words, r.finalResult ? words.length : words.length - 1, r.finalResult);
+    if (r.finalResult || words.isEmpty || !on || _correcting) return;
+    // A correct last word is accepted at once (the word lights up while reading).
+    final al = _al;
+    if (al != null && _consumed == words.length - 1) {
+      final w = _arNorm(words.last);
+      if (w.isNotEmpty && al.acceptTentative(w)) {
+        _consumed = words.length;
+        if (al.finished) {
+          stop(msg: _doneMsg);
+          return;
+        }
+        notifyListeners();
+      }
+    }
+    // The reader paused: the last word is settled, check it without waiting
+    // for another word or the end of the session.
+    final lvl = settings.coachLevel;
+    if (lvl >= 1) {
+      final ms = lvl == 1 ? 1300 : (lvl == 2 ? 900 : 500);
+      _idle = Timer(Duration(milliseconds: ms), () {
+        if (!on || _correcting || _al == null || _lastHeard.isEmpty) return;
+        _consume(_lastHeard, _lastHeard.length, false, idle: true);
+      });
+    }
+  }
+
+  /// Session ended without a final result: treat the last partial as final.
+  void _flushPending() {
+    _idle?.cancel();
+    if (!_flushed && _lastHeard.isNotEmpty) {
+      final w = _lastHeard;
+      _lastHeard = const [];
+      _flushed = true;
+      _consume(w, w.length, true);
+    }
+    _consumed = 0;
+  }
+
+  void _consume(List<String> words, int stable, bool isFinal,
+      {bool idle = false}) {
+    final al = _al;
+    if (al == null) return;
+    al.level = settings.coachLevel;
+    final fresh = <String>[];
+    for (var i = _consumed; i < stable && i < words.length; i++) {
+      final w = _arNorm(words[i]);
+      if (w.isNotEmpty) fresh.add(w);
+    }
+    if (stable > _consumed) _consumed = stable;
+    if (fresh.isEmpty && !isFinal) return;
+    final before = al.rev;
+    final ev = al.feed(fresh, isFinal: isFinal || idle);
+    if (isFinal) _consumed = 0;
+    _after(ev, before);
+  }
+
+  void _after(AlignEvent? ev, int revBefore) {
+    final al = _al;
+    if (al == null) return;
+    if (al.finished) {
+      stop(msg: _doneMsg);
+      return;
+    }
+    if (ev != null) {
+      _correct(ev);
+      return;
+    }
+    if (al.locked != _wasLocked) {
+      _wasLocked = al.locked;
+      if (state == CoachState.listening) {
+        message = _listeningText();
+        notifyListeners();
+        return;
+      }
+    }
+    if (al.rev != revBefore) notifyListeners();
+  }
+
+  // ---------- neural engine (recite_quran: Zipformer CTC + tajweed) ----------
+  /// Engine settings for the chosen level. The factories are used on purpose
+  /// (the enum member names of MatchingStrictness are not known for sure).
+  ///  1 easy     : forgiving matching, early commit, auto re-anchor
+  ///  2 balanced : normal matching, early commit, auto re-anchor
+  ///  3 strict   : strict matching, waits for the full vowel length (exact
+  ///               madd / ghunna / shadda), auto re-anchor (slower threshold)
+  rq.TrackerConfig _trackerConfig() {
+    final speed = const [
+      rq.RecitationSpeed.fast,
+      rq.RecitationSpeed.normal,
+      rq.RecitationSpeed.slow,
+    ][settings.coachSpeed];
+    switch (settings.coachLevel) {
+      case 1:
+        if (kEasyUsesNormalMatching) {
+          // the forgiving matcher accepted a misread word (علیکم for علیهم):
+          // easy keeps its other leniencies (tajweed, attempts) but the word
+          // itself is matched like the balanced level
+          return rq.TrackerConfig.normal(
+            speed: speed,
+            enableEarlyMatching: true,
+            enableAutoReanchor: true,
+            reanchorStallThreshold: 24,
+          );
+        }
+        return rq.TrackerConfig.easy(
+          speed: speed,
+          enableEarlyMatching: true,
+          enableAutoReanchor: true,
+          reanchorStallThreshold: 24,
+        );
+      case 3:
+        return rq.TrackerConfig.strict(
+          speed: speed,
+          enableEarlyMatching: false,
+          enableAutoReanchor: true, // free-flow: the reader may jump anywhere
+          reanchorStallThreshold: 30,
+        );
+      default:
+        return rq.TrackerConfig.normal(
+          speed: speed,
+          enableEarlyMatching: true,
+          enableAutoReanchor: true,
+          reanchorStallThreshold: 24,
+        );
+    }
+  }
+
+  /// How many corrections of the same word before the app lets it pass.
+  int get _maxFails =>
+      settings.coachLevel == 1 ? 2 : (settings.coachLevel == 3 ? 5 : 3);
+
+  Future<bool> _initNeural() async {
+    // The offline engine never asks for the microphone itself, so after a
+    // fresh install it fails with "PCM reader failed to initialize". The
+    // speech_to_text plugin shows the Android permission dialog when it is
+    // initialised, so do that first (its result is not needed here).
+    try {
+      await _init();
+    } catch (_) {}
+    try {
+      final repo = rq.QuranRepository(rq.QuranMetadataService());
+      _nRepo = repo;
+      await repo.loadSurahAsync(surah);
+      final tracker = rq.ReciteQuran(
+        repository: repo,
+        config: _trackerConfig(),
+        isTajweed: true,
+      );
+      await tracker.initialize();
+      tracker.setTargetSurah(surah);
+      final words = repo.getSurahWords(surah);
+      _byGlobal.clear();
+      _nWords = words;
+      _wordFails.clear();
+      for (final w in words) {
+        _byGlobal[w.globalIndex] = w;
+      }
+      _wBase = words.isEmpty ? 1 : words.first.wordInAyah;
+      _buildGlobalMap();
+      _nTracker = tracker;
+      _nSub = tracker.onWordMatched.listen(_onNeuralWord);
+      // resumed session: put the engine on the saved word (it starts at word 0)
+      final al0 = _al;
+      if (al0 != null && al0.cursor > 0) _resyncTracker();
+      // what the engine hears + its last result, shown under the status line
+      _dbgEv = '';
+      _dbgTr = '';
+      _nTrSub = tracker.onTranscript.listen((t) {
+        if (!on || !_neural) return;
+        if (t.trim().isNotEmpty && t != _dbgTr) voiceAt = DateTime.now();
+        // (room noise / other voices must not keep the mic on: only real
+        // recitation matches, see _onNeuralWordImpl, restart the 1-minute clock)
+        _dbgTr = t;
+        heardText.value = '$_dbgEv  $_dbgTr';
+        _reverify();
+        _freeFlowCheck();
+      });
+      await _startMic();
+      return true;
+    } catch (e) {
+      await _teardownNeural();
+      message = 'مۆدێلی دەنگ بار نەبوو (فایلی مۆدێلەکە لەناو ئەپەکەدا نییە، یان مایکرۆفۆن ڕێگەپێدراو نییە): $e';
+      return false;
+    }
+  }
+
+  /// Loudness of one microphone chunk, 0..1 (-1 = unknown format). Samples a
+  /// few hundred values only, so it costs almost nothing.
+  double _chunkLevel(dynamic chunk) {
+    try {
+      double sum = 0;
+      var cnt = 0;
+      var peak = 0.0;
+      if (chunk is Uint8List) {
+        // 16-bit little-endian PCM bytes
+        final n = chunk.length ~/ 2;
+        if (n == 0) return 0.0;
+        final step = n > 400 ? n ~/ 200 : 1;
+        for (var i = 0; i < n; i += step) {
+          var v = chunk[2 * i] | (chunk[2 * i + 1] << 8);
+          if (v >= 32768) v -= 65536;
+          final d = v / 32768.0;
+          sum += d * d;
+          cnt++;
+          if (d.abs() > peak) peak = d.abs();
+        }
+        return cnt == 0 ? 0.0 : (math.sqrt(sum / cnt) * 8).clamp(0.0, 1.0).toDouble();
+      }
+      final list = chunk as List;
+      final n = list.length;
+      if (n == 0) return 0.0;
+      final step = n > 400 ? n ~/ 200 : 1;
+      for (var i = 0; i < n; i += step) {
+        final v = (list[i] as num).toDouble();
+        sum += v * v;
+        cnt++;
+        if (v.abs() > peak) peak = v.abs();
+      }
+      var rms = cnt == 0 ? 0.0 : math.sqrt(sum / cnt);
+      if (peak > 1.5) rms /= 32768.0; // integer samples
+      return (rms * 8).clamp(0.0, 1.0).toDouble();
+    } catch (_) {
+      return -1;
+    }
+  }
+
+  Future<void> _startMic() async {
+    final tr = _nTracker;
+    if (tr == null) return;
+    final mic = rq.AudioProcessor();
+    _nMic = mic;
+    perf.resetChunkClock();
+    await mic.start(onChunk: (chunk, isFinal) {
+      if (!identical(_nMic, mic)) return; // an old microphone: ignore
+      final t0 = perf.now();
+      perf.noteChunk(t0); // gap to the previous chunk = the audio cycle
+      _micChunks++;
+      final nowDt = DateTime.now(); // one clock read per chunk
+      _lastChunkAt = nowDt;
+      if (!on || !_neural || _correcting || audio.playing) return;
+      if (nowDt.isBefore(_unmuteAt)) return;
+      if (nowDt.difference(micLevelAt).inMilliseconds >= 70) {
+        micLevelAt = nowDt;
+        final lv = _chunkLevel(chunk);
+        if (lv >= 0) micLevel.value = lv;
+      }
+      _fed++;
+      final t1 = perf.now();
+      tr.feedAudioChunk(chunk, isFinal: isFinal);
+      perf.noteFed(t0, t1, perf.now());
+    });
+  }
+
+  /// Playing the teacher's audio can leave the microphone stream dead on
+  /// Android (audio focus). After every correction the microphone is closed
+  /// and opened again, so the engine surely hears the re-read word.
+  /// Returns false when the microphone could not be opened.
+  Future<bool> _restartMic() async {
+    final old = _nMic;
+    _nMic = null;
+    if (old != null) {
+      try {
+        await (old as dynamic).stop();
+      } catch (_) {}
+      try {
+        await (old as dynamic).dispose();
+      } catch (_) {}
+    }
+    if (!on || !_neural) return false;
+    try {
+      await _startMic();
+      return true;
+    } catch (_) {
+      final bad = _nMic; // a microphone that never started
+      _nMic = null;
+      if (bad != null) {
+        try {
+          await (bad as dynamic).dispose();
+        } catch (_) {}
+      }
+      _dbgEv = '$_dbgEv [مایک هەڵە]';
+      heardText.value = '$_dbgEv  $_dbgTr';
+      return false;
+    }
+  }
+
+  /// app word number -> the package's global word index (-1 = no match),
+  /// built once per session so a resync does not scan every word of the surah.
+  void _buildGlobalMap() {
+    final byKey = <int, int>{};
+    for (final w in _nWords) {
+      final key = w.ayah * 4096 + w.wordInAyah;
+      if (!byKey.containsKey(key)) byKey[key] = w.globalIndex;
+    }
+    final out = Int32List(_wayah.length);
+    for (var g = 0; g < _wayah.length; g++) {
+      final ai = _wayah[g];
+      final wi = g - _starts[ai] + _wBase;
+      out[g] = byKey[_ayahs[ai].n * 4096 + wi] ?? -1;
+    }
+    _appToGlobal = out;
+  }
+
+  /// The package's global word index of the app's word number [g].
+  int? _globalOf(int g) {
+    if (g < 0 || g >= _wayah.length) return null;
+    if (g < _appToGlobal.length) {
+      final v = _appToGlobal[g];
+      return v >= 0 ? v : null;
+    }
+    final ai = _wayah[g];
+    final ayahN = _ayahs[ai].n;
+    final wi = g - _starts[ai] + _wBase;
+    for (final w in _nWords) {
+      if (w.ayah == ayahN && w.wordInAyah == wi) return w.globalIndex;
+    }
+    return null;
+  }
+
+  /// After a correction the engine must wait for the word the reader has to
+  /// say again (not the word after it): clear its audio buffer and put its
+  /// tracking cursor back on that word.
+  void _resyncTracker() {
+    final t0 = perf.now();
+    _resyncTrackerImpl();
+    perf.resync.add(perf.now() - t0);
+  }
+
+  void _resyncTrackerImpl() {
+    final tr = _nTracker;
+    final al = _al;
+    if (tr == null || al == null) return;
+    _lastGreenAt = DateTime.now(); // the position finder waits a moment
+    // with an error window the engine goes back to its first word, so the
+    // reader says the whole short phrase again
+    final target = _ctxLo >= 0 ? _ctxLo : al.cursor;
+    final gi = _globalOf(target);
+    if (gi == null) {
+      _dbgEv = '[jump: ؟]';
+      heardText.value = '$_dbgEv  $_dbgTr';
+      return;
+    }
+    try {
+      tr.resetBuffer();
+      _dbgTr = ''; // old text must not vouch for words read after the correction
+      tr.setTargetSurah(surah, startGlobalWord: gi, forceClear: true);
+      tr.jumpToWord(gi);
+      _dbgEv = '[jump #$gi]';
+    } catch (e) {
+      _dbgEv = '[jump هەڵە]';
+    }
+    heardText.value = '$_dbgEv  $_dbgTr';
+  }
+
+  /// Level 6: keep the next few words' audio ready on the phone.
+  /// Keeps the teacher's audio of the current and the next ayah on the phone,
+  /// so a correction can start with no network wait.
+  void _prefetchAhead() {
+    final al = _al;
+    if (al == null || !_neural || _wayah.isEmpty) return;
+    final g = al.cursor >= _wayah.length ? _wayah.length - 1 : al.cursor;
+    if (g < 0) return;
+    final ai = _wayah[g];
+    // current + the next 3 ayahs: a small download (about 150 KB each), so the
+    // teacher's voice is still there if the connection drops, with no load
+    for (var k = 0; k <= 3 && ai + k < _ayahs.length; k++) {
+      audio.prefetchAyah(surah, _ayahs[ai + k].n);
+    }
+  }
+
+  Future<void> _teardownNeural() async {
+    final sub = _nSub;
+    final trSub = _nTrSub;
+    _nTrSub = null;
+    try {
+      await trSub?.cancel();
+    } catch (_) {}
+    final mic = _nMic;
+    final tr = _nTracker;
+    _nSub = null;
+    _nMic = null;
+    _nTracker = null;
+    _neural = false;
+    try {
+      await sub?.cancel();
+    } catch (_) {}
+    // method names below are called dynamically so a different package
+    // version cannot break the build
+    if (mic != null) {
+      try {
+        await (mic as dynamic).stop();
+      } catch (_) {}
+      try {
+        await (mic as dynamic).dispose();
+      } catch (_) {}
+    }
+    if (tr != null) {
+      try {
+        await (tr as dynamic).dispose();
+      } catch (_) {}
+    }
+  }
+
+  void _onNeuralWord(rq.WordMatchedEvent ev) {
+    final t0 = perf.now();
+    perf.noteWordEvent(t0);
+    try {
+      _onNeuralWordImpl(ev);
+    } finally {
+      perf.wordEv.add(perf.now() - t0);
+    }
+  }
+
+  void _onNeuralWordImpl(rq.WordMatchedEvent ev) {
+    final al = _al;
+    if (!on || !_neural || al == null || _switching) return;
+    // wordId is the package's global word index; fall back to the list position
+    // results that were still in the pipe when the correction ended
+    if (!_correcting &&
+        DateTime.now().isBefore(_unmuteAt)) {
+      return;
+    }
+    _stall?.cancel(); // the engine heard something: no stall
+    _noteSpeech(); // ... and the inactivity clock starts again
+    voiceAt = DateTime.now();
+    _dbgEv = '[#${ev.wordId} ${ev.isRed ? 'سوور' : ((ev as dynamic).isNeutral == true ? 'بازدان' : 'سەوز')}]';
+    heardText.value = '$_dbgEv  $_dbgTr';
+    final w = _byGlobal[ev.wordId] ??
+        (ev.wordId >= 0 && ev.wordId < _nWords.length ? _nWords[ev.wordId] : null);
+    if (w == null) return;
+    final ai = _ayahIndexOf(w.ayah);
+    if (ai < 0) return;
+    final count = _starts[ai + 1] - _starts[ai];
+    if (count <= 0) return;
+    var k = w.wordInAyah - _wBase;
+    if (k < 0) k = 0;
+    if (k >= count) k = count - 1;
+    final g = _starts[ai] + k;
+    // A word the reader already got right is final: a late engine result for it
+    // (within the last 3 words) must neither flag it nor pull the position back.
+    if (!_correcting && g < al.cursor && g >= al.cursor - 3 && al.st[g] == 1) {
+      return;
+    }
+    // Free-flow: the reader can be at any ayah. The first confirmed word of the
+    // session, or one far from where the app expects the reader, moves the
+    // position there instead of being judged. No verdict (red) is given for
+    // words far from the expected place or before the place is known.
+    if (!_correcting) {
+      final far = g < al.cursor - 3 || g > al.cursor + kJumpWords;
+      if (!_anchored || far) {
+        if (ev.isRed || (ev as dynamic).isNeutral == true) return;
+        _anchorAt(g, ai);
+      }
+      if (!ev.isRed) _lastGreenAt = DateTime.now();
+    }
+    final errs = (ev as dynamic).tajweedErrors as List<dynamic>?;
+    // Tajweed slips: level 1 lets them pass, level 2 corrects the core rules,
+    // level 3 everything (madd length, ghunna timing, qalqala ...). What the
+    // lessons allow (madd arid 2/4/6, tanween when stopping ...) or what does
+    // not apply to this word is dropped (TajweedBridge.judge).
+    final verdict = _judgeTajweed(ai, g, errs);
+    final slip = verdict.flag;
+    al.locked = true;
+    final pos = w.wordInAyah - _wBase + 1;
+    // The previous word of an error window is only the connecting word (it was
+    // already read correctly): never flag it, just let the reader move on to
+    // the wrong word.
+    if (!_correcting &&
+        _ctxG >= 0 &&
+        g >= _ctxLo &&
+        g < _ctxG &&
+        (ev.isRed || slip)) {
+      al.st[g] = 1;
+      _wordFails.remove(g);
+      _badLetters.remove(g);
+      _badSigns.remove(g);
+      _clearGuideAt(g);
+      al.cursor = g + 1;
+      al.rev++;
+      _ctxDoneCheck();
+      notifyListeners();
+      return;
+    }
+    // Second opinion for a word the engine called wrong: when the reader
+    // joins words (wasl, al- + sun letter) the engine's word-by-word alignment
+    // can fail although the recitation is right. The transcript is compared
+    // as one space-free chain with the expected words (QuranPhonetics).
+    // "wrong" from the engine: the reader may just have jumped to another
+    // ayah, so look in the whole surah before correcting
+    if (ev.isRed && !_correcting && _tryFreeFlowJump()) return;
+    if (ev.isRed && !_correcting && kPhoneticLayer) {
+      final hi = _connectedSpan(ai, g); // a few microseconds of string work
+      if (hi >= 0) {
+        _acceptConnected(g, hi);
+        return;
+      }
+    }
+    if (ev.isRed || slip) {
+      _flagNeural(ai, g, ev.isRed, slip ? verdict.detail : '', pos,
+          errs: slip ? errs : null, verdict: verdict);
+      return;
+    }
+    // Easy / balanced: the engine confirmed the word, but the transcript shows
+    // a changed vowel (kasra read as damma): the whole word turns red and the
+    // teacher corrects it (names the heard and the right vowel, reads it again).
+    if (!_correcting &&
+        kVowelMixGuard &&
+        settings.coachLevel <= 2 &&
+        (ev as dynamic).isNeutral != true) {
+      final vm = _vowelMixOf(ai, g);
+      if (vm != null) {
+        _flagNeural(
+            ai,
+            g,
+            true,
+            'حەرەکەی «${_vowelNameKu[vm[2]] ?? ''}» بیستراوە، بەڵام دەبێت «${_vowelNameKu[vm[1]] ?? ''}» بێت',
+            pos);
+        _badSigns.remove(g); // the whole word is shown red (same as a wrong word)
+        return;
+      }
+    }
+    // Easy / balanced: the engine confirmed the word, but the transcript shows
+    // one letter replaced by a look-alike one (علیهم heard as عليكم): the whole
+    // word turns red and the teacher says it (same flow as a wrong word).
+    if (!_correcting &&
+        kLetterMixGuard &&
+        settings.coachLevel <= 2 &&
+        (ev as dynamic).isNeutral != true) {
+      final why = _misreadOf(ai, g);
+      if (why != null) {
+        _flagNeural(ai, g, true, why, pos);
+        _badSigns.remove(g); // the whole word is shown red
+        return;
+      }
+      final mix = _letterMixOf(ai, g);
+      if (mix != null) {
+        _flagNeural(ai, g, true, 'پیتی «${mix[0]}» وەک «${mix[1]}» بیستراوە', pos);
+        _badSigns.remove(g); // the whole word is shown red
+        return;
+      }
+    }
+    if ((ev as dynamic).isNeutral == true) return;
+    if (_correcting) return; // stale result that arrived after the mistake
+    al.st[g] = 1;
+    _wordFails.remove(g);
+    _badSigns.remove(g);
+    _clearGuideAt(g);
+    al.cursor = g + 1;
+    al.rev++;
+    if (settings.coachLevel <= 2) {
+      _verG = g; // the transcript may still be catching up with this word
+      _verAt = DateTime.now();
+    }
+    // the old "continue from ..." line must not stay on screen once the reader
+    // is reading on
+    if (state == CoachState.listening && message.startsWith('بەردەوام بە لە')) {
+      message = _listeningText();
+    }
+    _ctxDoneCheck();
+    if (al.cursor >= al.words.length) {
+      stop(msg: _doneMsg);
+      return;
+    }
+    _prefetchAhead();
+    notifyListeners();
+  }
+
+  // ---------- free-flow: find the reader's place in the whole surah ----------
+  /// The first confirmed word (or a word far from the expected place): the
+  /// reader's position is now there.
+  void _anchorAt(int g, int ai) {
+    final al = _al;
+    if (al == null) return;
+    final moved = al.cursor < g - 1 || al.cursor > g + 1;
+    perf.noteAnchor(first: !_anchored, byEngine: true, moved: moved);
+    _anchored = true;
+    _stall?.cancel();
+    _wordFails.clear();
+    _badLetters.clear();
+    _badSigns.clear();
+    _ctxLo = _ctxHi = _ctxG = -1;
+    if (moved) {
+      al.cursor = g;
+      al.rev++;
+      _set(CoachState.listening,
+          'ئایەتی ${_ayahs[ai].n} دۆزرایەوە - بەردەوام بە');
+    }
+  }
+
+  /// Called whenever the engine's transcript changes. While the place is
+  /// unknown (start of the session), or the engine has confirmed no word for a
+  /// moment, the heard words are searched in the whole surah.
+  void _freeFlowCheck() {
+    if (!on || !_neural || _correcting || _interrupted || _al == null) return;
+    if (state == CoachState.starting || _switching) return;
+    final now = DateTime.now();
+    // while the place is unknown (new session) look more often: re-anchor fast
+    final gap = Duration(milliseconds: _anchored ? 700 : 300);
+    if (now.difference(_lastLocateAt) < gap) {
+      return;
+    }
+    if (_anchored &&
+        now.difference(_lastGreenAt) < const Duration(milliseconds: 2500)) {
+      return;
+    }
+    _lastLocateAt = now;
+    _tryFreeFlowJump();
+  }
+
+  /// The heard text as a letter chain. The transcript is the same string for
+  /// many calls, and normalising it (regex + StringBuffer) is not free.
+  String _heardSkelOf(String t) {
+    if (t != _heardSkelSrc) {
+      _heardSkelSrc = t;
+      _heardSkel = _connSkel(t);
+    }
+    return _heardSkel;
+  }
+
+  /// Best place of [pat] (a letter chain) in the surah's chain:
+  /// [end index (exclusive), edits, edits of the best OTHER place], or null.
+  ///
+  /// Bit-parallel approximate matching (Myers / Hyyro): the pattern (at most
+  /// 60 letters) lives in one 64-bit integer, so one surah letter costs a
+  /// dozen integer operations instead of a whole column of the edit table.
+  /// The edit counts are exactly those of the plain table. Nothing is
+  /// allocated: the result row is a buffer kept between calls.
+  List<int>? _locateInSurah(String pat) {
+    final text = _skelU16;
+    final n = pat.length;
+    final m = text.length;
+    if (n == 0 || m == 0 || n > 60) return null;
+    final t0 = perf.now();
+    final peq = _peq;
+    for (var i = 0; i < peq.length; i++) {
+      peq[i] = 0;
+    }
+    for (var i = 0; i < n; i++) {
+      final c = pat.codeUnitAt(i) - 0x621;
+      if (c >= 0 && c < peq.length) peq[c] |= 1 << i;
+    }
+    final mask = (1 << n) - 1;
+    final high = 1 << (n - 1);
+    var pv = mask;
+    var mv = 0;
+    var score = n;
+    final ends = _locEnds;
+    ends[0] = n;
+    for (var j = 1; j <= m; j++) {
+      final c = text[j - 1] - 0x621;
+      final eq = (c >= 0 && c < peq.length) ? peq[c] : 0;
+      final xv = eq | mv;
+      final xh = ((((eq & pv) + pv) ^ pv) | eq) & mask;
+      var ph = (mv | ~(xh | pv)) & mask;
+      final mh = pv & xh;
+      if ((ph & high) != 0) {
+        score++;
+      } else if ((mh & high) != 0) {
+        score--;
+      }
+      ph = (ph << 1) & mask;
+      pv = (((mh << 1) & mask) | ~(xv | ph)) & mask;
+      mv = ph & xv;
+      ends[j] = score;
+    }
+    var bj = 1;
+    for (var j = 2; j <= m; j++) {
+      if (ends[j] < ends[bj]) bj = j;
+    }
+    var other = n;
+    for (var j = 1; j <= m; j++) {
+      if ((j - bj).abs() > n + 2 && ends[j] < other) other = ends[j];
+    }
+    perf.locate.add(perf.now() - t0);
+    return [bj, ends[bj], other];
+  }
+
+  /// Looks for the last heard words in the whole surah. When they fit one
+  /// place clearly (and only one), far from where the app expects the reader,
+  /// the position (and the engine) move there. True when it moved.
+  bool _tryFreeFlowJump() {
+    final t0 = perf.now();
+    final searches = perf.locate.count;
+    final moved = _tryFreeFlowJumpImpl();
+    if (perf.locate.count != searches) {
+      // a real surah search ran: time the whole search + jump
+      perf.reanchor.add(perf.now() - t0);
+      if (moved) perf.reanchorJumps++;
+    }
+    return moved;
+  }
+
+  bool _tryFreeFlowJumpImpl() {
+    final al = _al;
+    if (al == null || _skel.isEmpty) return false;
+    if (_switching) return false;
+    final heard = _heardSkelOf(_dbgTr);
+    // a new session looks sooner: the reader may start anywhere
+    if (heard.length < (_anchored ? 12 : 10)) return false; // too little to prove anything
+    final tail = heard.length > 28 ? heard.substring(heard.length - 28) : heard;
+    final r = _locateInSurah(tail);
+    final n = tail.length;
+    if (r == null || r[1] > n ~/ 4 || r[2] - r[1] < 3) {
+      // unclear or not unique in this surah: look in the whole Quran
+      return _tryGlobalJump(heard);
+    }
+    final endW = _skelWord[r[0] - 1];
+    final st = r[0] - n;
+    final startW = _skelWord[st < 0 ? 0 : st];
+    // the place the app expects: normal reading, the engine follows it
+    if (_anchored &&
+        endW >= al.cursor - 3 &&
+        endW <= al.cursor + kJumpWords) {
+      return false;
+    }
+    // the very beginning of the surah: the engine (waiting at word 0) handles it
+    if (!_anchored && startW <= 1) return false;
+    _jumpTo(startW, endW);
+    return true;
+  }
+
+  /// The app word number of ayah [ayahN], word [w0] (0-based) in the open surah.
+  int? _appWord(int ayahN, int w0) {
+    final ai = _ayahIndexOf(ayahN);
+    if (ai < 0) return null;
+    var g = _starts[ai] + w0;
+    if (g >= _starts[ai + 1]) g = _starts[ai + 1] - 1;
+    return g;
+  }
+
+  /// The last heard letters, searched in the WHOLE Quran. A clear and unique
+  /// place in this surah moves the position; in another surah the session
+  /// moves to that surah (the microphone keeps listening).
+  bool _tryGlobalJump(String heard) {
+    final idx = _QuranIndex.ready;
+    if (!kGlobalFinder || idx == null || _switching) return false;
+    final now = DateTime.now();
+    // a reader who is reading on normally is never moved to another surah
+    if (_anchored && now.difference(_lastGreenAt) < const Duration(seconds: 6)) {
+      return false;
+    }
+    if (now.difference(_lastGlobalAt) < const Duration(milliseconds: 500)) {
+      return false;
+    }
+    _lastGlobalAt = now;
+    if (heard.length < 14) return false;
+    final tail = heard.length > 40 ? heard.substring(heard.length - 40) : heard;
+    final r = idx.locate(tail);
+    if (r == null) return false;
+    final n = tail.length;
+    if (r[1] > n ~/ 5 || r[2] - r[1] < 4) return false; // unclear or not unique
+    final e = r[0] - 1;
+    final st = r[0] - n < 0 ? 0 : r[0] - n;
+    final sur = idx.surahOf[e];
+    if (idx.surahOf[st] != sur) return false; // crosses two surahs: not clear
+    final ea = idx.where[e] >> 10, ew = idx.where[e] & 1023;
+    final sa = idx.where[st] >> 10, sw = idx.where[st] & 1023;
+    if (sur == surah) {
+      final al = _al;
+      final startW = _appWord(sa, sw), endW = _appWord(ea, ew);
+      if (al == null || startW == null || endW == null || endW < startW) {
+        return false;
+      }
+      if (_anchored && endW >= al.cursor - 3 && endW <= al.cursor + kJumpWords) {
+        return false; // the place the app already expects
+      }
+      if (!_anchored && startW <= 1) return false; // the engine handles the start
+      _jumpTo(startW, endW);
+      return true;
+    }
+    _switchSurah(sur, sa, sw, ea, ew);
+    return true;
+  }
+
+  /// Moves the running session to another surah without stopping the
+  /// microphone: new word chain, new engine target, then the heard words are
+  /// marked and the engine waits for the next word. The reading page opens
+  /// the new surah (onForeignSurah).
+  Future<void> _switchSurah(int newS, int sa, int sw, int ea, int ew) async {
+    final tr = _nTracker;
+    final repo = _nRepo;
+    if (_switching || !on || tr == null || repo == null) return;
+    _switching = true;
+    try {
+      _set(CoachState.listening, 'سوورەتی ${kSurahs[newS - 1].ar} دۆزرایەوە...');
+      final ayahs = await loadSurah(newS);
+      await repo.loadSurahAsync(newS);
+      if (!on || _nTracker != tr) return;
+      surah = newS;
+      _lastAyahs = ayahs;
+      _build(ayahs, 1, 0); // new word chain and aligner for the new surah
+      tr.setTargetSurah(newS);
+      final words = repo.getSurahWords(newS);
+      _byGlobal.clear();
+      _nWords = words;
+      _wordFails.clear();
+      for (final w in words) {
+        _byGlobal[w.globalIndex] = w;
+      }
+      _wBase = words.isEmpty ? 1 : words.first.wordInAyah;
+      _buildGlobalMap();
+      _anchored = false;
+      final startW = _appWord(sa, sw), endW = _appWord(ea, ew);
+      settings.setLast(newS, ea);
+      onForeignSurah?.call(newS, ea); // the page shows the new surah
+      if (startW != null && endW != null && endW >= startW) {
+        _jumpTo(startW, endW);
+      }
+    } catch (_) {
+      // the engine could not follow: the next search will try again
+    } finally {
+      _switching = false;
+    }
+  }
+
+  /// The reader is at words [startW]..[endW] of the surah: mark them, put the
+  /// cursor and the engine on the next word.
+  void _jumpTo(int startW, int endW) {
+    final al = _al;
+    if (al == null) return;
+    perf.noteAnchor(first: !_anchored, byEngine: false, moved: true);
+    _anchored = true;
+    _stall?.cancel();
+    _wordFails.clear();
+    _badLetters.clear();
+    _badSigns.clear();
+    _ctxLo = _ctxHi = _ctxG = -1;
+    for (var k = startW; k <= endW && k < al.words.length; k++) {
+      al.st[k] = 1;
+    }
+    al.cursor = endW + 1;
+    al.locked = true;
+    al.rev++;
+    if (al.cursor >= al.words.length) {
+      stop(msg: _doneMsg);
+      return;
+    }
+    _resyncTracker(); // the engine now waits for the word after the heard ones
+    _unmuteAt = DateTime.now().add(const Duration(milliseconds: 200));
+    final ai = _wayah[al.cursor];
+    _set(CoachState.listening,
+        'ئایەتی ${_ayahs[ai].n} دۆزرایەوە - بەردەوام بە');
+    _prefetchAhead();
+  }
+
+  /// The error window is finished once all its words are green again: live
+  /// tracking simply carries on from there.
+  void _ctxDoneCheck() {
+    final al = _al;
+    if (al == null || _ctxLo < 0) return;
+    if (al.cursor > _ctxHi) {
+      // the reader (and the engine) are already past the window
+      for (var k = _ctxLo; k <= _ctxHi && k < al.words.length; k++) {
+        if (al.st[k] == 0) al.st[k] = 1;
+      }
+      _ctxLo = _ctxHi = _ctxG = -1;
+      return;
+    }
+    for (var k = _ctxLo; k <= _ctxHi && k < al.words.length; k++) {
+      if (al.st[k] != 1) return;
+    }
+    _ctxLo = _ctxHi = _ctxG = -1;
+  }
+
+  /// The words of the error window as text (previous word, wrong word).
+  String _ctxPhrase() {
+    if (_ctxLo < 0 || _ctxLo >= _wayah.length) return '';
+    final out = <String>[];
+    for (var k = _ctxLo; k <= _ctxHi && k < _wayah.length; k++) {
+      final t = _wordText(_wayah[k], k);
+      if (t.isNotEmpty) out.add(t);
+    }
+    return out.join(' ');
+  }
+
+  /// The exact glyphs of word [g] that are wrong: a letter, a shaddah, a
+  /// tanween, a harakah or a madd sign. Two sources, both only REFINE a word
+  /// the engine already flagged (they never create a mistake):
+  ///  1. the engine's tajweed error (madd / shaddah-ghunna / tanween),
+  ///  2. the recogniser's vowelled text for this word, compared glyph by glyph.
+  /// Empty = could not tell, so the whole word is shown as wrong.
+  Set<int> _pinpointSigns(int ai, int g, List<dynamic>? errs) {
+    final tok = _wordText(ai, g);
+    if (tok.isEmpty) return <int>{};
+    final cl = _clustersCached(tok);
+    final out = <int>{};
+    out.addAll(_kindFaults(cl, _faultKinds(errs)));
+    final expNorm = _arNorm(tok);
+    final heardNorm = _arNorm(_dbgTr);
+    if (expNorm.length >= 2 && heardNorm.length >= 2) {
+      final span = expNorm.length * 4 > 40 ? expNorm.length * 4 : 40;
+      final from = heardNorm.length > span ? heardNorm.length - span : 0;
+      final loc = _approxLocate(heardNorm.substring(from), expNorm);
+      if (loc[2] <= expNorm.length ~/ 2) {
+        final s0 = from + loc[0];
+        final e0 = from + loc[1];
+        // letters that differ (silent letters and long vowels are not blamed)
+        final ld = _letterDiff(
+            heardNorm.substring(s0, e0), expNorm, _silentOf(g, expNorm));
+        final cap = expNorm.length ~/ 2 > 0 ? expNorm.length ~/ 2 : 1;
+        if (ld.bad.isNotEmpty && ld.bad.length <= cap) {
+          for (var p = 0; p < cl.length; p++) {
+            if (cl[p].idx >= 0 && ld.bad.contains(cl[p].idx)) {
+              out.add(_faultKey(p, 0));
+            }
+          }
+        }
+        // harakat / shaddah / tanween on letters both sides have
+        final hc = _clusters(_dbgTr)
+            .where((c) => c.idx >= s0 && c.idx < e0)
+            .toList();
+        for (final pr in _alignClusters(cl, hc)) {
+          final p = pr[0];
+          final es = _signsOf(cl[p]);
+          final hs = _signsOf(hc[pr[1]]);
+          final ev = es.where(_isVowelRune).toSet();
+          final hv = hs.where(_isVowelRune).toSet();
+          final et = es.where(_isTanweenRune).toSet();
+          final ht = hs.where(_isTanweenRune).toSet();
+          if (ev.isNotEmpty &&
+              hv.isNotEmpty &&
+              !(ev.length == hv.length && ev.containsAll(hv))) {
+            for (final r in ev) {
+              out.add(_faultKey(p, r)); // another vowel was heard
+            }
+          }
+          if (es.contains(_kShadda) &&
+              !hs.contains(_kShadda) &&
+              (hv.isNotEmpty || ht.isNotEmpty)) {
+            out.add(_faultKey(p, _kShadda)); // the doubling was dropped
+          }
+          if (et.isNotEmpty && ht.isEmpty && hv.isNotEmpty) {
+            for (final r in et) {
+              out.add(_faultKey(p, r)); // tanween read as a plain vowel
+            }
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  /// [cluster position, expected vowel, heard vowel] when the transcript holds
+  /// word [g] with the same letters but ONE vowel changed (fatha / damma /
+  /// kasra), else null. Only vowels both sides really have are compared.
+  List<int>? _vowelMixOf(int ai, int g) {
+    if (!kVowelMixGuard || _dbgTr.isEmpty) return null;
+    final tok = _wordText(ai, g);
+    if (tok.isEmpty) return null;
+    final cl = _clustersCached(tok);
+    final expNorm = _arNorm(tok);
+    final heardNorm = _arNorm(_dbgTr);
+    if (expNorm.length < 2 || heardNorm.length < 2) return null;
+    final span = expNorm.length + 10; // the end of the transcript (just said)
+    final from = heardNorm.length > span ? heardNorm.length - span : 0;
+    final loc = _approxLocate(heardNorm.substring(from), expNorm);
+    if (loc[2] > 1) return null; // too different: a wrong word, not a vowel
+    final s0 = from + loc[0];
+    final e0 = from + loc[1];
+    final hc =
+        _clusters(_dbgTr).where((c) => c.idx >= s0 && c.idx < e0).toList();
+    List<int>? hit;
+    for (final pr in _alignClusters(cl, hc)) {
+      final p = pr[0];
+      final ev = _signsOf(cl[p]).where(_isVowelRune).toList();
+      final hv = _signsOf(hc[pr[1]]).where(_isVowelRune).toList();
+      if (ev.length != 1 || hv.length != 1 || ev.first == hv.first) continue;
+      if (hit != null) return null; // several changes: let the normal flow judge
+      hit = [p, ev.first, hv.first];
+    }
+    return hit;
+  }
+
+  /// [expected letter, heard letter] when the transcript holds word [g] with
+  /// exactly one letter replaced by a look-alike one, else null.
+  List<String>? _letterMixOf(int ai, int g) {
+    if (_dbgTr.isEmpty) return null;
+    final tok = _wordText(ai, g);
+    if (tok.isEmpty) return null;
+    final exp = _arNorm(tok);
+    final heardNorm = _arNorm(_dbgTr);
+    if (exp.length < 3 || heardNorm.length < 3) return null;
+    // Only the END of the transcript: the word was said just now. A wide window
+    // also held an earlier correct copy of the same word (علیهم twice in
+    // الفاتحة) and the slip was judged "exact".
+    final span = exp.length + 10;
+    final from = heardNorm.length > span ? heardNorm.length - span : 0;
+    final loc = _approxLocate(heardNorm.substring(from), exp);
+    if (loc[2] != 1) return null; // exact (fine) or too different to judge
+    return _mixSlip(heardNorm.substring(from + loc[0], from + loc[1]), exp,
+        any: kAnyLetterGuard);
+  }
+
+  /// Level- and context-aware verdict on the engine's tajweed errors of word [g].
+  TajweedVerdict _judgeTajweed(int ai, int g, List<dynamic>? errs) {
+    if (errs == null || errs.isEmpty) return TajweedVerdict.none;
+    final end = _starts[ai + 1];
+    return TajweedBridge.judge(
+      errs,
+      word: _wordText(ai, g),
+      next: g + 1 < end ? _wordText(ai, g + 1) : '',
+      atWaqf: g == end - 1,
+      level: settings.coachLevel,
+    );
+  }
+
+  /// Remembers which lesson explains the mistake in word [g]: first from the
+  /// engine's tajweed error, else from the exact glyphs marked red.
+  void _setGuide(int ai, int g, TajweedVerdict? v, Set<int> signs) {
+    var id = v?.lessonId ?? 0;
+    if (id == 0 && signs.isNotEmpty) {
+      final end = _starts[ai + 1];
+      id = TajweedBridge.lessonForGlyphs(
+          signs, _wordText(ai, g), g + 1 < end ? _wordText(ai, g + 1) : '',
+          g == end - 1);
+    }
+    _setGuideId(id, g);
+  }
+
+  void _setGuideId(int id, int g) {
+    final ls = id == 0 ? null : tajweedLessonById(id);
+    guideLessonId = ls == null ? 0 : id;
+    guideLabel = ls == null ? '' : ls.titleKu;
+    _guideG = g;
+  }
+
+  /// The word [g] (or a later one) was read correctly: the hint is done.
+  void _clearGuideAt(int g) {
+    if (guideLessonId != 0 && g >= _guideG) {
+      guideLessonId = 0;
+      guideLabel = '';
+      _guideG = -1;
+    }
+  }
+
+  /// Shows word [g] as wrong and starts the teacher-style correction.
+  void _flagNeural(int ai, int g, bool wrongWord, String detail, int pos,
+      {List<dynamic>? errs, TajweedVerdict? verdict}) {
+    final al = _al;
+    if (al == null) return;
+    // only the faulty letter / sign turns red (empty: the whole word does)
+    final signs = _pinpointSigns(ai, g, errs);
+    if (signs.isEmpty) {
+      _badSigns.remove(g);
+    } else {
+      _badSigns[g] = signs;
+    }
+    _setGuide(ai, g, verdict, signs);
+    al.st[g] = wrongWord ? 2 : 4;
+    al.cursor = g;
+    al.rev++;
+    if (_correcting) {
+      notifyListeners();
+    } else {
+      // exact, teacher-style hint: which letter / shaddah / tanween / madd
+      final end = _starts[ai + 1];
+      final w0 = _wordText(ai, g);
+      final nx = g + 1 < end ? _wordText(ai, g + 1) : '';
+      final atEnd = g == end - 1;
+      var hint = TajweedExplainer.explain(
+          word: w0, signs: signs, next: nx, atWaqf: atEnd);
+      if (hint.isEmpty && verdict != null && verdict.flag) {
+        hint = TajweedExplainer.kindHint(
+            verdict.kind, verdict.dir, w0, nx, atEnd);
+      }
+      _teacherJudge(verdict, wrongWord, w0, g);
+      _correctNeural(ai, g, wrongWord, hint.isNotEmpty ? hint : detail, pos);
+    }
+  }
+
+  /// Classifies the mistake (red = major, yellow = minor), keeps the short
+  /// teacher tip for the panel and counts the points once per word.
+  /// A wrong word is always major; a tajweed slip is minor, because the
+  /// engine cannot tell whether the meaning changed.
+  void _teacherJudge(TajweedVerdict? v, bool wrongWord, String word, int g) {
+    final TeacherFeedback fb;
+    if (wrongWord || v == null || !v.flag) {
+      fb = TajweedTeacher.feedback(
+          kind: 'other', word: word, attempt: _wordFails[g] ?? 0, escalate: true);
+    } else {
+      fb = TajweedTeacher.feedback(
+          kind: v.kind.name,
+          dir: v.dir.name,
+          word: word,
+          attempt: _wordFails[g] ?? 0,
+          forceMinor: true);
+    }
+    teacherSeverity = fb.severity == ErrSeverity.jali ? 2 : 1;
+    teacherTip = fb.tip;
+    if (_scoredWords.add(g)) scorer.add(fb);
+  }
+
+  /// Closing message: the score is shown only when there were mistakes.
+  String get _doneMsg => scorer.items.isEmpty
+      ? 'ماشاءاللە! سوورەتەکەت تەواو کرد.'
+      : 'ماشاءاللە! سوورەتەکەت تەواو کرد.\n${scorer.summaryKu}';
+
+  /// The word the reader REALLY said (easy / balanced). It is found by place:
+  /// every word of the transcript's end is given to the expected word it is
+  /// nearest to (neighbours included), so a similar word next to it, or an
+  /// earlier correct copy of the same word, is never taken for it. Then:
+  ///  - a different REAL Quran word (علیکم for علیهم)  -> misread, red;
+  ///  - the same word with one other consonant          -> misread, red;
+  ///  - only spelling (long vowels, al- merged)         -> fine.
+  /// Returns the message for the teacher, or null when the word is fine or
+  /// cannot be judged (the engine's answer then stands).
+  String? _misreadOf(int ai, int g) {
+    final al = _al;
+    if (al == null || _dbgTr.isEmpty || g < 0 || g >= al.words.length) {
+      return null;
+    }
+    final exp = al.words[g];
+    if (exp.length < 3) return null;
+    final raw = <String>[];
+    final toks = <String>[];
+    for (final t in _dbgTr.split(RegExp(r'\s+'))) {
+      final n = _arNorm(t);
+      if (n.isEmpty) continue;
+      raw.add(t);
+      toks.add(n);
+    }
+    if (toks.isEmpty) return null;
+    final lo = g - 4 < 0 ? 0 : g - 4;
+    final hi = g + 4 >= al.words.length ? al.words.length - 1 : g + 4;
+    final lim = exp.length >= 7 ? 3 : (exp.length >= 5 ? 2 : 1);
+    final tailFrom = toks.length > 6 ? toks.length - 6 : 0;
+    for (var i = toks.length - 1; i >= tailFrom; i--) {
+      final t = toks[i];
+      var best = 1 << 30;
+      var forG = false;
+      for (var j = lo; j <= hi; j++) {
+        final d = _lev(t, al.words[j]);
+        if (d < best) {
+          best = d;
+          forG = j == g;
+        } else if (d == best && j == g) {
+          forG = true;
+        }
+      }
+      if (best > lim || !forG) continue; // noise, or another word's text
+      if (t == exp) return null;
+      final st = t.replaceAll(_arMatres, '');
+      final se = exp.replaceAll(_arMatres, '');
+      if (st == se) return null; // only long-vowel letters differ: spelling
+      // lam of al- merged into a sun letter (الشمس written اشمس)
+      if (exp.startsWith('ال') && se.length > 1 && st == se.substring(1)) {
+        return null;
+      }
+      // last letter changed by the next word (idgham / iqlab)
+      final nx = g + 1 < al.words.length ? al.words[g + 1] : '';
+      if (nx.isNotEmpty &&
+          'برلمنوي'.contains(nx[0]) &&
+          st.length == se.length &&
+          st.isNotEmpty &&
+          st.substring(0, st.length - 1) == se.substring(0, se.length - 1)) {
+        return null;
+      }
+      final v = _QuranIndex.vocab;
+      if (v != null && v.contains(st)) {
+        return 'وشەی «${raw[i]}» بیستراوە، بەڵام دەبێت «${_wordText(ai, g)}» بێت';
+      }
+      final sub = _mixSlip(t, exp, any: kAnyLetterGuard);
+      if (sub != null) return 'پیتی «${sub[0]}» وەک «${sub[1]}» بیستراوە';
+      return null;
+    }
+    return null;
+  }
+
+  /// The engine can confirm a word before the transcript has the word in it.
+  /// For a moment after each accepted word (easy / balanced) every new
+  /// transcript is checked again; a misread word then turns red like any other.
+  void _reverify() {
+    final g = _verG;
+    final al = _al;
+    if (g < 0 || al == null || _correcting || !kLetterMixGuard) return;
+    if (g >= _wayah.length ||
+        DateTime.now().difference(_verAt).inMilliseconds > 1500 ||
+        al.cursor != g + 1 ||
+        al.st[g] != 1) {
+      _verG = -1;
+      return;
+    }
+    final ai = _wayah[g];
+    final why = _misreadOf(ai, g);
+    if (why == null) return; // keep watching until the moment is over
+    _verG = -1;
+    _flagNeural(ai, g, true, why, g - _starts[ai] + 1);
+    _badSigns.remove(g);
+  }
+
+  /// Last word index (inclusive) of a connected phrase around word [g] that the
+  /// recogniser's text confirms, or -1. Smallest phrases first; each contains
+  /// [g], stays inside the ayah, and is long enough to prove something.
+  int _connectedSpan(int ai, int g) {
+    if (!kPhoneticLayer || ai < 0 || ai + 1 >= _starts.length) return -1;
+    final heard = _heardSkelOf(_dbgTr);
+    if (heard.length < 4) return -1;
+    final a0 = _starts[ai];
+    final a1 = _starts[ai + 1] - 1;
+    for (var size = 1; size <= 5; size++) {
+      for (var lo = g - size + 1; lo <= g; lo++) {
+        final hi = lo + size - 1;
+        if (lo < a0 || hi > a1 || hi >= _phon.length) continue;
+        final ws = _phon.sublist(lo, hi + 1);
+        // spelled as pronounced: wasl alef dropped, lam of al- merged
+        final joined = _connSkel(
+            QuranPhonetics.chain(ws, sounded: false, startOfUtterance: lo == a0));
+        // plain letters, in case the recogniser writes al- unmerged
+        final plain = _connSkel(ws.map((p) => p.ortho).join());
+        final lv = settings.coachLevel;
+        if (_connContains(heard, joined, lv) || _connContains(heard, plain, lv)) {
+          return hi;
+        }
+      }
+    }
+    return -1;
+  }
+
+  /// The connected phrase g..hi was read correctly: green, move on.
+  void _acceptConnected(int g, int hi) {
+    final al = _al;
+    if (al == null) return;
+    for (var k = g; k <= hi && k < al.words.length; k++) {
+      al.st[k] = 1;
+      _wordFails.remove(k);
+      _badLetters.remove(k);
+      _badSigns.remove(k);
+      _clearGuideAt(k);
+    }
+    if (hi + 1 > al.cursor) al.cursor = hi + 1;
+    al.rev++;
+    _ctxDoneCheck();
+    _stall?.cancel();
+    _lastGreenAt = DateTime.now();
+    if (al.cursor >= al.words.length) {
+      stop(msg: _doneMsg);
+      return;
+    }
+    _prefetchAhead();
+    notifyListeners();
+  }
+
+  /// Teacher-style correction: the previous word and the wrong word are said
+  /// connected at once. The window never grows backwards: a word the reader
+  /// already got right is not judged or re-flagged again.
+  Future<void> _correctNeural(
+      int ai, int g, bool wrongWord, String detail, int pos) async {
+    final al = _al;
+    if (al == null) return;
+    final ayah = _ayahs[ai];
+    final bad = _wordText(ai, g);
+    if ((_wordFails[g] ?? 0) >= _maxFails) {
+      // corrected often enough: stop blocking, mark it and carry on
+      _wordFails.remove(g);
+      _ctxLo = _ctxHi = _ctxG = -1;
+      al.st[g] = 4;
+      al.cursor = g + 1;
+      al.rev++;
+      if (al.cursor >= al.words.length) {
+        stop(msg: _doneMsg);
+        return;
+      }
+      _set(CoachState.listening,
+          'بەردەوام بە - وشەی «$bad» دواتر دووبارە بکەرەوە');
+      return;
+    }
+    // live tracking is paused (_correcting) and the microphone is not fed
+    _correcting = true;
+    _corrArmed = false;
+    final fails = (_wordFails[g] ?? 0) + 1;
+    _wordFails[g] = fails;
+    // Contextual error window: ONLY the previous word and the wrong word (kept
+    // inside the ayah). The previous word is just the connecting word (it was
+    // already right and is never judged again); the teacher says exactly this
+    // phrase, connected, and the reader says it again from its first word.
+    final lo = g - 1 < _starts[ai] ? _starts[ai] : g - 1;
+    final hi = g;
+    _ctxLo = lo;
+    _ctxHi = hi;
+    _ctxG = g;
+    for (var k = lo; k <= hi; k++) {
+      if (k != g) al.st[k] = 0; // neighbours are shown as guidance until re-read
+    }
+    var before = 0;
+    var through = 0;
+    var total = 0;
+    for (var k = _starts[ai]; k < _starts[ai + 1]; k++) {
+      final n = al.words[k].length + 1;
+      total += n;
+      if (k < lo) before += n;
+      if (k <= hi) through += n;
+    }
+    final from = total > 0 ? before / total : 0.0;
+    final to = total > 0 ? through / total : 0.0;
+    al.cursor = lo; // _resyncTracker puts the engine back on this word
+    al.rev++;
+    heardText.value = '';
+    final phrase = _ctxPhrase();
+    _notes[g] = _WordNote(
+      wrongWord
+          ? 'هەڵە لە وشەی «$bad»${detail.isEmpty ? '' : ' - $detail'}'
+          : 'هەڵەی تەجوید لە وشەی «$bad»${detail.isEmpty ? '' : ' ($detail)'}',
+      teacherTip,
+      teacherSeverity,
+      guideLessonId,
+      guideLabel,
+    );
+    _set(
+      CoachState.correcting,
+      wrongWord
+          ? 'هەڵە لە وشەی «$bad»${detail.isEmpty ? '' : ' - $detail'} - گوێبگرە: «$phrase»'
+          : 'هەڵەی تەجوید لە وشەی «$bad»${detail.isEmpty ? '' : ' ($detail)'} - گوێبگرە: «$phrase»',
+    );
+    _safety?.cancel();
+    _safety = Timer(const Duration(seconds: 12), _endCorrection);
+    // always the connected ayah recording (never isolated word clips, which
+    // sound chopped: "bismi ... Allah"), only the 3-word slice
+    final f = audio.playCorrection(surah, ayah.n, from: from, to: to);
+    _corrArmed = true;
+    await f;
+    if (_correcting && audio.corrMs > 0) {
+      _safety?.cancel();
+      _safety = Timer(Duration(milliseconds: audio.corrMs), _endCorrection);
+    }
+  }
+
+  // ---------- correction ----------
+  /// Letters of word [g] that are never pronounced (lam of al- before a sun
+  /// letter): they must not be reported as "not heard".
+  Set<int>? _silentOf(int g, String expected) {
+    if (!kPhoneticLayer || g < 0 || g >= _phon.length) return null;
+    final p = _phon[g];
+    return (p.ortho == expected && p.silent.isNotEmpty) ? p.silent : null;
+  }
+
+  Future<void> _correct(AlignEvent ev) async {
+    final al = _al;
+    if (al == null) return;
+    final ai = _wayah[ev.g];
+    final ayah = _ayahs[ai];
+    final bad = _wordText(ai, ev.g);
+    _correcting = true;
+    _corrArmed = false;
+    _restart?.cancel();
+    _idle?.cancel();
+    // which letters were wrong (shown in red inside the word)
+    var detail = '';
+    if (!ev.skipped && ev.heard.isNotEmpty && ev.expected.isNotEmpty) {
+      final ld =
+          _letterDiff(ev.heard, ev.expected, _silentOf(ev.g, ev.expected));
+      if (ld.bad.isNotEmpty) _badLetters[ev.g] = ld.bad;
+      if (ld.notes.isNotEmpty) detail = ' (${ld.notes.take(2).join(' • ')})';
+      if (ld.bad.isNotEmpty) {
+        final tip = TajweedExplainer.letterTipAt(ev.expected, ld.bad.first);
+        if (tip.isNotEmpty) detail = '$detail - $tip';
+      }
+    }
+    // a wrong letter is a makhraj mistake (lesson 17); a skipped word has none
+    final lb = _badLetters[ev.g];
+    _setGuideId(lb != null && lb.isNotEmpty ? 17 : 0, ev.g);
+    _teacherJudge(null, true, bad, ev.g);
+    // normal levels: repeat the whole ayah. letter-by-letter level: repeat
+    // only from two words before the mistake, and play the audio from there.
+    final letterMode = settings.coachLevel >= 3;
+    var resume = _starts[ai];
+    var from = 0.0;
+    if (letterMode) {
+      resume = ev.g - 2 < _starts[ai] ? _starts[ai] : ev.g - 2;
+      var before = 0;
+      var total = 0;
+      for (var k = _starts[ai]; k < _starts[ai + 1]; k++) {
+        final w = al.words[k].length + 1;
+        total += w;
+        if (k < resume) before += w;
+      }
+      if (total > 0) from = before / total;
+    }
+    al.rewindTo(resume, _starts[ai + 1]);
+    _wasLocked = true;
+    heardText.value = '';
+    _notes[ev.g] = _WordNote(
+      ev.skipped
+          ? 'وشەیەک بەجێماوە لە ئایەتی ${ayah.n}'
+          : 'هەڵە لە وشەی «$bad»$detail - ئایەتی ${ayah.n}',
+      teacherTip,
+      teacherSeverity,
+      guideLessonId,
+      guideLabel,
+    );
+    _set(
+      CoachState.correcting,
+      ev.skipped
+          ? 'وشەیەک بەجێماوە لە ئایەتی ${ayah.n}. گوێبگرە و دووبارە بکەرەوە'
+          : 'هەڵە لە وشەی «$bad»$detail - ئایەتی ${ayah.n}. گوێبگرە و دووبارە بکەرەوە',
+    );
+    try {
+      await _stt.cancel();
+    } catch (_) {}
+    if (!on || !_correcting) return;
+    _safety?.cancel();
+    _safety = Timer(const Duration(seconds: 40), _endCorrection);
+    final f = audio.playCorrection(surah, ayah.n, from: from);
+    _corrArmed = true; // playCorrection has already registered the new ayah
+    await f;
+  }
+
+  Future<void> _endCorrection() async {
+    if (!_correcting) return;
+    _correcting = false;
+    _corrArmed = false;
+    _safety?.cancel();
+    if (audio.surah != 0) await audio.stop();
+    if (!on) return;
+    _selfAudioUntil = DateTime.now().add(const Duration(seconds: 2));
+    if (_neural) {
+      // Android reports our own teacher audio as "focus lost": take the focus
+      // back. During a real call this is refused: wait for the call instead.
+      if (!await _reclaimFocus()) {
+        if (on) await _pauseForInterruption();
+        return;
+      }
+      if (!on) return;
+      _resyncTracker();
+      // The reader sees at once that it is their turn (no silent screen while
+      // the microphone is re-opened); the engine is live a moment later.
+      final sw = Stopwatch()..start();
+      final ph0 = _ctxLo >= 0 ? _ctxPhrase() : '';
+      if (ph0.isNotEmpty) {
+        _set(
+            CoachState.listening,
+            _voiceMissing
+                ? 'دەنگی مامۆستا بێ ئینتەرنێت بەردەست نییە. ${teacherTip.isEmpty ? '' : '$teacherTip '}خۆت بیخوێنەوە: «$ph0»'
+                : 'ئامادەبە: «$ph0»');
+      }
+      _voiceMissing = false;
+      // The microphone stayed open (its input was only muted while the teacher
+      // spoke), so listening starts at once. It is closed and opened again only
+      // when it stopped delivering audio.
+      final alive = _nMic != null &&
+          DateTime.now().difference(_lastChunkAt) <
+              const Duration(milliseconds: 700);
+      if (alive) {
+        _unmuteAt = DateTime.now().add(const Duration(milliseconds: 150));
+        // the stream can die right at the end of the teacher's audio: check
+        Timer(const Duration(milliseconds: 900), () {
+          if (!on || !_neural || _correcting || _interrupted) return;
+          if (DateTime.now().difference(_lastChunkAt) >
+              const Duration(milliseconds: 600)) {
+            _restartMic();
+          }
+        });
+      } else {
+        final ok = await _restartMic();
+        if (!on) return;
+        if (!ok) {
+          // never leave a dead microphone behind a "listening" status: wait
+          // and try again by itself
+          await _pauseForInterruption(
+              msg: 'مایکرۆفۆن ئامادە نەبوو - خۆی دووبارە هەوڵ دەداتەوە...');
+          return;
+        }
+        _unmuteAt = DateTime.now();
+      }
+      _dbgEv = '$_dbgEv [⏱ ${sw.elapsedMilliseconds}ms]'; // mic re-open time
+      heardText.value = '$_dbgEv  $_dbgTr';
+      // diagnostics: 2 s later show whether audio reaches the engine
+      final c0 = _micChunks;
+      final f0 = _fed;
+      Timer(const Duration(seconds: 2), () {
+        if (!on || !_neural) return;
+        _dbgEv = '${_dbgEv.split(' [مایک').first} [مایک +${_micChunks - c0} / نێردرا +${_fed - f0}]';
+        heardText.value = '$_dbgEv  $_dbgTr';
+      });
+      _prefetchAhead();
+      // If the engine gives no word after the correction (it may be waiting
+      // for the same word, or already be ahead), do not freeze on this word:
+      // after 5 s the cursor moves on. Engine results still win when they come.
+      _stall?.cancel();
+      final pin = _al?.cursor ?? -1;
+      _stall = Timer(const Duration(seconds: 5), () {
+        final a = _al;
+        if (!on || _correcting || a == null || a.cursor != pin) return;
+        if (pin + 1 >= a.words.length) return;
+        _wordFails.remove(pin);
+        _ctxLo = _ctxHi = _ctxG = -1;
+        a.cursor = pin + 1;
+        a.rev++;
+        _prefetchAhead();
+        _set(CoachState.listening, 'گوێم لێتە - بەردەوام بخوێنە');
+      });
+      final ph = _ctxLo >= 0 ? _ctxPhrase() : '';
+      final w = _cursorWord();
+      _set(
+          CoachState.listening,
+          ph.isNotEmpty
+              ? 'ئێستا ئەم دەستەواژەیە دووبارە بکەرەوە: «$ph»'
+              : (w.isNotEmpty
+                  ? 'ئامادەبە، لە وشەی «$w» دەست پێبکەوە...'
+                  : 'گوێم لێتە'));
+      return;
+    }
+    final cw = settings.coachLevel >= 3 ? _cursorWord() : '';
+    _set(
+        CoachState.paused,
+        cw.isNotEmpty
+            ? 'ئامادەبە، لە وشەی «$cw» دەست پێبکەوە...'
+            : 'ئامادەبە، ئایەتی $cursorAyah دووبارە بکەرەوە...');
+    _scheduleRestart(const Duration(milliseconds: 700));
+  }
+
+  void _onAudio() {
+    if (!on) return;
+    if (_correcting) {
+      if (_corrArmed && (audio.surah == 0 || audio.error)) {
+        if (audio.error) _voiceMissing = true; // no network and not downloaded
+        _endCorrection();
+      }
+      return;
+    }
+    if (_neural) return;
+    if (audio.playing) {
+      if (state == CoachState.listening) {
+        _restart?.cancel();
+        _set(CoachState.paused, 'گوێگرتن ڕاگیراوە تا دەنگەکە دەوەستێت');
+        _stt.cancel();
+      }
+    } else if (state == CoachState.paused) {
+      _scheduleRestart(const Duration(milliseconds: 500));
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState s) {
+    if (on && s == AppLifecycleState.paused && state != CoachState.starting) {
+      // Android takes the microphone away in the background: stop cleanly
+      // (the position is saved) and carry on from there when the app is back.
+      _resumeAfterBg = true;
+      stop(msg: 'گوێگرتن وەستا. کە گەڕایتەوە، لە هەمان شوێن بەردەوام دەبێت.');
+    } else if (s == AppLifecycleState.resumed && _resumeAfterBg && !on) {
+      _resumeAfterBg = false;
+      final ay = _lastAyahs;
+      final sn = surah;
+      if (ay != null && sn > 0) start(sn, ay); // free session, no forced position
+    }
+  }
+}
+
+final RecitationCoach coach = RecitationCoach();
+
+// ---------- UI: toggle (next to the Settings icon) ----------
+class _CoachToggle extends StatelessWidget {
+  final VoidCallback onTurnOn;
+  const _CoachToggle({required this.onTurnOn});
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: coach,
+      builder: (context, _) {
+        final sw = Tooltip(
+          message: 'ڕاستکردنەوەی خوێندنەوە بە دەنگ',
+          child: SizedBox(
+            width: 50,
+            child: FittedBox(
+              child: Switch(
+                value: coach.on,
+                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                onChanged: (v) {
+                  if (v) {
+                    onTurnOn();
+                  } else {
+                    coach.stop();
+                  }
+                },
+                thumbIcon: WidgetStateProperty.resolveWith<Icon?>(
+                  (states) => states.contains(WidgetState.selected)
+                      ? const Icon(Icons.mic, size: 16, color: Colors.white)
+                      : const Icon(Icons.mic_off, size: 16, color: Color(0xFF6B6A5E)),
+                ),
+                thumbColor: WidgetStateProperty.resolveWith<Color?>(
+                  (states) => states.contains(WidgetState.selected)
+                      ? _green
+                      : Colors.white,
+                ),
+                trackColor: WidgetStateProperty.resolveWith<Color?>(
+                  (states) => states.contains(WidgetState.selected)
+                      ? _gold
+                      : const Color(0x66FFFFFF),
+                ),
+                trackOutlineColor:
+                    const WidgetStatePropertyAll<Color>(Colors.transparent),
+              ),
+            ),
+          ),
+        );
+        // live sound bars next to the switch while the microphone is on
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (coach.on) const _MicWave(),
+            sw,
+          ],
+        );
+      },
+    );
+  }
+}
+
+/// Small equaliser next to the mic switch: the bars follow the real
+/// microphone level, so the reader sees that the app is hearing the voice.
+/// Quiet = slow breathing dots, voice = bars dancing with the loudness.
+class _MicWave extends StatefulWidget {
+  const _MicWave();
+
+  @override
+  State<_MicWave> createState() => _MicWaveState();
+}
+
+class _MicWaveState extends State<_MicWave>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1100),
+  )..repeat();
+  double _sm = 0; // smoothed level
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _c,
+      builder: (context, _) {
+        final now = DateTime.now();
+        var target = 0.0;
+        if (coach.state == CoachState.listening) {
+          if (now.difference(coach.micLevelAt).inMilliseconds < 600) {
+            target = coach.micLevel.value;
+          }
+          if (now.difference(coach.voiceAt).inMilliseconds < 1500 &&
+              target < 0.45) {
+            target = 0.45; // the engine hears words: surely voice
+          }
+        }
+        _sm += (target - _sm) * 0.35;
+        final voiced = _sm > 0.12;
+        final t = _c.value;
+        const n = 5;
+        return Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4),
+          child: SizedBox(
+            width: 28,
+            height: 26,
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                for (var i = 0; i < n; i++)
+                  Container(
+                    width: 3.5,
+                    height: voiced
+                        ? 4 +
+                            20 *
+                                _sm.clamp(0.0, 1.0) *
+                                (0.35 +
+                                    0.65 *
+                                        (0.5 +
+                                            0.5 *
+                                                math.sin(
+                                                    2 * math.pi * (t * 2 + i * 0.23))))
+                        : 4 + 2.5 * (0.5 + 0.5 * math.sin(2 * math.pi * (t + i * 0.2))),
+                    margin: const EdgeInsets.symmetric(horizontal: 1.2),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(2),
+                      color: voiced
+                          ? const Color(0xFFFFE08A)
+                          : Colors.white.withAlpha(150),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+// ---------- UI: status panel above the player bar ----------
+class _CoachPanel extends StatelessWidget {
+  const _CoachPanel();
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: Listenable.merge([coach, audio]),
+      builder: (context, _) {
+        if (!coach.on) return const SizedBox.shrink();
+        final st = coach.state;
+        final rv = coach.review; // a tapped red word: its note again
+        final bad = rv != null || st == CoachState.correcting;
+        final minor =
+            bad && (rv != null ? rv.severity : coach.teacherSeverity) == 1;
+        final shownMsg = rv?.message ?? coach.message;
+        final shownTip = rv != null ? rv.tip : coach.teacherTip;
+        final shownLesson = rv != null ? rv.lessonId : coach.guideLessonId;
+        final shownLabel = rv != null ? rv.lessonLabel : coach.guideLabel;
+        final accent = bad
+            ? (minor ? const Color(0xFFF9A825) : const Color(0xFFD32F2F))
+            : _green;
+        // dark amber for the text (yellow is unreadable on a light card)
+        final textAccent = minor ? const Color(0xFF9A6700) : accent;
+        return Material(
+          color: _cardColor(context),
+          child: SafeArea(
+            top: false,
+            bottom: audio.surah == 0,
+            child: Container(
+              decoration: BoxDecoration(
+                border: Border(top: BorderSide(color: accent, width: 2)),
+              ),
+              padding: const EdgeInsets.fromLTRB(14, 8, 14, 8),
+              child: Row(
+                children: [
+                  // long-press: show / hide the performance numbers
+                  GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onLongPress: perf.toggleHud,
+                    child: _MicDot(
+                      active: st == CoachState.listening,
+                      color: accent,
+                      icon: rv != null
+                          ? Icons.info_outline
+                          : bad
+                          ? Icons.volume_up
+                          : (st == CoachState.paused ? Icons.mic_off : Icons.mic),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          shownMsg,
+                          style: TextStyle(
+                            fontSize: 14.5,
+                            fontWeight: FontWeight.bold,
+                            color: bad ? textAccent : _inkColor(context),
+                          ),
+                        ),
+                        if (bad && shownTip.isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 3),
+                            child: Text(
+                              shownTip,
+                              style: TextStyle(
+                                fontSize: 13,
+                                height: 1.35,
+                                color: _mutedColor(context),
+                              ),
+                            ),
+                          ),
+                        if (shownLesson != 0)
+                          TextButton.icon(
+                            style: TextButton.styleFrom(
+                              padding: EdgeInsets.zero,
+                              minimumSize: const Size(0, 30),
+                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                              alignment: AlignmentDirectional.centerStart,
+                              foregroundColor: _green,
+                            ),
+                            icon: const Icon(Icons.menu_book, size: 18),
+                            label: Text(
+                              'وانەی $shownLesson ببینەوە: $shownLabel',
+                              style: const TextStyle(
+                                  fontSize: 13.5, fontWeight: FontWeight.bold),
+                            ),
+                            onPressed: () {
+                              final id = shownLesson;
+                              final nav = Navigator.of(context);
+                              // the microphone is closed while the lesson is open
+                              coach.stop(
+                                  msg:
+                                      'گوێگرتن وەستا بۆ پێداچوونەوەی وانە. دووبارە دەستی پێبکەرەوە.');
+                              nav.push(MaterialPageRoute<void>(
+                                  builder: (_) =>
+                                      TajweedLessonsScreen(initialLessonId: id)));
+                            },
+                          ),
+                        ValueListenableBuilder<String>(
+                          valueListenable: perf.hud,
+                          builder: (context, v, _) => v.isEmpty
+                              ? const SizedBox.shrink()
+                              : Text(
+                                  v,
+                                  maxLines: 4,
+                                  softWrap: false,
+                                  overflow: TextOverflow.clip,
+                                  textDirection: TextDirection.ltr,
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    height: 1.25,
+                                    fontFamily: 'monospace',
+                                    color: _mutedColor(context),
+                                  ),
+                                ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _MicDot extends StatefulWidget {
+  final bool active;
+  final Color color;
+  final IconData icon;
+  const _MicDot({required this.active, required this.color, required this.icon});
+
+  @override
+  State<_MicDot> createState() => _MicDotState();
+}
+
+class _MicDotState extends State<_MicDot> with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 900),
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    _sync();
+  }
+
+  @override
+  void didUpdateWidget(_MicDot old) {
+    super.didUpdateWidget(old);
+    _sync();
+  }
+
+  void _sync() {
+    if (widget.active) {
+      if (!_c.isAnimating) _c.repeat(reverse: true);
+    } else {
+      _c.stop();
+      _c.value = 0;
+    }
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _c,
+      builder: (context, _) {
+        final t = _c.value;
+        return Container(
+          width: 40,
+          height: 40,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: widget.color,
+            boxShadow: widget.active
+                ? [
+                    BoxShadow(
+                      color: const Color(0x661E7A3E),
+                      blurRadius: 4 + 8 * t,
+                      spreadRadius: 1 + 4 * t,
+                    ),
+                  ]
+                : const [],
+          ),
+          child: Icon(widget.icon, color: Colors.white, size: 22),
+        );
+      },
+    );
+  }
+}
+
+// ---------- UI: Arabic text of one ayah (coloured while the coach is on) ----------
+// Rebuilds only when the fingerprint of ITS OWN words changes (see
+// RecitationCoach.markSignature), not on every coach notification.
+class _AyahArabic extends StatefulWidget {
+  final Ayah a;
+  final int surah;
+  const _AyahArabic(this.a, this.surah);
+
+  @override
+  State<_AyahArabic> createState() => _AyahArabicState();
+}
+
+class _AyahArabicState extends State<_AyahArabic> {
+  int _sig = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _sig = coach.markSignature(widget.surah, widget.a.n);
+    coach.addListener(_onCoach);
+  }
+
+  @override
+  void didUpdateWidget(_AyahArabic old) {
+    super.didUpdateWidget(old);
+    _sig = coach.markSignature(widget.surah, widget.a.n);
+  }
+
+  @override
+  void dispose() {
+    coach.removeListener(_onCoach);
+    super.dispose();
+  }
+
+  void _onCoach() {
+    if (!mounted) return;
+    final s = coach.markSignature(widget.surah, widget.a.n);
+    if (s == _sig) {
+      perf.uiSkipped++;
+      return;
+    }
+    _sig = s;
+    perf.uiRebuilt++;
+    setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t0 = perf.now();
+    final w = _content(context);
+    perf.marksBuild.add(perf.now() - t0);
+    return w;
+  }
+
+  Widget _content(BuildContext context) {
+    final a = widget.a;
+    final base = TextStyle(
+      fontSize: settings.arabicSize,
+      height: 2.0,
+      color: _inkColor(context),
+      fontFamily: _quranFont,
+      fontFamilyFallback: _arFonts,
+    );
+    final m = coach.marksFor(widget.surah, a.n);
+    if (m == null) {
+      return Text(
+        a.ar,
+        textDirection: TextDirection.rtl,
+        textAlign: TextAlign.start,
+        style: base,
+      );
+    }
+    final dark = _isDark(context);
+    final okColor = dark ? const Color(0xFF6FD08C) : _green;
+    final badColor = dark ? const Color(0xFFFF7B7B) : const Color(0xFFD32F2F);
+    // every style is made once per build and shared by all words
+    final ink = TextStyle(color: _inkColor(context));
+    final okStyle = TextStyle(color: okColor);
+    final badStyle =
+        TextStyle(color: badColor, backgroundColor: const Color(0x33E53935));
+    const curStyle =
+        TextStyle(color: _gold, backgroundColor: Color(0x33D9A21B));
+    // tajweed slip (word right, rule wrong)
+    const slipStyle =
+        TextStyle(color: Color(0xFFEF8F00), backgroundColor: Color(0x44EF8F00));
+    // guidance: the words around a mistake, to be read again
+    final guideStyle = TextStyle(
+      color: dark ? const Color(0xFF4DB6AC) : const Color(0xFF00796B),
+      backgroundColor: const Color(0x2200897B),
+    );
+    final hot = TextStyle(color: badColor, fontWeight: FontWeight.bold);
+    final hotLetter = TextStyle(
+      color: badColor,
+      fontWeight: FontWeight.bold,
+      backgroundColor: const Color(0x66E53935),
+    );
+    // neighbouring words with the same style are joined into one run
+    final spans = <TextSpan>[];
+    final run = StringBuffer();
+    TextStyle? runStyle;
+    void flush() {
+      if (run.isEmpty) return;
+      spans.add(TextSpan(text: run.toString(), style: runStyle));
+      run.clear();
+    }
+
+    for (var i = 0; i < m.tokens.length; i++) {
+      final last = i == m.tokens.length - 1;
+      final mark = m.marks[i];
+      final wrong = m.letters[i];
+      final sg = m.signs[i];
+      if ((mark == 2 || mark == 4) && sg != null && sg.isNotEmpty) {
+        // granular: only the faulty letter / sign is red
+        flush();
+        final cl = _clustersCached(m.tokens[i]);
+        spans.add(TextSpan(children: [
+          for (var p = 0; p < cl.length; p++)
+            ..._signSpans(cl[p], p, sg, ink, hot, const Color(0x44E53935)),
+          if (!last) const TextSpan(text: ' '),
+        ]));
+        continue;
+      }
+      if (mark == 2 && wrong != null && wrong.isNotEmpty) {
+        flush();
+        final cl = _clustersCached(m.tokens[i]);
+        spans.add(TextSpan(children: [
+          for (final c in cl)
+            TextSpan(text: c.text, style: wrong.contains(c.idx) ? hotLetter : ink),
+          if (!last) const TextSpan(text: ' '),
+        ]));
+        continue;
+      }
+      TextStyle? s;
+      switch (mark) {
+        case 1:
+          s = okStyle;
+          break;
+        case 2:
+          s = badStyle;
+          break;
+        case 3:
+          s = curStyle;
+          break;
+        case 4:
+          s = slipStyle;
+          break;
+        case 5:
+          s = guideStyle;
+          break;
+      }
+      if (run.isNotEmpty && !identical(s, runStyle)) flush();
+      runStyle = s;
+      run.write(m.tokens[i]);
+      if (!last) run.write(' ');
+    }
+    flush();
+    return Text.rich(
+      TextSpan(style: base, children: spans),
+      textDirection: TextDirection.rtl,
+      textAlign: TextAlign.start,
+    );
+  }
+}
+
+// ============================================================
+//  Mushaf pages: 604 pages like the printed Madani Mushaf.
+//  Page starts and hizb starts come from Tanzil's quran-data.js
+//  (pairs of surah, ayah; the last page entry is a sentinel).
+// ============================================================
+const List<int> _kPg = [
+  1, 1, 2, 1, 2, 6, 2, 17, 2, 25, 2, 30, 2, 38, 2, 49, 2, 58, 2, 62,
+  2, 70, 2, 77, 2, 84, 2, 89, 2, 94, 2, 102, 2, 106, 2, 113, 2, 120, 2, 127,
+  2, 135, 2, 142, 2, 146, 2, 154, 2, 164, 2, 170, 2, 177, 2, 182, 2, 187, 2, 191,
+  2, 197, 2, 203, 2, 211, 2, 216, 2, 220, 2, 225, 2, 231, 2, 234, 2, 238, 2, 246,
+  2, 249, 2, 253, 2, 257, 2, 260, 2, 265, 2, 270, 2, 275, 2, 282, 2, 283, 3, 1,
+  3, 10, 3, 16, 3, 23, 3, 30, 3, 38, 3, 46, 3, 53, 3, 62, 3, 71, 3, 78,
+  3, 84, 3, 92, 3, 101, 3, 109, 3, 116, 3, 122, 3, 133, 3, 141, 3, 149, 3, 154,
+  3, 158, 3, 166, 3, 174, 3, 181, 3, 187, 3, 195, 4, 1, 4, 7, 4, 12, 4, 15,
+  4, 20, 4, 24, 4, 27, 4, 34, 4, 38, 4, 45, 4, 52, 4, 60, 4, 66, 4, 75,
+  4, 80, 4, 87, 4, 92, 4, 95, 4, 102, 4, 106, 4, 114, 4, 122, 4, 128, 4, 135,
+  4, 141, 4, 148, 4, 155, 4, 163, 4, 171, 4, 176, 5, 3, 5, 6, 5, 10, 5, 14,
+  5, 18, 5, 24, 5, 32, 5, 37, 5, 42, 5, 46, 5, 51, 5, 58, 5, 65, 5, 71,
+  5, 77, 5, 83, 5, 90, 5, 96, 5, 104, 5, 109, 5, 114, 6, 1, 6, 9, 6, 19,
+  6, 28, 6, 36, 6, 45, 6, 53, 6, 60, 6, 69, 6, 74, 6, 82, 6, 91, 6, 95,
+  6, 102, 6, 111, 6, 119, 6, 125, 6, 132, 6, 138, 6, 143, 6, 147, 6, 152, 6, 158,
+  7, 1, 7, 12, 7, 23, 7, 31, 7, 38, 7, 44, 7, 52, 7, 58, 7, 68, 7, 74,
+  7, 82, 7, 88, 7, 96, 7, 105, 7, 121, 7, 131, 7, 138, 7, 144, 7, 150, 7, 156,
+  7, 160, 7, 164, 7, 171, 7, 179, 7, 188, 7, 196, 8, 1, 8, 9, 8, 17, 8, 26,
+  8, 34, 8, 41, 8, 46, 8, 53, 8, 62, 8, 70, 9, 1, 9, 7, 9, 14, 9, 21,
+  9, 27, 9, 32, 9, 37, 9, 41, 9, 48, 9, 55, 9, 62, 9, 69, 9, 73, 9, 80,
+  9, 87, 9, 94, 9, 100, 9, 107, 9, 112, 9, 118, 9, 123, 10, 1, 10, 7, 10, 15,
+  10, 21, 10, 26, 10, 34, 10, 43, 10, 54, 10, 62, 10, 71, 10, 79, 10, 89, 10, 98,
+  10, 107, 11, 6, 11, 13, 11, 20, 11, 29, 11, 38, 11, 46, 11, 54, 11, 63, 11, 72,
+  11, 82, 11, 89, 11, 98, 11, 109, 11, 118, 12, 5, 12, 15, 12, 23, 12, 31, 12, 38,
+  12, 44, 12, 53, 12, 64, 12, 70, 12, 79, 12, 87, 12, 96, 12, 104, 13, 1, 13, 6,
+  13, 14, 13, 19, 13, 29, 13, 35, 13, 43, 14, 6, 14, 11, 14, 19, 14, 25, 14, 34,
+  14, 43, 15, 1, 15, 16, 15, 32, 15, 52, 15, 71, 15, 91, 16, 7, 16, 15, 16, 27,
+  16, 35, 16, 43, 16, 55, 16, 65, 16, 73, 16, 80, 16, 88, 16, 94, 16, 103, 16, 111,
+  16, 119, 17, 1, 17, 8, 17, 18, 17, 28, 17, 39, 17, 50, 17, 59, 17, 67, 17, 76,
+  17, 87, 17, 97, 17, 105, 18, 5, 18, 16, 18, 21, 18, 28, 18, 35, 18, 46, 18, 54,
+  18, 62, 18, 75, 18, 84, 18, 98, 19, 1, 19, 12, 19, 26, 19, 39, 19, 52, 19, 65,
+  19, 77, 19, 96, 20, 13, 20, 38, 20, 52, 20, 65, 20, 77, 20, 88, 20, 99, 20, 114,
+  20, 126, 21, 1, 21, 11, 21, 25, 21, 36, 21, 45, 21, 58, 21, 73, 21, 82, 21, 91,
+  21, 102, 22, 1, 22, 6, 22, 16, 22, 24, 22, 31, 22, 39, 22, 47, 22, 56, 22, 65,
+  22, 73, 23, 1, 23, 18, 23, 28, 23, 43, 23, 60, 23, 75, 23, 90, 23, 105, 24, 1,
+  24, 11, 24, 21, 24, 28, 24, 32, 24, 37, 24, 44, 24, 54, 24, 59, 24, 62, 25, 3,
+  25, 12, 25, 21, 25, 33, 25, 44, 25, 56, 25, 68, 26, 1, 26, 20, 26, 40, 26, 61,
+  26, 84, 26, 112, 26, 137, 26, 160, 26, 184, 26, 207, 27, 1, 27, 14, 27, 23, 27, 36,
+  27, 45, 27, 56, 27, 64, 27, 77, 27, 89, 28, 6, 28, 14, 28, 22, 28, 29, 28, 36,
+  28, 44, 28, 51, 28, 60, 28, 71, 28, 78, 28, 85, 29, 7, 29, 15, 29, 24, 29, 31,
+  29, 39, 29, 46, 29, 53, 29, 64, 30, 6, 30, 16, 30, 25, 30, 33, 30, 42, 30, 51,
+  31, 1, 31, 12, 31, 20, 31, 29, 32, 1, 32, 12, 32, 21, 33, 1, 33, 7, 33, 16,
+  33, 23, 33, 31, 33, 36, 33, 44, 33, 51, 33, 55, 33, 63, 34, 1, 34, 8, 34, 15,
+  34, 23, 34, 32, 34, 40, 34, 49, 35, 4, 35, 12, 35, 19, 35, 31, 35, 39, 35, 45,
+  36, 13, 36, 28, 36, 41, 36, 55, 36, 71, 37, 1, 37, 25, 37, 52, 37, 77, 37, 103,
+  37, 127, 37, 154, 38, 1, 38, 17, 38, 27, 38, 43, 38, 62, 38, 84, 39, 6, 39, 11,
+  39, 22, 39, 32, 39, 41, 39, 48, 39, 57, 39, 68, 39, 75, 40, 8, 40, 17, 40, 26,
+  40, 34, 40, 41, 40, 50, 40, 59, 40, 67, 40, 78, 41, 1, 41, 12, 41, 21, 41, 30,
+  41, 39, 41, 47, 42, 1, 42, 11, 42, 16, 42, 23, 42, 32, 42, 45, 42, 52, 43, 11,
+  43, 23, 43, 34, 43, 48, 43, 61, 43, 74, 44, 1, 44, 19, 44, 40, 45, 1, 45, 14,
+  45, 23, 45, 33, 46, 6, 46, 15, 46, 21, 46, 29, 47, 1, 47, 12, 47, 20, 47, 30,
+  48, 1, 48, 10, 48, 16, 48, 24, 48, 29, 49, 5, 49, 12, 50, 1, 50, 16, 50, 36,
+  51, 7, 51, 31, 51, 52, 52, 15, 52, 32, 53, 1, 53, 27, 53, 45, 54, 7, 54, 28,
+  54, 50, 55, 17, 55, 41, 55, 68, 56, 17, 56, 51, 56, 77, 57, 4, 57, 12, 57, 19,
+  57, 25, 58, 1, 58, 7, 58, 12, 58, 22, 59, 4, 59, 10, 59, 17, 60, 1, 60, 6,
+  60, 12, 61, 6, 62, 1, 62, 9, 63, 5, 64, 1, 64, 10, 65, 1, 65, 6, 66, 1,
+  66, 8, 67, 1, 67, 13, 67, 27, 68, 16, 68, 43, 69, 9, 69, 35, 70, 11, 70, 40,
+  71, 11, 72, 1, 72, 14, 73, 1, 73, 20, 74, 18, 74, 48, 75, 20, 76, 6, 76, 26,
+  77, 20, 78, 1, 78, 31, 79, 16, 80, 1, 81, 1, 82, 1, 83, 7, 83, 35, 85, 1,
+  86, 1, 87, 16, 89, 1, 89, 24, 91, 1, 92, 15, 95, 1, 97, 1, 98, 8, 100, 10,
+  103, 1, 106, 1, 109, 1, 112, 1, 115, 1,
+];
+
+const List<int> _kHizbStart = [
+  1, 1, 2, 75, 2, 142, 2, 203, 2, 253, 3, 15, 3, 93, 3, 171, 4, 24, 4, 88,
+  4, 148, 5, 27, 5, 82, 6, 36, 6, 111, 7, 1, 7, 88, 7, 171, 8, 41, 9, 34,
+  9, 93, 10, 26, 11, 6, 11, 84, 12, 53, 13, 19, 15, 1, 16, 51, 17, 1, 17, 99,
+  18, 75, 20, 1, 21, 1, 22, 1, 23, 1, 24, 21, 25, 21, 26, 111, 27, 56, 28, 51,
+  29, 46, 31, 22, 33, 31, 34, 24, 36, 28, 37, 145, 39, 32, 40, 41, 41, 47, 43, 24,
+  46, 1, 48, 18, 51, 31, 55, 1, 58, 1, 62, 1, 67, 1, 72, 1, 78, 1, 87, 1,
+];
+
+int _pgS(int p) => _kPg[(p - 1) * 2];
+int _pgA(int p) => _kPg[(p - 1) * 2 + 1];
+
+/// Page (1..604) that holds ayah [a] of surah [s].
+int _pageOf(int s, int a) {
+  var lo = 1;
+  var hi = 604;
+  while (lo < hi) {
+    final mid = (lo + hi + 1) >> 1;
+    final ps = _pgS(mid);
+    final pa = _pgA(mid);
+    if (ps < s || (ps == s && pa <= a)) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return lo;
+}
+
+/// Hizb (1..60) that holds ayah [a] of surah [s].
+int _hizbOf(int s, int a) {
+  var h = 1;
+  for (var i = 0; i < 60; i++) {
+    final hs = _kHizbStart[i * 2];
+    final ha = _kHizbStart[i * 2 + 1];
+    if (hs < s || (hs == s && ha <= a)) {
+      h = i + 1;
+    } else {
+      break;
+    }
+  }
+  return h;
+}
+
+String _arDigits(int n) {
+  const d = ['٠', '١', '٢', '٣', '٤', '٥', '٦', '٧', '٨', '٩'];
+  final b = StringBuffer();
+  for (final c in '$n'.codeUnits) {
+    b.write(d[c - 48]);
+  }
+  return b.toString();
+}
+
+// ---------- colours of the recitation coach, per word ----------
+class _MarkSt {
+  final TextStyle ink, ok, bad, cur, slip, guide, hot, hotLetter;
+  const _MarkSt(this.ink, this.ok, this.bad, this.cur, this.slip, this.guide,
+      this.hot, this.hotLetter);
+
+  factory _MarkSt.of(BuildContext context) {
+    final dark = _isDark(context);
+    final okColor = dark ? const Color(0xFF6FD08C) : _green;
+    final badColor = dark ? const Color(0xFFFF7B7B) : const Color(0xFFD32F2F);
+    return _MarkSt(
+      TextStyle(color: _inkColor(context)),
+      TextStyle(color: okColor),
+      TextStyle(color: badColor, backgroundColor: const Color(0x33E53935)),
+      const TextStyle(color: _gold, backgroundColor: Color(0x33D9A21B)),
+      const TextStyle(
+          color: Color(0xFFEF8F00), backgroundColor: Color(0x44EF8F00)),
+      TextStyle(
+        color: dark ? const Color(0xFF4DB6AC) : const Color(0xFF00796B),
+        backgroundColor: const Color(0x2200897B),
+      ),
+      TextStyle(color: badColor, fontWeight: FontWeight.bold),
+      TextStyle(
+        color: badColor,
+        fontWeight: FontWeight.bold,
+        backgroundColor: const Color(0x66E53935),
+      ),
+    );
+  }
+}
+
+// ---------- the page widget ----------
+// ============================================================
+//  Madani Mushaf pages drawn with the King Fahd Complex page fonts
+//  (QCF V1): every page has its own font (p001..p604) and the lines are
+//  exactly the lines of the printed Mushaf.
+//  Files (made by fetch_qcf.py during the build):
+//    assets/quran_pages.json   page -> rows -> words (glyph code, ayah, ...)
+//    assets/qcf/pNNN.ttf       the 604 page fonts
+//  If anything is missing the page shows a retry button.
+// ============================================================
+// ---------- Mushaf page background: soft colours + a thin gold frame ----------
+class _PageBg {
+  final String name;
+  final Color top; // light mode: colour in the middle of the page
+  final Color edge; // light mode: colour at the edges
+  final Color frame; // light mode: ornament colour
+  final Color dTop, dEdge, dFrame; // the same three for dark mode
+  const _PageBg(this.name, this.top, this.edge, this.frame, this.dTop,
+      this.dEdge, this.dFrame);
+}
+
+const List<_PageBg> _kPageBgs = [
+  _PageBg('سەوزی کاڵ', Color(0xFFF7FBF3), Color(0xFFE5EFDD), Color(0xFFB59B4F),
+      Color(0xFF17251C), Color(0xFF0F1913), Color(0xFF8C7A3E)),
+  _PageBg('مرواری', Color(0xFFFFFDF8), Color(0xFFF1ECDF), Color(0xFFC2A45A),
+      Color(0xFF1C1F1B), Color(0xFF121412), Color(0xFF8C7A3E)),
+  _PageBg('ئاسمانی کاڵ', Color(0xFFF7FAFD), Color(0xFFE2ECF5), Color(0xFF9DB1C6),
+      Color(0xFF16202A), Color(0xFF0E151C), Color(0xFF6F8498)),
+  _PageBg('گوڵی کاڵ', Color(0xFFFFF8F6), Color(0xFFF4E4E0), Color(0xFFC79F8E),
+      Color(0xFF261B1B), Color(0xFF181111), Color(0xFF8E6E62)),
+  _PageBg('کرێمی کۆن', Color(0xFFFBF4E2), Color(0xFFFBF4E2), Color(0xFFD9A21B),
+      Color(0xFF111A14), Color(0xFF111A14), Color(0xFF8C7A3E)),
+];
+
+_PageBg _pageBgOf() =>
+    _kPageBgs[settings.pageBg.clamp(0, _kPageBgs.length - 1).toInt()];
+
+/// Colour at the edge of the page (also used behind the status bar).
+Color _pageBaseColor(BuildContext c) =>
+    _isDark(c) ? _pageBgOf().dEdge : _pageBgOf().edge;
+
+class _FramePainter extends CustomPainter {
+  final Color c;
+  const _FramePainter(this.c);
+
+  @override
+  void paint(Canvas canvas, Size s) {
+    if (s.width < 60 || s.height < 60) return;
+    final line = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.5
+      ..color = c;
+    final thin = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 0.7
+      ..color = c.withAlpha(150);
+    final fill = Paint()
+      ..style = PaintingStyle.fill
+      ..color = c;
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+          Rect.fromLTWH(4, 4, s.width - 8, s.height - 8),
+          const Radius.circular(12)),
+      line,
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+          Rect.fromLTWH(8, 8, s.width - 16, s.height - 16),
+          const Radius.circular(8)),
+      thin,
+    );
+    void diamond(double x, double y, double r) {
+      final p = Path()
+        ..moveTo(x, y - r)
+        ..lineTo(x + r, y)
+        ..lineTo(x, y + r)
+        ..lineTo(x - r, y)
+        ..close();
+      canvas.drawPath(p, fill);
+    }
+
+    for (final x in <double>[6, s.width - 6]) {
+      for (final y in <double>[6, s.height - 6]) {
+        diamond(x, y, 4.5);
+      }
+    }
+    diamond(s.width / 2, 4, 3.5);
+    diamond(s.width / 2, s.height - 4, 3.5);
+    diamond(4, s.height / 2, 3.5);
+    diamond(s.width - 4, s.height / 2, 3.5);
+  }
+
+  @override
+  bool shouldRepaint(covariant _FramePainter old) => old.c != c;
+}
+
+// ---------- surah banner like the printed Mushaf ----------
+// gold frame, the surah name in the middle, number of ayahs on the left and
+// Makki / Madani on the right.
+class _BannerPainter extends CustomPainter {
+  final Color frame, fill, fill2;
+  const _BannerPainter(this.frame, this.fill, this.fill2);
+
+  @override
+  void paint(Canvas canvas, Size s) {
+    if (s.width < 80 || s.height < 20) return;
+    final box = RRect.fromRectAndRadius(
+        Rect.fromLTWH(1.5, 1.5, s.width - 3, s.height - 3),
+        Radius.circular(s.height * 0.22));
+    canvas.drawRRect(
+      box,
+      Paint()
+        ..shader = LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [fill, fill2],
+        ).createShader(Offset.zero & s),
+    );
+    canvas.drawRRect(
+      box,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.2
+        ..color = frame,
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+          Rect.fromLTWH(5, 5, s.width - 10, s.height - 10),
+          Radius.circular(s.height * 0.16)),
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 0.8
+        ..color = frame.withAlpha(170),
+    );
+    final dot = Paint()..color = frame;
+    void diamond(double x, double y, double r) {
+      canvas.drawPath(
+        Path()
+          ..moveTo(x, y - r)
+          ..lineTo(x + r, y)
+          ..lineTo(x, y + r)
+          ..lineTo(x - r, y)
+          ..close(),
+        dot,
+      );
+    }
+
+    for (final x in <double>[7, s.width - 7]) {
+      for (final y in <double>[7, s.height - 7]) {
+        diamond(x, y, 3.4);
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _BannerPainter o) =>
+      o.frame != frame || o.fill != fill || o.fill2 != fill2;
+}
+
+class _SurahBanner extends StatelessWidget {
+  final int surah;
+  final double height;
+  const _SurahBanner(this.surah, this.height);
+
+  @override
+  Widget build(BuildContext context) {
+    final info = kSurahs[surah - 1];
+    final dark = _isDark(context);
+    final frame = dark ? const Color(0xFF9C8445) : const Color(0xFFC49A3A);
+    final fill = dark ? const Color(0xFF2B2616) : const Color(0xFFF9F0CF);
+    final fill2 = dark ? const Color(0xFF211D11) : const Color(0xFFF3E5B6);
+    final deep = dark ? const Color(0xFFD9B968) : const Color(0xFF8A6A1F);
+    final pillW = height * 1.5;
+
+    Widget pill(String t) {
+      return SizedBox(
+        width: pillW,
+        child: Container(
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: dark ? const Color(0x33D9A21B) : const Color(0x66F1D98A),
+            border: Border.all(color: frame, width: 1),
+            borderRadius: BorderRadius.circular(height * 0.28),
+          ),
+          child: FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 6),
+              child: Text(
+                t,
+                textDirection: TextDirection.rtl,
+                textScaler: TextScaler.noScaling,
+                style: TextStyle(
+                  fontSize: height * 0.25,
+                  height: 1.2,
+                  color: deep,
+                  fontWeight: FontWeight.w600,
+                  fontFamily: _quranFont,
+                  fontFamilyFallback: _arFonts,
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    return SizedBox(
+      height: height,
+      child: CustomPaint(
+        painter: _BannerPainter(frame, fill, fill2),
+        child: Padding(
+          padding: EdgeInsets.symmetric(
+              horizontal: height * 0.24, vertical: height * 0.15),
+          child: Row(
+            textDirection: TextDirection.rtl,
+            children: [
+              pill(info.makki ? 'مَكِّيَّة' : 'مَدَنِيَّة'),
+              Expanded(
+                child: Center(
+                  // The title is a picture of the name drawn with the Elgharib
+                  // surah-name font (assets/surah/NNN.png, one per surah). A
+                  // picture looks the same on every phone, whatever text
+                  // engine or system language it uses.
+                  child: UnconstrainedBox(
+                    child: Image.asset(
+                      'assets/surah/${surah.toString().padLeft(3, '0')}.png',
+                      width: height * 700 / 280,
+                      height: height * 300 / 280,
+                      color: _inkColor(context),
+                      colorBlendMode: BlendMode.srcIn,
+                      filterQuality: FilterQuality.high,
+                      gaplessPlayback: true,
+                      errorBuilder: (c, e, st) => Text(
+                        'سُورَةُ ${info.ar}',
+                        textDirection: TextDirection.rtl,
+                        textScaler: TextScaler.noScaling,
+                        style: TextStyle(
+                          fontSize: height * 0.64,
+                          height: 1.25,
+                          color: _inkColor(context),
+                          fontFamily: _quranFont,
+                          fontFamilyFallback: _arFonts,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              pill('آيَاتُهَا ${_arDigits(info.count)}'),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+const double _kQGap = 0.10; // smallest word gap (x font size)
+
+class _QWord {
+  final String code;
+  final int s;
+  final int a;
+  final int pos; // 1-based position inside the ayah
+  final bool end; // the numbered circle that closes the ayah
+  const _QWord(this.code, this.s, this.a, this.pos, this.end);
+}
+
+class _QRow {
+  final int kind; // 0 text line, 1 surah banner, 2 bismillah
+  final int surah;
+  final List<_QWord> words;
+  const _QRow(this.kind, this.surah, this.words);
+}
+
+class _QPageData {
+  final int page;
+  final int slots; // 15 lines (8 on the first two pages)
+  final List<_QRow> rows;
+  const _QPageData(this.page, this.slots, this.rows);
+}
+
+Map<String, dynamic> _qcfDecode(String src) =>
+    jsonDecode(src) as Map<String, dynamic>;
+
+class _QcfStore {
+  static Future<Map<String, dynamic>?>? _raw;
+  static final Map<int, _QPageData> _pages = <int, _QPageData>{};
+  static final Map<int, Future<bool>> _fonts = <int, Future<bool>>{};
+  static final Map<int, bool> _fontOk = <int, bool>{};
+  static List<String> bism = const <String>[];
+
+  static String _num(int p) => p.toString().padLeft(3, '0');
+  static String family(int p) => 'QCF1_P${_num(p)}';
+
+  static Future<Map<String, dynamic>?> _load() {
+    return _raw ??= () async {
+      try {
+        final src = await rootBundle.loadString('assets/quran_pages.json');
+        final m = await compute(_qcfDecode, src);
+        final b = m['bism'];
+        if (b is List) bism = <String>[for (final x in b) x as String];
+        return m;
+      } catch (e) {
+        debugPrint('qcf data: $e');
+        return null;
+      }
+    }();
+  }
+
+  static Future<_QPageData?> page(int p) async {
+    final hit = _pages[p];
+    if (hit != null) return hit;
+    final m = await _load();
+    if (m == null) return null;
+    try {
+      final list = m['pages'] as List<dynamic>;
+      final pg = list[p - 1] as Map<String, dynamic>;
+      final rows = <_QRow>[];
+      for (final r in pg['rows'] as List<dynamic>) {
+        final rr = r as List<dynamic>;
+        final ws = <_QWord>[];
+        for (final w in rr[2] as List<dynamic>) {
+          final x = w as List<dynamic>;
+          ws.add(_QWord(x[0] as String, x[1] as int, x[2] as int, x[3] as int,
+              (x[4] as int) == 1));
+        }
+        rows.add(_QRow(rr[0] as int, rr[1] as int, ws));
+      }
+      final d = _QPageData(p, pg['slots'] as int, rows);
+      _pages[p] = d;
+      return d;
+    } catch (e) {
+      debugPrint('qcf page $p: $e');
+      return null;
+    }
+  }
+
+  static Future<bool> font(int p) {
+    return _fonts[p] ??= () async {
+      try {
+        final loader = FontLoader(family(p));
+        loader.addFont(rootBundle.load('assets/qcf/p${_num(p)}.ttf'));
+        await loader.load();
+        _fontOk[p] = true;
+        return true;
+      } catch (e) {
+        debugPrint('qcf font $p: $e');
+        _fontOk[p] = false;
+        return false;
+      }
+    }();
+  }
+
+  // calligraphic font for the surah names (assets/fonts/surah_name.ttf)
+  static bool surahFontReady = false;
+  static Future<bool>? _sf;
+
+  static Future<bool> surahFont() {
+    return _sf ??= () async {
+      try {
+        final loader = FontLoader('SurahName');
+        loader.addFont(rootBundle.load('assets/fonts/surah_name.ttf'));
+        await loader.load();
+        surahFontReady = true;
+        return true;
+      } catch (e) {
+        debugPrint('surah font: $e');
+        return false;
+      }
+    }();
+  }
+
+  // ---- Smooth page turning --------------------------------------------
+  // A page is drawn by ONE CustomPainter from words that were laid out
+  // once (at size 100) and are only scaled when painted. So turning pages
+  // never lays out text, and loading a font (which makes Flutter re-layout
+  // every Text widget) does not touch the Mushaf pages at all.
+  static _QPageData? pageSync(int p) => _pages[p];
+  static bool fontReady(int p) => _fontOk[p] == true;
+
+  static Color ink = const Color(0xFF1B1B16);
+  static bool busy = false; // the reader is being dragged right now
+  static final Map<int, _QGlyphs> _glyphs = <int, _QGlyphs>{};
+
+  static TextStyle _style(int page, Color c) => TextStyle(
+        fontFamily: family(page),
+        fontSize: _kProbe,
+        height: 1.0,
+        color: c,
+      );
+
+  static TextPainter word(int page, String code, Color c) {
+    return TextPainter(
+      text: TextSpan(text: code, style: _style(page, c)),
+      textDirection: TextDirection.rtl,
+    )..layout();
+  }
+
+  static void _put(int p, _QGlyphs g) {
+    _glyphs.remove(p);
+    _glyphs[p] = g;
+    while (_glyphs.length > 14) {
+      _glyphs.remove(_glyphs.keys.first);
+    }
+  }
+
+  static _QGlyphs glyphs(_QPageData d, Color c) {
+    final hit = _glyphs.remove(d.page);
+    if (hit != null && hit.ink == c.hashCode) {
+      _glyphs[d.page] = hit;
+      return hit;
+    }
+    final tps = <List<TextPainter>>[];
+    final wd = <List<double>>[];
+    for (final r in d.rows) {
+      final a = <TextPainter>[];
+      final b = <double>[];
+      if (r.kind == 0) {
+        for (final x in r.words) {
+          final tp = word(d.page, x.code, c);
+          a.add(tp);
+          b.add(tp.width);
+        }
+      }
+      tps.add(a);
+      wd.add(b);
+    }
+    final g = _QGlyphs(tps, wd, c.hashCode);
+    _put(d.page, g);
+    return g;
+  }
+
+  static final List<int> _queue = <int>[];
+  static bool _running = false;
+
+  static void prefetch(int center) {
+    for (final p in <int>[center + 1, center - 1, center + 2, center - 2]) {
+      if (p < 1 || p > 604 || _queue.contains(p)) continue;
+      if (_glyphs.containsKey(p) && fontReady(p)) continue;
+      _queue.add(p);
+    }
+    if (!_running) {
+      _running = true;
+      _drain();
+    }
+  }
+
+  static Future<void> _idle() async {
+    for (var t = 0; busy && t < 30; t++) {
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+    }
+    await Future<void>.delayed(Duration.zero);
+  }
+
+  static Future<void> _drain() async {
+    try {
+      while (_queue.isNotEmpty) {
+        await _idle();
+        final p = _queue.removeAt(0);
+        final d = await page(p);
+        if (d == null) continue;
+        await _idle();
+        if (!await font(p)) continue;
+        if (d.rows.any((r) => r.kind == 2)) await font(1);
+        if (!_glyphs.containsKey(p)) {
+          final c = ink;
+          final tps = <List<TextPainter>>[];
+          final wd = <List<double>>[];
+          var n = 0;
+          for (final r in d.rows) {
+            final a = <TextPainter>[];
+            final b = <double>[];
+            if (r.kind == 0) {
+              for (final x in r.words) {
+                final tp = word(p, x.code, c);
+                a.add(tp);
+                b.add(tp.width);
+              }
+              if (++n % 3 == 0) await _idle(); // a few rows per frame
+            }
+            tps.add(a);
+            wd.add(b);
+          }
+          _put(p, _QGlyphs(tps, wd, c.hashCode));
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 60));
+      }
+    } catch (e) {
+      debugPrint('qcf prefetch: $e');
+    } finally {
+      _running = false;
+    }
+  }
+}
+
+const double _kProbe = 100.0; // size the words are laid out at
+
+class _QGlyphs {
+  final List<List<TextPainter>> tps; // per row, per word
+  final List<List<double>> wd; // widths at _kProbe
+  final int ink;
+  const _QGlyphs(this.tps, this.wd, this.ink);
+}
+
+class _QGeom {
+  final _QGlyphs g;
+  final double w, h, f, pitch, y0;
+  final List<List<double>> left; // x of every word (RTL, measured from left)
+  final List<List<double>> ww; // width of every word
+  const _QGeom(this.g, this.w, this.h, this.f, this.pitch, this.y0, this.left,
+      this.ww);
+}
+
+/// Font size = the biggest at which the widest line still fits the width.
+/// Full lines are justified, short ones are centred.
+_QGeom _qGeom(_QPageData d, _QGlyphs g, double w, double h) {
+  // 15 lines per page (pages 1-2 are drawn on the same grid). A page that
+  // starts a surah may hold more rows (banner + bismillah + text), so the
+  // grid grows to fit them: nothing is ever pushed off the screen.
+  final slots = math.max(d.slots <= 8 ? 15 : d.slots, d.rows.length);
+  final pitch = h / slots;
+  final need = <double>[];
+  var f = double.infinity;
+  for (var i = 0; i < d.rows.length; i++) {
+    final ws = g.wd[i];
+    if (ws.isEmpty) {
+      need.add(0);
+      continue;
+    }
+    var sum = 0.0;
+    for (final x in ws) {
+      sum += x;
+    }
+    final n = sum / _kProbe + (ws.length - 1) * _kQGap;
+    need.add(n);
+    f = math.min(f, w * 0.995 / n);
+  }
+  if (!f.isFinite) f = pitch * 0.6;
+  if (d.slots <= 8) f *= 0.68; // the first two pages are shorter lines
+  f = math.min(f, pitch * 0.98);
+  final k = f / _kProbe;
+  final y0 = (h - d.rows.length * pitch) / 2;
+  final left = <List<double>>[];
+  final ww = <List<double>>[];
+  for (var i = 0; i < d.rows.length; i++) {
+    final ws = g.wd[i];
+    final sw = <double>[for (final x in ws) x * k];
+    final xs = List<double>.filled(ws.length, 0);
+    if (ws.isNotEmpty) {
+      var sum = 0.0;
+      for (final x in sw) {
+        sum += x;
+      }
+      final just = d.slots > 8 && need[i] * f >= 0.82 * w;
+      double gap;
+      double right;
+      if (just) {
+        gap = ws.length > 1 ? (w - sum) / (ws.length - 1) : 0;
+        right = w;
+      } else {
+        gap = f * 0.25;
+        right = (w + sum + gap * (ws.length - 1)) / 2;
+      }
+      for (var j = 0; j < ws.length; j++) {
+        right -= sw[j];
+        xs[j] = right;
+        right -= gap;
+      }
+    }
+    left.add(xs);
+    ww.add(sw);
+  }
+  return _QGeom(g, w, h, f, pitch, y0, left, ww);
+}
+
+class _QWStyle {
+  final Color? bg;
+  final TextPainter? tp; // the word in another colour (laid out at _kProbe)
+  const _QWStyle(this.bg, this.tp);
+}
+
+class _QPagePainter extends CustomPainter {
+  final _QGeom geom;
+  final List<List<_QWStyle?>> styles;
+  final int key;
+  const _QPagePainter(this.geom, this.styles, this.key);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final g = geom.g;
+    final k = geom.f / _kProbe;
+    for (var i = 0; i < g.tps.length; i++) {
+      final tps = g.tps[i];
+      if (tps.isEmpty) continue;
+      final rowTop = geom.y0 + i * geom.pitch;
+      final top = rowTop + (geom.pitch - geom.f) / 2;
+      for (var j = 0; j < tps.length; j++) {
+        final st = styles[i][j];
+        final l = geom.left[i][j];
+        final bg = st?.bg;
+        if (bg != null) {
+          canvas.drawRRect(
+            RRect.fromRectAndRadius(
+              Rect.fromLTWH(l - 1.5, rowTop + geom.pitch * 0.1,
+                  geom.ww[i][j] + 3, geom.pitch * 0.8),
+              const Radius.circular(6),
+            ),
+            Paint()..color = bg,
+          );
+        }
+        final tp = st?.tp ?? tps[j];
+        canvas.save();
+        canvas.translate(l, top);
+        canvas.scale(k);
+        tp.paint(canvas, Offset.zero);
+        canvas.restore();
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _QPagePainter old) =>
+      old.geom != geom || old.key != key;
+}
+
+class _MushafPage extends StatefulWidget {
+  final int page;
+  final int surah; // the surah this reader was opened for (coach / marks)
+  const _MushafPage({super.key, required this.page, required this.surah});
+
+  @override
+  State<_MushafPage> createState() => _MushafPageQState();
+}
+
+class _MushafPageQState extends State<_MushafPage> {
+  _QPageData? _d;
+  bool _fail = false;
+  bool _bismFont = false;
+  bool _prefDone = false;
+  List<int> _own = const <int>[];
+  int _sig = 0;
+  int _active = 0; // surah * 1000 + ayah being played, if it is on this page
+  _QGlyphs? _glyphs;
+  _QGeom? _geom;
+  final Map<int, TextPainter> _col = <int, TextPainter>{};
+
+  @override
+  void initState() {
+    super.initState();
+    // pages that were prepared in advance appear at once (no spinner)
+    final d = _QcfStore.pageSync(widget.page);
+    if (d != null && _QcfStore.fontReady(widget.page)) {
+      final needB = d.rows.any((r) => r.kind == 2);
+      if (!needB || (_QcfStore.fontReady(1) && _QcfStore.bism.isNotEmpty)) {
+        _prepare(d, needB);
+      }
+    }
+    if (_d == null) _init();
+    if (!_QcfStore.surahFontReady) {
+      _QcfStore.surahFont().then((ok) {
+        if (ok && mounted) setState(() {});
+      });
+    }
+    coach.addListener(_onCoach);
+    audio.addListener(_onAudio);
+  }
+
+  @override
+  void dispose() {
+    coach.removeListener(_onCoach);
+    audio.removeListener(_onAudio);
+    super.dispose();
+  }
+
+  void _prepare(_QPageData d, bool bismOk) {
+    final own = <int>[];
+    for (final r in d.rows) {
+      for (final x in r.words) {
+        if (x.end && x.s == widget.surah) own.add(x.a);
+      }
+    }
+    _d = d;
+    _own = own;
+    _bismFont = bismOk;
+    _sig = _signature();
+    _active = _activeKey();
+  }
+
+  Future<void> _init() async {
+    final d = await _QcfStore.page(widget.page);
+    var ok = d != null;
+    var bismOk = false;
+    if (d != null) {
+      ok = await _QcfStore.font(widget.page);
+      if (ok && d.rows.any((r) => r.kind == 2)) {
+        bismOk = await _QcfStore.font(1) && _QcfStore.bism.isNotEmpty;
+      }
+    }
+    if (!mounted) return;
+    if (!ok || d == null) {
+      setState(() => _fail = true);
+      return;
+    }
+    setState(() => _prepare(d, bismOk));
+  }
+
+  int _signature() {
+    var h = 17;
+    for (final n in _own) {
+      h = (h * 31 + coach.markSignature(widget.surah, n)) & 0x3fffffff;
+    }
+    return h;
+  }
+
+  int _activeKey() {
+    if (audio.correcting || audio.surah == 0 || audio.ayah == 0) return 0;
+    final s = audio.surah;
+    final a = audio.ayah;
+    final p = widget.page;
+    final ps = _pgS(p);
+    final pa = _pgA(p);
+    final es = _pgS(p + 1);
+    final ea = _pgA(p + 1);
+    final afterStart = s > ps || (s == ps && a >= pa);
+    final beforeEnd = s < es || (s == es && a < ea);
+    return (afterStart && beforeEnd) ? s * 1000 + a : 0;
+  }
+
+  void _onCoach() {
+    if (!mounted || _d == null) return;
+    final s = _signature();
+    if (s == _sig) {
+      perf.uiSkipped++;
+      return;
+    }
+    _sig = s;
+    perf.uiRebuilt++;
+    setState(() {});
+  }
+
+  void _onAudio() {
+    if (!mounted || _d == null) return;
+    final k = _activeKey();
+    if (k == _active) return;
+    _active = k;
+    setState(() {});
+  }
+
+  Future<void> _openAyah(int s, int a) async {
+    final list = await loadSurah(s);
+    if (!mounted || a < 1 || a > list.length) return;
+    // ignore: use_build_context_synchronously
+    _showAyahSheet(context, s, list[a - 1]);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_fail) {
+      // the page font / data could not be loaded: say so and let the reader retry
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('پەڕەکە نەکرایەوە'),
+            const SizedBox(height: 8),
+            TextButton(
+              onPressed: () {
+                setState(() => _fail = false);
+                _init();
+              },
+              child: const Text('دووبارە'),
+            ),
+          ],
+        ),
+      );
+    }
+    final d = _d;
+    if (d == null) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    return LayoutBuilder(builder: (context, c) {
+      const hpad = 18.0;
+      const headH = 34.0;
+      const footH = 34.0;
+      final w = c.maxWidth - hpad * 2;
+      final h = c.maxHeight - headH - footH - 8;
+      if (w < 60 || h < 120) return const SizedBox.shrink();
+      final ink = _inkColor(context);
+      _QcfStore.ink = ink;
+      var g = _glyphs;
+      if (g == null || g.ink != ink.hashCode) {
+        g = _QcfStore.glyphs(d, ink);
+        _glyphs = g;
+        _col.clear();
+      }
+      var geom = _geom;
+      if (geom == null ||
+          !identical(geom.g, g) ||
+          (geom.w - w).abs() > 0.5 ||
+          (geom.h - h).abs() > 0.5) {
+        geom = _qGeom(d, g, w, h);
+        _geom = geom;
+      }
+      if (!_prefDone) {
+        _prefDone = true;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _QcfStore.prefetch(widget.page);
+        });
+      }
+      final bg = _pageBgOf();
+      final dark = _isDark(context);
+      return SizedBox(
+        width: c.maxWidth,
+        height: c.maxHeight,
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            gradient: RadialGradient(
+              radius: 1.15,
+              colors: [dark ? bg.dTop : bg.top, dark ? bg.dEdge : bg.edge],
+            ),
+          ),
+          child: CustomPaint(
+            painter: _FramePainter(dark ? bg.dFrame : bg.frame),
+            child: Column(
+              children: [
+                SizedBox(height: headH, child: _header(context, hpad)),
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: hpad),
+                    child: Align(
+                      alignment: Alignment.center,
+                      child: _body(context, d, g, geom, ink),
+                    ),
+                  ),
+                ),
+                SizedBox(height: footH, child: _footer(context)),
+              ],
+            ),
+          ),
+        ),
+      );
+    });
+  }
+
+  Widget _header(BuildContext context, double hpad) {
+    final p = widget.page;
+    final s = _pgS(p);
+    final hizb = _hizbOf(s, _pgA(p));
+    final juz = (hizb + 1) >> 1;
+    final st = TextStyle(
+      fontSize: 14.5,
+      color: _isDark(context) ? _gold : const Color(0xFF8A6A1F),
+      fontFamilyFallback: _arFonts,
+    );
+    return Padding(
+      padding: EdgeInsets.symmetric(horizontal: hpad),
+      child: Row(
+        textDirection: TextDirection.rtl,
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text('سُورَةُ ${kSurahs[s - 1].ar}', style: st),
+          Text('الجُزْءُ ${_arDigits(juz)} • الحِزْبُ ${_arDigits(hizb)}',
+              style: st),
+        ],
+      ),
+    );
+  }
+
+  Widget _footer(BuildContext context) {
+    final bar = Container(width: 20, height: 1.6, color: _gold);
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        bar,
+        const SizedBox(width: 8),
+        Text(
+          _arDigits(widget.page),
+          style: const TextStyle(
+              fontSize: 15, color: _gold, fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(width: 8),
+        bar,
+      ],
+    );
+  }
+
+  /// Tap on a red / yellow word: the note about it is shown again below.
+  void _tapWord(Offset p, _QPageData d, _QGeom geom) {
+    final i = ((p.dy - geom.y0) / geom.pitch).floor();
+    if (i < 0 || i >= d.rows.length || d.rows[i].kind != 0) return;
+    final r = d.rows[i];
+    for (var j = 0; j < r.words.length; j++) {
+      final l = geom.left[i][j];
+      if (p.dx >= l - 3 && p.dx <= l + geom.ww[i][j] + 3) {
+        final x = r.words[j];
+        if (x.end) return;
+        coach.showNoteAt(x.s, x.a, x.pos - 1);
+        return;
+      }
+    }
+  }
+
+  void _longPress(Offset p, _QPageData d, _QGeom geom) {
+    final i = ((p.dy - geom.y0) / geom.pitch).floor();
+    if (i < 0 || i >= d.rows.length || d.rows[i].kind != 0) return;
+    final r = d.rows[i];
+    for (var j = 0; j < r.words.length; j++) {
+      final l = geom.left[i][j];
+      if (p.dx >= l - 3 && p.dx <= l + geom.ww[i][j] + 3) {
+        _openAyah(r.words[j].s, r.words[j].a);
+        return;
+      }
+    }
+  }
+
+  Widget _body(BuildContext context, _QPageData d, _QGlyphs g, _QGeom geom,
+      Color ink) {
+    final st = _MarkSt.of(context);
+    final memo = <int, CoachMarks?>{};
+    final styles = <List<_QWStyle?>>[];
+    final over = <Widget>[];
+    var key = 7;
+
+    for (var i = 0; i < d.rows.length; i++) {
+      final r = d.rows[i];
+      final rowTop = geom.y0 + i * geom.pitch;
+      final rs = <_QWStyle?>[];
+      if (r.kind == 0) {
+        for (var j = 0; j < r.words.length; j++) {
+          final x = r.words[j];
+          Color? bgc;
+          Color? fgc;
+          if (x.s * 1000 + x.a == _active) bgc = const Color(0x33D9A21B);
+          if (!x.end && x.s == widget.surah) {
+            CoachMarks? m;
+            if (memo.containsKey(x.a)) {
+              m = memo[x.a];
+            } else {
+              m = coach.marksFor(x.s, x.a);
+              memo[x.a] = m;
+            }
+            final wi = x.pos - 1;
+            if (m != null && wi >= 0 && wi < m.marks.length) {
+              TextStyle? ms;
+              switch (m.marks[wi]) {
+                case 1:
+                  ms = st.ok;
+                  break;
+                case 2:
+                  ms = st.bad;
+                  break;
+                case 3:
+                  ms = st.cur;
+                  break;
+                case 4:
+                  ms = st.slip;
+                  break;
+                case 5:
+                  ms = st.guide;
+                  break;
+              }
+              if (ms != null) {
+                fgc = ms.color;
+                bgc = ms.backgroundColor ?? bgc;
+              }
+            }
+          }
+          if (x.end) {
+            if (settings.isMarked(x.s, x.a)) bgc = const Color(0x44D9A21B);
+            // tap on the numbered circle: play / bookmark / translation
+            over.add(Positioned(
+              left: geom.left[i][j] - 4,
+              top: rowTop + geom.pitch * 0.05,
+              width: geom.ww[i][j] + 8,
+              height: geom.pitch * 0.9,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () => _openAyah(x.s, x.a),
+              ),
+            ));
+          }
+          if (bgc == null && fgc == null) {
+            rs.add(null);
+            continue;
+          }
+          TextPainter? tp;
+          if (fgc != null) {
+            final ck = Object.hash(i, j, fgc.hashCode);
+            tp = _col[ck];
+            if (tp == null) {
+              tp = _QcfStore.word(d.page, x.code, fgc);
+              _col[ck] = tp;
+            }
+          }
+          rs.add(_QWStyle(bgc, tp));
+          key = (key * 31 + (bgc?.hashCode ?? 0)) & 0x3fffffff;
+          key = (key * 31 + (fgc?.hashCode ?? 0) + i * 131 + j) & 0x3fffffff;
+        }
+      } else if (r.kind == 1) {
+        final bh = math.min(geom.pitch * 0.94, 50.0);
+        over.add(Positioned(
+          left: 0,
+          top: rowTop,
+          width: geom.w,
+          height: geom.pitch,
+          child: Center(child: _SurahBanner(r.surah, bh)),
+        ));
+      } else {
+        final f = geom.f;
+        final Widget line;
+        if (_bismFont && _QcfStore.bism.isNotEmpty) {
+          final b = TextStyle(
+              fontFamily: _QcfStore.family(1),
+              fontSize: f * 1.15,
+              height: 1.0,
+              color: ink);
+          line = Row(
+            mainAxisSize: MainAxisSize.min,
+            textDirection: TextDirection.rtl,
+            children: [
+              for (var k = 0; k < _QcfStore.bism.length; k++) ...[
+                if (k > 0) SizedBox(width: f * 0.3),
+                Text(
+                  _QcfStore.bism[k],
+                  style: b,
+                  textDirection: TextDirection.rtl,
+                  textScaler: TextScaler.noScaling,
+                  softWrap: false,
+                ),
+              ],
+            ],
+          );
+        } else {
+          line = Text(
+            'بِسْمِ ٱللَّهِ ٱلرَّحْمَٰنِ ٱلرَّحِيمِ',
+            textDirection: TextDirection.rtl,
+            style: TextStyle(
+              fontSize: f,
+              height: 1.0,
+              color: ink,
+              fontFamily: _quranFont,
+              fontFamilyFallback: _arFonts,
+            ),
+          );
+        }
+        over.add(Positioned(
+          left: 0,
+          top: rowTop,
+          width: geom.w,
+          height: geom.pitch,
+          child: Center(
+            child: FittedBox(fit: BoxFit.scaleDown, child: line),
+          ),
+        ));
+      }
+      styles.add(rs);
+    }
+
+    return SizedBox(
+      width: geom.w,
+      height: geom.h,
+      child: Stack(
+        children: [
+          GestureDetector(
+            onTapUp: (e) => _tapWord(e.localPosition, d, geom),
+            onLongPressStart: (e) => _longPress(e.localPosition, d, geom),
+            child: CustomPaint(
+              size: Size(geom.w, geom.h),
+              isComplex: true,
+              painter: _QPagePainter(geom, styles, key),
+            ),
+          ),
+          ...over,
+        ],
+      ),
+    );
+  }
+}
+
+void _showAyahSheet(BuildContext context, int surah, Ayah a) {
+  showModalBottomSheet<void>(
+    context: context,
+    showDragHandle: true,
+    isScrollControlled: true,
+    builder: (ctx) {
+      return SafeArea(
+        child: ListenableBuilder(
+          listenable: Listenable.merge([audio, settings]),
+          builder: (ctx, _) {
+            final active = audio.surah == surah && audio.ayah == a.n;
+            final tr = a.tr(settings.tr);
+            return ConstrainedBox(
+              constraints: BoxConstraints(
+                  maxHeight: MediaQuery.of(ctx).size.height * 0.7),
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(18, 0, 18, 18),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Row(
+                      children: [
+                        _Badge(a.n, size: 34),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            '${kSurahs[surah - 1].ar} • ئایەتی ${a.n}',
+                            style: const TextStyle(
+                                fontSize: 17, fontWeight: FontWeight.bold),
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: 'نیشانەکردن',
+                          onPressed: () => settings.toggleMark(surah, a.n),
+                          icon: Icon(
+                            settings.isMarked(surah, a.n)
+                                ? Icons.bookmark
+                                : Icons.bookmark_border,
+                            color: _gold,
+                            size: 30,
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: 'گوێگرتن',
+                          onPressed: () =>
+                              active ? audio.toggle() : audio.play(surah, a.n),
+                          icon: Icon(
+                            active && audio.playing
+                                ? Icons.pause_circle
+                                : Icons.play_circle,
+                            color: _gold,
+                            size: 40,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const Divider(height: 22),
+                    Text(
+                      a.ar,
+                      textAlign: TextAlign.center,
+                      textDirection: TextDirection.rtl,
+                      style: TextStyle(
+                        fontSize: 26,
+                        height: 2.0,
+                        color: _inkColor(ctx),
+                        fontFamily: _quranFont,
+                        fontFamilyFallback: _arFonts,
+                      ),
+                    ),
+                    if (settings.tr != Tr.none) ...[
+                      const Divider(height: 22),
+                      Text(
+                        (tr == null || tr.isEmpty)
+                            ? '(ئەم وەرگێڕانە بۆ ئەم ئایەتە بەردەست نییە)'
+                            : tr,
+                        textDirection: TextDirection.rtl,
+                        style: TextStyle(
+                          fontSize: (settings.arabicSize * 0.6)
+                              .clamp(14.0, 24.0)
+                              .toDouble(),
+                          height: 1.7,
+                          color: _mutedColor(ctx),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
+      );
+    },
+  );
+}
+
+// ============================================================
+//  Dashboard (home screen) with 5 cards
+//  1 قوُڕئانی پیرۆز   2 مایک و لیڤڵەکان   3 قیبلەنما
+//  4 زیکرەکان          5 کاتەکانی بانگ
+// ============================================================
+String _two(int n) => n < 10 ? '0$n' : '$n';
+String _hm(DateTime? t) => t == null ? '--:--' : '${_two(t.hour)}:${_two(t.minute)}';
+
+String _hms(Duration d) {
+  final s = d.inSeconds < 0 ? 0 : d.inSeconds;
+  return '${_two(s ~/ 3600)}:${_two((s % 3600) ~/ 60)}:${_two(s % 60)}';
+}
+
+const List<String> _lvShort = ['سووک', 'مامناوەند', 'قورس'];
+
+// ---------- places (offline list, no GPS permission needed) ----------
+class PrayCity {
+  final String ku;
+  final double lat;
+  final double lng;
+
+  /// true = times follow the Kurdistan Awqaf timetables (see PrayerCalc).
+  final bool awqaf;
+
+  // Awqaf calibration, in minutes, added to the astronomical sunrise / noon /
+  // Asr / sunset. The "s*" values are the extra minutes in mid-summer.
+  final double dRise, dNoon, dAsr, dSet;
+  final double sRise, sNoon, sAsr, sSet;
+
+  // Fajr = sunrise - fajrGap, Isha = sunset + ishaGap (minutes, winter value;
+  // sFajr / sIsha = extra minutes in mid-summer).
+  final double fajrGap, ishaGap, sFajr, sIsha;
+
+  /// Fixed UTC offset of the city (Iraq / Kurdistan = Asia/Baghdad = UTC+3, no
+  /// DST). null = follow the phone's own time zone.
+  final double? tz;
+
+  const PrayCity(
+    this.ku,
+    this.lat,
+    this.lng, {
+    this.awqaf = false,
+    this.dRise = 0,
+    this.dNoon = 6,
+    this.dAsr = 0.7,
+    this.dSet = 8,
+    this.sRise = 0,
+    this.sNoon = 0,
+    this.sAsr = 0,
+    this.sSet = 0,
+    this.fajrGap = 82,
+    this.ishaGap = 76,
+    this.sFajr = 4,
+    this.sIsha = 4,
+    this.tz,
+  });
+}
+
+// Kurdistan Region cities only (Awqaf timetable). The first four are measured
+// against the official timetables; the others borrow the default Awqaf
+// calibration until their real days are added (assets/prayer_times.json).
+// Coordinates of the newer towns are approximate: they only matter for days
+// that are missing from the timetable (the engine fallback).
+final List<PrayCity> kPrayCities = [
+  // --- measured against the official Awqaf timetables ---
+  PrayCity('هەولێر', 36.1912, 44.0092,
+      awqaf: true,
+      dRise: 5, dNoon: 8, dAsr: 3, dSet: 4.5,
+      sRise: 6, sNoon: 3, sAsr: 8,
+      fajrGap: 85, ishaGap: 75, sFajr: 15, sIsha: 0),
+  PrayCity('سلێمانی', 35.5613, 45.4308, awqaf: true),
+  PrayCity('دهۆک', 36.8672, 42.9989, awqaf: true),
+  PrayCity('کەرکووک', 35.4681, 44.3922,
+      awqaf: true,
+      dRise: -3, dNoon: 5, dAsr: 3.5, dSet: 6, fajrGap: 83),
+  PrayCity('هەڵەبجە', 35.1778, 45.9861, awqaf: true),
+  PrayCity('شارەزور', 35.3500, 45.7500, awqaf: true),
+  PrayCity('سەیدسادق', 35.3600, 45.8850, awqaf: true),
+  PrayCity('پێنجوێن', 35.6200, 45.9500, awqaf: true),
+  PrayCity('عەربەت', 35.4450, 45.5700, awqaf: true),
+  PrayCity('ڕانیە', 36.2547, 44.8836,
+      awqaf: true, dNoon: 7, dAsr: 2.5, dSet: 9),
+  PrayCity('زاخۆ', 37.1439, 42.6872, awqaf: true),
+  PrayCity('کەلار', 34.6275, 45.3197, awqaf: true),
+  PrayCity('دەربەندیخان', 35.1100, 45.6967, awqaf: true),
+  PrayCity('کفری', 34.6867, 44.9667, awqaf: true),
+  PrayCity('بازیان', 35.5800, 45.1000, awqaf: true),
+  PrayCity('چەمچەماڵ', 35.5292, 44.8325, awqaf: true),
+  PrayCity('دوکان', 35.9500, 44.9833, awqaf: true),
+  PrayCity('قەڵادزێ', 36.1833, 45.1333, awqaf: true),
+  PrayCity('کۆیە', 36.0833, 44.6333, awqaf: true),
+  PrayCity('سۆران', 36.6500, 44.5333, awqaf: true),
+];
+
+/// Chosen city + Asr school, kept on the phone.
+class LocPrefs extends ChangeNotifier {
+  int city = 0;
+  bool hanafi = false; // Kurds are mostly Shafi'i: Asr when shadow = 1x
+
+  /// Fine-tuning in whole minutes for each time (fajr, sunrise, dhuhr, asr,
+  /// maghrib, isha), -30..+30. Added on top of every time (official or
+  /// calculated) so the app can be matched to the local mosque timetable.
+  final List<int> offset = List<int>.filled(6, 0);
+  bool get hasOffsets => offset.any((e) => e != 0);
+  bool _loaded = false;
+  Timer? _midnight;
+
+  PrayCity get c => kPrayCities[city];
+
+  /// Fires a few seconds after every midnight so each screen that listens to
+  /// locPrefs re-reads DateTime.now() and shows the new day's times without
+  /// an app restart (the 1 s / 30 s timers do the same; this is the guarantee).
+  void _armMidnight() {
+    _midnight?.cancel();
+    final now = DateTime.now();
+    final next = DateTime(now.year, now.month, now.day + 1, 0, 0, 5);
+    _midnight = Timer(next.difference(now), () {
+      notifyListeners();
+      _armMidnight();
+    });
+  }
+
+  Future<void> ensureLoaded() async {
+    if (_loaded) return;
+    _loaded = true;
+    _armMidnight();
+    try {
+      final p = await SharedPreferences.getInstance();
+      final name = p.getString('pcityName');
+      final idx =
+          name == null ? -1 : kPrayCities.indexWhere((e) => e.ku == name);
+      city = idx < 0 ? 0 : idx;
+      hanafi = false; // Shafi'i only: the Asr toggle was removed from the screen
+      for (var i = 0; i < 6; i++) {
+        offset[i] = (p.getInt('poff$i') ?? 0).clamp(-30, 30).toInt();
+      }
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  Future<void> setCity(int i) async {
+    city = i.clamp(0, kPrayCities.length - 1).toInt();
+    notifyListeners();
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setString('pcityName', kPrayCities[city].ku);
+    } catch (_) {}
+  }
+
+  Future<void> setOffset(int i, int minutes) async {
+    offset[i] = minutes.clamp(-30, 30).toInt();
+    notifyListeners();
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setInt('poff$i', offset[i]);
+    } catch (_) {}
+  }
+
+  Future<void> resetOffsets() async {
+    for (var i = 0; i < 6; i++) {
+      offset[i] = 0;
+    }
+    notifyListeners();
+    try {
+      final p = await SharedPreferences.getInstance();
+      for (var i = 0; i < 6; i++) {
+        await p.remove('poff$i');
+      }
+    } catch (_) {}
+  }
+
+}
+
+final LocPrefs locPrefs = LocPrefs();
+
+Future<void> _pickCity(BuildContext context) async {
+  final i = await showModalBottomSheet<int>(
+    context: context,
+    isScrollControlled: true,
+    showDragHandle: true,
+    builder: (ctx) => SizedBox(
+      height: MediaQuery.of(ctx).size.height * 0.7,
+      child: ListView.builder(
+        itemCount: kPrayCities.length,
+        itemBuilder: (ctx, i) => ListTile(
+          leading: Icon(
+            i == locPrefs.city ? Icons.radio_button_checked : Icons.location_city,
+            color: _gold,
+          ),
+          title: Text(kPrayCities[i].ku, style: const TextStyle(fontSize: 18)),
+          onTap: () => Navigator.of(ctx).pop(i),
+        ),
+      ),
+    ),
+  );
+  if (i != null) locPrefs.setCity(i);
+}
+
+// ---------- Qibla maths ----------
+// Kaaba (centre of the Masjid al-Haram) and the WGS84 ellipsoid.
+const double _kaabaLat = 21.422487;
+const double _kaabaLng = 39.826206;
+const double _wgsA = 6378137.0;
+const double _wgsF = 1 / 298.257223563;
+const double _wgsB = 6356752.314245;
+
+/// Shortest path (geodesic) from a place to the Kaaba on the WGS84 ellipsoid
+/// (Vincenty inverse). Returns [true bearing in degrees from true north,
+/// distance in metres]. More exact than the spherical formula (which can be
+/// off by ~0.1-0.2 degrees at this distance).
+List<double> _geodesicToKaaba(double lat, double lng) {
+  const rad = math.pi / 180;
+  final l = (_kaabaLng - lng) * rad;
+  final u1 = math.atan((1 - _wgsF) * math.tan(lat * rad));
+  final u2 = math.atan((1 - _wgsF) * math.tan(_kaabaLat * rad));
+  final sinU1 = math.sin(u1), cosU1 = math.cos(u1);
+  final sinU2 = math.sin(u2), cosU2 = math.cos(u2);
+  var lambda = l;
+  var sinSigma = 0.0, cosSigma = 0.0, sigma = 0.0;
+  var cos2Alpha = 0.0, cos2SigmaM = 0.0;
+  var ok = false;
+  for (var i = 0; i < 100; i++) {
+    final sinL = math.sin(lambda), cosL = math.cos(lambda);
+    final x = cosU2 * sinL;
+    final y = cosU1 * sinU2 - sinU1 * cosU2 * cosL;
+    sinSigma = math.sqrt(x * x + y * y);
+    if (sinSigma == 0) return [0.0, 0.0]; // standing on the Kaaba
+    cosSigma = sinU1 * sinU2 + cosU1 * cosU2 * cosL;
+    sigma = math.atan2(sinSigma, cosSigma);
+    final sinAlpha = cosU1 * cosU2 * sinL / sinSigma;
+    cos2Alpha = 1 - sinAlpha * sinAlpha;
+    cos2SigmaM = cos2Alpha == 0 ? 0.0 : cosSigma - 2 * sinU1 * sinU2 / cos2Alpha;
+    final c = _wgsF / 16 * cos2Alpha * (4 + _wgsF * (4 - 3 * cos2Alpha));
+    final prev = lambda;
+    lambda = l +
+        (1 - c) *
+            _wgsF *
+            sinAlpha *
+            (sigma +
+                c *
+                    sinSigma *
+                    (cos2SigmaM +
+                        c * cosSigma * (-1 + 2 * cos2SigmaM * cos2SigmaM)));
+    if ((lambda - prev).abs() < 1e-12) {
+      ok = true;
+      break;
+    }
+  }
+  if (!ok) {
+    // spherical fallback (never expected for places this close)
+    final p1 = lat * rad, p2 = _kaabaLat * rad, dl = l;
+    final br = math.atan2(math.sin(dl),
+        math.cos(p1) * math.tan(p2) - math.sin(p1) * math.cos(dl));
+    final dLat = p2 - p1;
+    final h = math.sin(dLat / 2) * math.sin(dLat / 2) +
+        math.cos(p1) * math.cos(p2) * math.sin(dl / 2) * math.sin(dl / 2);
+    return [
+      (br / rad + 360) % 360,
+      2 * 6371000.0 * math.atan2(math.sqrt(h), math.sqrt(1 - h)),
+    ];
+  }
+  final uSq = cos2Alpha * (_wgsA * _wgsA - _wgsB * _wgsB) / (_wgsB * _wgsB);
+  final bigA =
+      1 + uSq / 16384 * (4096 + uSq * (-768 + uSq * (320 - 175 * uSq)));
+  final bigB = uSq / 1024 * (256 + uSq * (-128 + uSq * (74 - 47 * uSq)));
+  final dSigma = bigB *
+      sinSigma *
+      (cos2SigmaM +
+          bigB /
+              4 *
+              (cosSigma * (-1 + 2 * cos2SigmaM * cos2SigmaM) -
+                  bigB /
+                      6 *
+                      cos2SigmaM *
+                      (-3 + 4 * sinSigma * sinSigma) *
+                      (-3 + 4 * cos2SigmaM * cos2SigmaM)));
+  final meters = _wgsB * bigA * (sigma - dSigma);
+  final a1 = math.atan2(cosU2 * math.sin(lambda),
+      cosU1 * sinU2 - sinU1 * cosU2 * math.cos(lambda));
+  return [(a1 / rad + 360) % 360, meters];
+}
+
+/// Qibla direction in degrees clockwise from TRUE north.
+double qiblaBearing(double lat, double lng) => _geodesicToKaaba(lat, lng)[0];
+
+/// Distance to the Kaaba in kilometres.
+double distanceToKaaba(double lat, double lng) =>
+    _geodesicToKaaba(lat, lng)[1] / 1000;
+
+/// Magnetic declination in degrees (+ = magnetic north lies EAST of true
+/// north) for the Kurdistan Region and the area around it (lat 33-38, lng
+/// 41-48), including the yearly drift (~+0.12 deg/yr). The phone's compass
+/// points to MAGNETIC north, the Qibla bearing is from TRUE north, so this
+/// value must be added to the compass heading. Accuracy about +-0.7 deg
+/// (the model itself changes only ~0.5 deg over the whole region).
+double magneticDeclination(double lat, double lng, DateTime when) {
+  final year = when.year + (when.month - 1) / 12.0;
+  return 5.9 +
+      0.10 * (lat - 35.8) -
+      0.10 * (lng - 44.5) +
+      0.12 * (year - 2026.0);
+}
+
+/// Same as [magneticDeclination], but null outside the area the model is
+/// valid for (Kurdistan Region and its surroundings). Outside it the value
+/// would be a guess, so the compass must not claim to be exact there.
+double? magneticDeclinationOrNull(double lat, double lng, DateTime when) {
+  if (lat < 32 || lat > 39 || lng < 40 || lng > 49) return null;
+  return magneticDeclination(lat, lng, when);
+}
+
+// ---------- prayer times maths (works offline) ----------
+const List<String> kPrayerNames = [
+  'بەیانی (فەجر)',
+  'خۆرهەڵات',
+  'نیوەڕۆ (ظوهر)',
+  'عەسر',
+  'ئێوارە (مەغریب)',
+  'خەوتنان (عیشا)',
+];
+const List<String> kPrayerShort = [
+  'بەیانی',
+  'خۆرهەڵات',
+  'نیوەڕۆ',
+  'عەسر',
+  'ئێوارە',
+  'خەوتنان',
+];
+const List<IconData> kPrayerIcons = [
+  Icons.nights_stay,
+  Icons.wb_twilight,
+  Icons.wb_sunny,
+  Icons.wb_sunny_outlined,
+  Icons.wb_twilight,
+  Icons.bedtime,
+];
+
+class PrayerDay {
+  final DateTime? fajr, sunrise, dhuhr, asr, maghrib, isha;
+  const PrayerDay(
+      this.fajr, this.sunrise, this.dhuhr, this.asr, this.maghrib, this.isha);
+  List<DateTime?> get list => [fajr, sunrise, dhuhr, asr, maghrib, isha];
+}
+
+class NextPrayer {
+  final int index;
+  final DateTime time;
+  const NextPrayer(this.index, this.time);
+}
+
+/// Official Awqaf schedule, one table per city.
+///   city name (PrayCity.ku) -> { 'MM-DD' -> [fajr, sunrise, dhuhr, asr, maghrib, isha] }
+/// Times are 24h 'HH:MM' (Asia/Baghdad clock). A day found here is shown exactly as written (no
+/// calculation, no drift); in Hanafi mode only Asr is moved. A day that is missing falls back to the calibrated
+/// engine in PrayerCalc, so the app always works, even with an empty table.
+/// The key has no year: one table serves every year (29 Feb has no entry
+/// unless you add '02-29', so it uses the engine).
+///
+/// IMPORTANT: only days copied from the official Awqaf timetables belong
+/// here. The days below are the ones I could verify (29/10/2026 from the
+/// Awqaf app photos; the other days from the published Awqaf timetables).
+/// Cities with an empty table use the engine until their days are added.
+final Map<String, Map<String, List<String>>> kAwqafSchedule = {
+  'سلێمانی': {
+    '06-01': ['03:18', '04:44', '12:02', '15:46', '19:16', '20:36'],
+    '06-02': ['03:18', '04:44', '12:02', '15:46', '19:17', '20:37'],
+    '06-03': ['03:17', '04:43', '12:03', '15:46', '19:17', '20:37'],
+    '06-05': ['03:17', '04:43', '12:03', '15:46', '19:19', '20:39'],
+    '06-06': ['03:17', '04:43', '12:03', '15:47', '19:19', '20:39'],
+    '06-07': ['03:17', '04:43', '12:03', '15:47', '19:20', '20:40'],
+    '06-08': ['03:16', '04:42', '12:03', '15:47', '19:20', '20:40'],
+    '10-27': ['04:54', '06:16', '11:48', '14:45', '17:17', '18:33'],
+    '10-29': ['04:55', '06:17', '11:48', '14:44', '17:15', '18:31'],
+  },
+  'سەیدسادق': {
+    '10-29': ['04:53', '06:15', '11:46', '14:42', '17:13', '18:29'],
+  },
+  'هەولێر': {
+    '06-01': ['03:18', '04:59', '12:13', '16:03', '19:20', '20:35'],
+    '06-02': ['03:18', '04:59', '12:13', '16:03', '19:20', '20:35'],
+    '06-03': ['03:17', '04:58', '12:13', '16:03', '19:21', '20:36'],
+    '06-05': ['03:17', '04:58', '12:13', '16:04', '19:21', '20:36'],
+    '06-06': ['03:17', '04:57', '12:14', '16:04', '19:22', '20:37'],
+    '06-07': ['03:17', '04:57', '12:14', '16:04', '19:22', '20:37'],
+    '06-08': ['03:16', '04:57', '12:14', '16:04', '19:23', '20:38'],
+    '10-02': ['04:36', '06:05', '12:04', '15:17', '17:53', '19:08'],
+    '10-03': ['04:37', '06:06', '12:03', '15:16', '17:51', '19:06'],
+    '10-04': ['04:38', '06:06', '12:03', '15:14', '17:49', '19:04'],
+    '10-05': ['04:38', '06:07', '12:03', '15:13', '17:47', '19:02'],
+    '10-06': ['04:39', '06:07', '12:01', '15:12', '17:45', '19:00'],
+    '10-07': ['04:40', '06:08', '12:01', '15:12', '17:44', '18:59'],
+    '10-27': ['05:02', '06:27', '11:56', '14:52', '17:18', '18:33'],
+  },
+  'کەرکووک': {
+    '02-03': ['05:34', '06:57', '12:21', '15:14', '17:38', '18:54'],
+    '02-10': ['05:28', '06:51', '12:22', '15:19', '17:45', '19:01'],
+    '02-11': ['05:27', '06:50', '12:22', '15:20', '17:46', '19:02'],
+  },
+  'ڕانیە': {
+    '03-01': ['05:09', '06:31', '12:20', '15:28', '18:04', '19:20'],
+    '03-02': ['05:07', '06:29', '12:19', '15:29', '18:05', '19:21'],
+    '03-03': ['05:06', '06:28', '12:19', '15:29', '18:06', '19:22'],
+    '03-06': ['05:02', '06:24', '12:18', '15:31', '18:09', '19:25'],
+    '03-07': ['05:01', '06:23', '12:18', '15:31', '18:10', '19:26'],
+    '03-08': ['05:00', '06:22', '12:18', '15:32', '18:11', '19:27'],
+    '03-09': ['04:59', '06:21', '12:18', '15:32', '18:12', '19:28'],
+    '03-11': ['04:56', '06:17', '12:17', '15:33', '18:13', '19:29'],
+    '03-12': ['04:55', '06:16', '12:17', '15:34', '18:14', '19:30'],
+  },
+  // No verified Awqaf days yet: these use the engine until you add days.
+  // (Halabja: full year added; its sunrise column is calculated, the rest is from the timetable.)
+  'دهۆک': {},
+  'هەڵەبجە': {
+    '01-01': ['05:36', '07:05', '12:05', '14:39', '17:00', '18:17'],
+    '01-02': ['05:36', '07:05', '12:05', '14:40', '17:01', '18:18'],
+    '01-03': ['05:36', '07:05', '12:06', '14:41', '17:02', '18:19'],
+    '01-04': ['05:36', '07:05', '12:06', '14:42', '17:02', '18:19'],
+    '01-05': ['05:36', '07:05', '12:07', '14:43', '17:03', '18:20'],
+    '01-06': ['05:36', '07:05', '12:07', '14:43', '17:04', '18:21'],
+    '01-07': ['05:36', '07:05', '12:08', '14:44', '17:05', '18:22'],
+    '01-08': ['05:37', '07:05', '12:08', '14:45', '17:06', '18:23'],
+    '01-09': ['05:37', '07:05', '12:08', '14:46', '17:07', '18:24'],
+    '01-10': ['05:37', '07:05', '12:09', '14:47', '17:08', '18:25'],
+    '01-11': ['05:37', '07:05', '12:09', '14:48', '17:09', '18:26'],
+    '01-12': ['05:38', '07:05', '12:10', '14:48', '17:10', '18:27'],
+    '01-13': ['05:38', '07:04', '12:10', '14:49', '17:10', '18:28'],
+    '01-14': ['05:38', '07:04', '12:10', '14:50', '17:11', '18:29'],
+    '01-15': ['05:38', '07:04', '12:10', '14:51', '17:12', '18:30'],
+    '01-16': ['05:39', '07:04', '12:11', '14:52', '17:13', '18:31'],
+    '01-17': ['05:39', '07:03', '12:11', '14:53', '17:14', '18:32'],
+    '01-18': ['05:39', '07:03', '12:12', '14:54', '17:15', '18:33'],
+    '01-19': ['05:40', '07:03', '12:12', '14:55', '17:16', '18:34'],
+    '01-20': ['05:40', '07:02', '12:12', '14:56', '17:17', '18:35'],
+    '01-21': ['05:39', '07:02', '12:13', '14:56', '17:18', '18:36'],
+    '01-22': ['05:39', '07:01', '12:13', '14:57', '17:19', '18:37'],
+    '01-23': ['05:38', '07:01', '12:13', '14:58', '17:20', '18:38'],
+    '01-24': ['05:38', '07:00', '12:14', '14:59', '17:21', '18:39'],
+    '01-25': ['05:37', '07:00', '12:14', '15:00', '17:22', '18:40'],
+    '01-26': ['05:36', '06:59', '12:14', '15:01', '17:23', '18:41'],
+    '01-27': ['05:35', '06:59', '12:14', '15:02', '17:24', '18:42'],
+    '01-28': ['05:35', '06:58', '12:14', '15:03', '17:25', '18:42'],
+    '01-29': ['05:34', '06:57', '12:15', '15:04', '17:27', '18:43'],
+    '01-30': ['05:34', '06:57', '12:15', '15:04', '17:28', '18:44'],
+    '01-31': ['05:33', '06:56', '12:15', '15:05', '17:29', '18:45'],
+    '02-01': ['05:32', '06:55', '12:15', '15:06', '17:30', '18:45'],
+    '02-02': ['05:31', '06:54', '12:15', '15:07', '17:31', '18:46'],
+    '02-03': ['05:31', '06:54', '12:15', '15:08', '17:32', '18:47'],
+    '02-04': ['05:30', '06:53', '12:15', '15:09', '17:33', '18:48'],
+    '02-05': ['05:29', '06:52', '12:15', '15:09', '17:34', '18:49'],
+    '02-06': ['05:28', '06:51', '12:15', '15:10', '17:35', '18:50'],
+    '02-07': ['05:27', '06:50', '12:15', '15:11', '17:36', '18:50'],
+    '02-08': ['05:26', '06:49', '12:15', '15:12', '17:37', '18:51'],
+    '02-09': ['05:25', '06:48', '12:15', '15:13', '17:38', '18:52'],
+    '02-10': ['05:25', '06:47', '12:15', '15:14', '17:39', '18:53'],
+    '02-11': ['05:24', '06:46', '12:15', '15:14', '17:40', '18:54'],
+    '02-12': ['05:23', '06:45', '12:15', '15:15', '17:41', '18:55'],
+    '02-13': ['05:22', '06:44', '12:15', '15:16', '17:42', '18:56'],
+    '02-14': ['05:21', '06:43', '12:15', '15:17', '17:43', '18:57'],
+    '02-15': ['05:20', '06:42', '12:15', '15:17', '17:44', '18:58'],
+    '02-16': ['05:19', '06:41', '12:15', '15:18', '17:45', '18:59'],
+    '02-17': ['05:18', '06:40', '12:15', '15:19', '17:46', '19:00'],
+    '02-18': ['05:16', '06:39', '12:15', '15:19', '17:47', '19:01'],
+    '02-19': ['05:15', '06:38', '12:15', '15:20', '17:48', '19:02'],
+    '02-20': ['05:13', '06:37', '12:15', '15:21', '17:49', '19:03'],
+    '02-21': ['05:12', '06:35', '12:15', '15:22', '17:50', '19:04'],
+    '02-22': ['05:11', '06:34', '12:15', '15:22', '17:51', '19:04'],
+    '02-23': ['05:09', '06:33', '12:15', '15:23', '17:52', '19:05'],
+    '02-24': ['05:08', '06:32', '12:15', '15:23', '17:53', '19:06'],
+    '02-25': ['05:06', '06:31', '12:14', '15:24', '17:54', '19:07'],
+    '02-26': ['05:05', '06:29', '12:14', '15:25', '17:55', '19:08'],
+    '02-27': ['05:04', '06:28', '12:14', '15:25', '17:56', '19:09'],
+    '02-28': ['05:03', '06:27', '12:14', '15:26', '17:57', '19:10'],
+    '02-29': ['05:02', '06:27', '12:14', '15:26', '17:57', '19:10'],
+    '03-01': ['05:02', '06:26', '12:14', '15:26', '17:57', '19:10'],
+    '03-02': ['05:01', '06:24', '12:14', '15:27', '17:58', '19:11'],
+    '03-03': ['04:59', '06:23', '12:13', '15:27', '17:59', '19:12'],
+    '03-04': ['04:58', '06:22', '12:13', '15:28', '18:00', '19:12'],
+    '03-05': ['04:57', '06:20', '12:13', '15:28', '18:00', '19:13'],
+    '03-06': ['04:55', '06:19', '12:13', '15:29', '18:01', '19:14'],
+    '03-07': ['04:54', '06:18', '12:13', '15:29', '18:02', '19:15'],
+    '03-08': ['04:53', '06:16', '12:12', '15:30', '18:03', '19:15'],
+    '03-09': ['04:51', '06:15', '12:12', '15:30', '18:04', '19:16'],
+    '03-10': ['04:50', '06:14', '12:12', '15:31', '18:05', '19:17'],
+    '03-11': ['04:49', '06:12', '12:11', '15:31', '18:06', '19:18'],
+    '03-12': ['04:48', '06:11', '12:11', '15:32', '18:07', '19:18'],
+    '03-13': ['04:47', '06:10', '12:11', '15:32', '18:08', '19:19'],
+    '03-14': ['04:46', '06:08', '12:11', '15:33', '18:09', '19:20'],
+    '03-15': ['04:44', '06:07', '12:10', '15:33', '18:10', '19:21'],
+    '03-16': ['04:43', '06:05', '12:10', '15:33', '18:10', '19:22'],
+    '03-17': ['04:41', '06:04', '12:10', '15:34', '18:11', '19:22'],
+    '03-18': ['04:40', '06:03', '12:10', '15:34', '18:12', '19:23'],
+    '03-19': ['04:39', '06:01', '12:09', '15:34', '18:13', '19:24'],
+    '03-20': ['04:37', '06:00', '12:09', '15:35', '18:14', '19:25'],
+    '03-21': ['04:35', '05:58', '12:09', '15:35', '18:15', '19:26'],
+    '03-22': ['04:34', '05:57', '12:08', '15:35', '18:15', '19:27'],
+    '03-23': ['04:33', '05:56', '12:08', '15:36', '18:16', '19:27'],
+    '03-24': ['04:31', '05:54', '12:08', '15:36', '18:17', '19:28'],
+    '03-25': ['04:30', '05:53', '12:08', '15:36', '18:18', '19:29'],
+    '03-26': ['04:29', '05:51', '12:07', '15:36', '18:19', '19:30'],
+    '03-27': ['04:28', '05:50', '12:07', '15:37', '18:19', '19:30'],
+    '03-28': ['04:27', '05:48', '12:07', '15:37', '18:20', '19:31'],
+    '03-29': ['04:25', '05:47', '12:06', '15:37', '18:21', '19:32'],
+    '03-30': ['04:23', '05:46', '12:06', '15:37', '18:22', '19:33'],
+    '03-31': ['04:22', '05:44', '12:06', '15:38', '18:23', '19:33'],
+    '04-01': ['04:21', '05:43', '12:05', '15:38', '18:23', '19:34'],
+    '04-02': ['04:20', '05:41', '12:05', '15:38', '18:24', '19:35'],
+    '04-03': ['04:18', '05:40', '12:05', '15:38', '18:25', '19:35'],
+    '04-04': ['04:17', '05:39', '12:05', '15:38', '18:26', '19:36'],
+    '04-05': ['04:15', '05:37', '12:04', '15:39', '18:27', '19:37'],
+    '04-06': ['04:14', '05:36', '12:04', '15:39', '18:28', '19:38'],
+    '04-07': ['04:13', '05:35', '12:04', '15:39', '18:28', '19:39'],
+    '04-08': ['04:11', '05:33', '12:03', '15:39', '18:29', '19:40'],
+    '04-09': ['04:10', '05:32', '12:03', '15:39', '18:30', '19:40'],
+    '04-10': ['04:08', '05:30', '12:03', '15:39', '18:31', '19:41'],
+    '04-11': ['04:07', '05:29', '12:03', '15:40', '18:32', '19:42'],
+    '04-12': ['04:05', '05:28', '12:02', '15:40', '18:32', '19:43'],
+    '04-13': ['04:04', '05:27', '12:02', '15:40', '18:33', '19:44'],
+    '04-14': ['04:02', '05:25', '12:02', '15:40', '18:34', '19:44'],
+    '04-15': ['04:01', '05:24', '12:02', '15:40', '18:35', '19:45'],
+    '04-16': ['04:00', '05:23', '12:01', '15:40', '18:36', '19:46'],
+    '04-17': ['03:59', '05:21', '12:01', '15:41', '18:37', '19:47'],
+    '04-18': ['03:58', '05:20', '12:01', '15:41', '18:37', '19:48'],
+    '04-19': ['03:56', '05:19', '12:01', '15:41', '18:38', '19:49'],
+    '04-20': ['03:55', '05:18', '12:01', '15:41', '18:39', '19:49'],
+    '04-21': ['03:53', '05:16', '12:00', '15:41', '18:40', '19:50'],
+    '04-22': ['03:53', '05:15', '12:00', '15:41', '18:41', '19:51'],
+    '04-23': ['03:50', '05:14', '12:00', '15:41', '18:42', '19:52'],
+    '04-24': ['03:49', '05:13', '12:00', '15:41', '18:42', '19:53'],
+    '04-25': ['03:48', '05:12', '12:00', '15:42', '18:43', '19:54'],
+    '04-26': ['03:45', '05:10', '11:59', '15:42', '18:44', '19:54'],
+    '04-27': ['03:44', '05:09', '11:59', '15:42', '18:45', '19:55'],
+    '04-28': ['03:43', '05:08', '11:59', '15:42', '18:46', '19:56'],
+    '04-29': ['03:41', '05:07', '11:59', '15:42', '18:47', '19:57'],
+    '04-30': ['03:40', '05:06', '11:59', '15:42', '18:48', '19:57'],
+    '05-01': ['03:39', '05:05', '11:59', '15:42', '18:48', '19:58'],
+    '05-02': ['03:38', '05:04', '11:59', '15:42', '18:49', '19:59'],
+    '05-03': ['03:37', '05:03', '11:58', '15:42', '18:50', '20:00'],
+    '05-04': ['03:36', '05:02', '11:58', '15:42', '18:51', '20:01'],
+    '05-05': ['03:35', '05:01', '11:58', '15:43', '18:52', '20:02'],
+    '05-06': ['03:34', '05:00', '11:58', '15:43', '18:53', '20:03'],
+    '05-07': ['03:33', '04:59', '11:58', '15:43', '18:53', '20:03'],
+    '05-08': ['03:32', '04:58', '11:58', '15:43', '18:54', '20:04'],
+    '05-09': ['03:31', '04:57', '11:58', '15:43', '18:55', '20:05'],
+    '05-10': ['03:31', '04:56', '11:58', '15:43', '18:56', '20:06'],
+    '05-11': ['03:30', '04:55', '11:58', '15:43', '18:57', '20:07'],
+    '05-12': ['03:29', '04:54', '11:58', '15:43', '18:58', '20:08'],
+    '05-13': ['03:28', '04:54', '11:58', '15:44', '18:58', '20:09'],
+    '05-14': ['03:27', '04:53', '11:58', '15:44', '18:59', '20:10'],
+    '05-15': ['03:26', '04:52', '11:58', '15:44', '19:00', '20:11'],
+    '05-16': ['03:25', '04:51', '11:58', '15:44', '19:00', '20:12'],
+    '05-17': ['03:24', '04:51', '11:58', '15:44', '19:01', '20:13'],
+    '05-18': ['03:23', '04:50', '11:58', '15:44', '19:02', '20:14'],
+    '05-19': ['03:22', '04:49', '11:58', '15:44', '19:03', '20:15'],
+    '05-20': ['03:21', '04:49', '11:58', '15:45', '19:04', '20:15'],
+    '05-21': ['03:20', '04:48', '11:58', '15:45', '19:05', '20:17'],
+    '05-22': ['03:20', '04:47', '11:58', '15:45', '19:05', '20:18'],
+    '05-23': ['03:19', '04:47', '11:58', '15:45', '19:04', '20:19'],
+    '05-24': ['03:18', '04:46', '11:58', '15:45', '19:07', '20:20'],
+    '05-25': ['03:17', '04:46', '11:58', '15:45', '19:08', '20:21'],
+    '05-26': ['03:16', '04:45', '11:58', '15:45', '19:08', '20:22'],
+    '05-27': ['03:16', '04:45', '11:58', '15:46', '19:09', '20:23'],
+    '05-28': ['03:15', '04:44', '11:59', '15:46', '19:10', '20:24'],
+    '05-29': ['03:15', '04:44', '11:59', '15:46', '19:10', '20:25'],
+    '05-30': ['03:14', '04:44', '11:59', '15:46', '19:11', '20:26'],
+    '05-31': ['03:14', '04:43', '11:59', '15:46', '19:12', '20:27'],
+    '06-01': ['03:14', '04:43', '11:59', '15:47', '19:12', '20:28'],
+    '06-02': ['03:13', '04:43', '11:59', '15:47', '19:13', '20:29'],
+    '06-03': ['03:13', '04:42', '12:00', '15:47', '19:14', '20:29'],
+    '06-04': ['03:13', '04:42', '12:00', '15:47', '19:14', '20:30'],
+    '06-05': ['03:13', '04:42', '12:00', '15:47', '19:15', '20:31'],
+    '06-06': ['03:12', '04:42', '12:00', '15:48', '19:15', '20:32'],
+    '06-07': ['03:12', '04:41', '12:00', '15:48', '19:16', '20:32'],
+    '06-08': ['03:12', '04:41', '12:00', '15:48', '19:16', '20:33'],
+    '06-09': ['03:12', '04:41', '12:01', '15:48', '19:17', '20:34'],
+    '06-10': ['03:12', '04:41', '12:01', '15:48', '19:17', '20:35'],
+    '06-11': ['03:11', '04:41', '12:01', '15:49', '19:18', '20:36'],
+    '06-12': ['03:11', '04:41', '12:01', '15:49', '19:18', '20:36'],
+    '06-13': ['03:11', '04:41', '12:01', '15:49', '19:19', '20:37'],
+    '06-14': ['03:11', '04:41', '12:02', '15:49', '19:19', '20:37'],
+    '06-15': ['03:11', '04:41', '12:02', '15:49', '19:20', '20:37'],
+    '06-16': ['03:11', '04:41', '12:02', '15:50', '19:20', '20:37'],
+    '06-17': ['03:11', '04:41', '12:02', '15:50', '19:20', '20:38'],
+    '06-18': ['03:11', '04:41', '12:02', '15:50', '19:20', '20:38'],
+    '06-19': ['03:11', '04:42', '12:03', '15:50', '19:21', '20:38'],
+    '06-20': ['03:11', '04:42', '12:03', '15:51', '19:21', '20:38'],
+    '06-21': ['03:12', '04:42', '12:03', '15:51', '19:21', '20:38'],
+    '06-22': ['03:12', '04:42', '12:03', '15:51', '19:21', '20:39'],
+    '06-23': ['03:12', '04:42', '12:03', '15:51', '19:22', '20:39'],
+    '06-24': ['03:13', '04:43', '12:04', '15:51', '19:22', '20:39'],
+    '06-25': ['03:13', '04:43', '12:04', '15:52', '19:22', '20:39'],
+    '06-26': ['03:14', '04:43', '12:04', '15:52', '19:22', '20:39'],
+    '06-27': ['03:14', '04:44', '12:04', '15:52', '19:22', '20:39'],
+    '06-28': ['03:14', '04:44', '12:05', '15:52', '19:22', '20:39'],
+    '06-29': ['03:15', '04:44', '12:05', '15:53', '19:22', '20:39'],
+    '06-30': ['03:15', '04:45', '12:05', '15:53', '19:22', '20:39'],
+    '07-01': ['03:15', '04:45', '12:05', '15:53', '19:21', '20:39'],
+    '07-02': ['03:16', '04:46', '12:05', '15:53', '19:21', '20:39'],
+    '07-03': ['03:16', '04:46', '12:05', '15:53', '19:21', '20:38'],
+    '07-04': ['03:17', '04:47', '12:06', '15:53', '19:21', '20:38'],
+    '07-05': ['03:17', '04:47', '12:06', '15:53', '19:21', '20:38'],
+    '07-06': ['03:18', '04:48', '12:06', '15:54', '19:20', '20:38'],
+    '07-07': ['03:18', '04:48', '12:06', '15:54', '19:20', '20:37'],
+    '07-08': ['03:19', '04:49', '12:06', '15:54', '19:20', '20:37'],
+    '07-09': ['03:19', '04:49', '12:06', '15:54', '19:20', '20:37'],
+    '07-10': ['03:20', '04:50', '12:06', '15:54', '19:19', '20:36'],
+    '07-11': ['03:21', '04:51', '12:07', '15:54', '19:19', '20:36'],
+    '07-12': ['03:21', '04:51', '12:07', '15:54', '19:20', '20:36'],
+    '07-13': ['03:22', '04:52', '12:07', '15:54', '19:19', '20:35'],
+    '07-14': ['03:22', '04:52', '12:07', '15:54', '19:19', '20:35'],
+    '07-15': ['03:23', '04:53', '12:07', '15:55', '19:18', '20:34'],
+    '07-16': ['03:24', '04:54', '12:07', '15:55', '19:18', '20:34'],
+    '07-17': ['03:25', '04:54', '12:07', '15:55', '19:17', '20:33'],
+    '07-18': ['03:26', '04:55', '12:07', '15:55', '19:17', '20:32'],
+    '07-19': ['03:27', '04:56', '12:08', '15:55', '19:16', '20:31'],
+    '07-20': ['03:27', '04:56', '12:08', '15:55', '19:16', '20:30'],
+    '07-21': ['03:28', '04:57', '12:08', '15:54', '19:15', '20:30'],
+    '07-22': ['03:29', '04:58', '12:08', '15:54', '19:14', '20:30'],
+    '07-23': ['03:30', '04:59', '12:08', '15:54', '19:14', '20:29'],
+    '07-24': ['03:31', '04:59', '12:08', '15:54', '19:13', '20:29'],
+    '07-25': ['03:32', '05:00', '12:08', '15:54', '19:12', '20:28'],
+    '07-26': ['03:33', '05:01', '12:08', '15:54', '19:12', '20:28'],
+    '07-27': ['03:34', '05:01', '12:08', '15:54', '19:11', '20:27'],
+    '07-28': ['03:35', '05:02', '12:08', '15:54', '19:10', '20:27'],
+    '07-29': ['03:36', '05:03', '12:08', '15:54', '19:09', '20:26'],
+    '07-30': ['03:37', '05:04', '12:08', '15:53', '19:08', '20:25'],
+    '07-31': ['03:38', '05:04', '12:07', '15:53', '19:07', '20:24'],
+    '08-01': ['03:39', '05:05', '12:07', '15:53', '19:06', '20:23'],
+    '08-02': ['03:40', '05:06', '12:07', '15:53', '19:05', '20:22'],
+    '08-03': ['03:40', '05:07', '12:07', '15:53', '19:04', '20:21'],
+    '08-04': ['03:41', '05:07', '12:07', '15:52', '19:03', '20:20'],
+    '08-05': ['03:41', '05:08', '12:07', '15:52', '19:02', '20:19'],
+    '08-06': ['03:42', '05:09', '12:07', '15:51', '19:01', '20:18'],
+    '08-07': ['03:43', '05:10', '12:07', '15:51', '19:00', '20:17'],
+    '08-08': ['03:44', '05:10', '12:07', '15:51', '18:59', '20:16'],
+    '08-09': ['03:45', '05:11', '12:07', '15:51', '18:58', '20:15'],
+    '08-10': ['03:46', '05:12', '12:06', '15:50', '18:57', '20:14'],
+    '08-11': ['03:47', '05:13', '12:06', '15:50', '18:56', '20:13'],
+    '08-12': ['03:48', '05:14', '12:06', '15:50', '18:55', '20:12'],
+    '08-13': ['03:49', '05:14', '12:06', '15:49', '18:54', '20:11'],
+    '08-14': ['03:50', '05:15', '12:06', '15:49', '18:53', '20:10'],
+    '08-15': ['03:51', '05:16', '12:06', '15:48', '18:52', '20:09'],
+    '08-16': ['03:52', '05:17', '12:05', '15:48', '18:50', '20:08'],
+    '08-17': ['03:52', '05:17', '12:05', '15:47', '18:48', '20:07'],
+    '08-18': ['03:53', '05:18', '12:05', '15:47', '18:48', '20:06'],
+    '08-19': ['03:54', '05:19', '12:05', '15:46', '18:47', '20:05'],
+    '08-20': ['03:55', '05:20', '12:04', '15:46', '18:46', '20:04'],
+    '08-21': ['03:55', '05:20', '12:04', '15:45', '18:44', '20:03'],
+    '08-22': ['03:56', '05:21', '12:04', '15:45', '18:43', '20:02'],
+    '08-23': ['03:57', '05:22', '12:04', '15:44', '18:42', '20:01'],
+    '08-24': ['03:58', '05:23', '12:03', '15:44', '18:40', '20:00'],
+    '08-25': ['03:59', '05:23', '12:03', '15:43', '18:39', '19:59'],
+    '08-26': ['04:00', '05:24', '12:03', '15:42', '18:38', '19:56'],
+    '08-27': ['04:01', '05:25', '12:03', '15:42', '18:36', '19:54'],
+    '08-28': ['04:02', '05:26', '12:02', '15:41', '18:35', '19:53'],
+    '08-29': ['04:03', '05:26', '12:02', '15:40', '18:34', '19:52'],
+    '08-30': ['04:03', '05:27', '12:02', '15:40', '18:32', '19:50'],
+    '08-31': ['04:04', '05:28', '12:01', '15:39', '18:31', '19:48'],
+    '09-01': ['04:05', '05:29', '12:01', '15:38', '18:30', '19:46'],
+    '09-02': ['04:05', '05:29', '12:01', '15:37', '18:28', '19:44'],
+    '09-03': ['04:06', '05:30', '12:00', '15:37', '18:27', '19:42'],
+    '09-04': ['04:07', '05:31', '12:00', '15:36', '18:25', '19:40'],
+    '09-05': ['04:08', '05:32', '12:00', '15:35', '18:24', '19:38'],
+    '09-06': ['04:08', '05:32', '11:59', '15:34', '18:23', '19:36'],
+    '09-07': ['04:09', '05:33', '11:59', '15:34', '18:21', '19:35'],
+    '09-08': ['04:10', '05:34', '11:59', '15:33', '18:20', '19:33'],
+    '09-09': ['04:11', '05:34', '11:58', '15:32', '18:18', '19:31'],
+    '09-10': ['04:12', '05:35', '11:58', '15:31', '18:17', '19:29'],
+    '09-11': ['04:13', '05:36', '11:58', '15:30', '18:15', '19:28'],
+    '09-12': ['04:14', '05:37', '11:57', '15:29', '18:14', '19:27'],
+    '09-13': ['04:15', '05:37', '11:57', '15:28', '18:13', '19:25'],
+    '09-14': ['04:15', '05:38', '11:57', '15:28', '18:11', '19:23'],
+    '09-15': ['04:16', '05:39', '11:56', '15:27', '18:10', '19:22'],
+    '09-16': ['04:17', '05:40', '11:56', '15:26', '18:08', '19:22'],
+    '09-17': ['04:18', '05:40', '11:56', '15:25', '18:07', '19:20'],
+    '09-18': ['04:18', '05:41', '11:55', '15:24', '18:05', '19:18'],
+    '09-19': ['04:19', '05:42', '11:55', '15:23', '18:04', '19:16'],
+    '09-20': ['04:20', '05:43', '11:55', '15:22', '18:02', '19:15'],
+    '09-21': ['04:21', '05:43', '11:54', '15:21', '18:01', '19:13'],
+    '09-22': ['04:21', '05:44', '11:54', '15:20', '18:00', '19:11'],
+    '09-23': ['04:22', '05:45', '11:54', '15:19', '17:58', '19:09'],
+    '09-24': ['04:23', '05:46', '11:53', '15:18', '17:57', '19:08'],
+    '09-25': ['04:24', '05:46', '11:53', '15:17', '17:55', '19:07'],
+    '09-26': ['04:24', '05:47', '11:53', '15:16', '17:54', '19:06'],
+    '09-27': ['04:25', '05:48', '11:52', '15:15', '17:52', '19:05'],
+    '09-28': ['04:26', '05:49', '11:52', '15:14', '17:51', '19:04'],
+    '09-29': ['04:27', '05:49', '11:52', '15:13', '17:50', '19:02'],
+    '09-30': ['04:27', '05:50', '11:51', '15:12', '17:48', '19:01'],
+    '10-01': ['04:28', '05:51', '11:51', '15:11', '17:47', '19:00'],
+    '10-02': ['04:29', '05:52', '11:51', '15:10', '17:45', '18:59'],
+    '10-03': ['04:29', '05:52', '11:50', '15:09', '17:44', '18:58'],
+    '10-04': ['04:30', '05:53', '11:50', '15:08', '17:42', '18:56'],
+    '10-05': ['04:31', '05:54', '11:50', '15:07', '17:41', '18:54'],
+    '10-06': ['04:32', '05:55', '11:49', '15:06', '17:40', '18:52'],
+    '10-07': ['04:33', '05:56', '11:49', '15:05', '17:38', '18:50'],
+    '10-08': ['04:34', '05:56', '11:49', '15:04', '17:37', '18:48'],
+    '10-09': ['04:35', '05:57', '11:48', '15:03', '17:35', '18:47'],
+    '10-10': ['04:36', '05:58', '11:48', '15:02', '17:34', '18:45'],
+    '10-11': ['04:37', '05:59', '11:48', '15:01', '17:33', '18:43'],
+    '10-12': ['04:38', '06:00', '11:48', '15:00', '17:31', '18:41'],
+    '10-13': ['04:38', '06:00', '11:47', '14:58', '17:30', '18:39'],
+    '10-14': ['04:39', '06:01', '11:47', '14:57', '17:29', '18:38'],
+    '10-15': ['04:39', '06:02', '11:47', '14:57', '17:27', '18:36'],
+    '10-16': ['04:40', '06:03', '11:47', '14:56', '17:26', '18:34'],
+    '10-17': ['04:41', '06:04', '11:46', '14:55', '17:25', '18:32'],
+    '10-18': ['04:42', '06:05', '11:46', '14:54', '17:24', '18:30'],
+    '10-19': ['04:43', '06:06', '11:46', '14:53', '17:22', '18:29'],
+    '10-20': ['04:44', '06:06', '11:46', '14:53', '17:21', '18:28'],
+    '10-21': ['04:45', '06:07', '11:46', '14:52', '17:20', '18:27'],
+    '10-22': ['04:45', '06:08', '11:46', '14:51', '17:19', '18:26'],
+    '10-23': ['04:46', '06:09', '11:46', '14:50', '17:17', '18:25'],
+    '10-24': ['04:47', '06:10', '11:45', '14:49', '17:16', '18:24'],
+    '10-25': ['04:47', '06:11', '11:45', '14:48', '17:15', '18:24'],
+    '10-26': ['04:48', '06:12', '11:45', '14:47', '17:14', '18:23'],
+    '10-27': ['04:49', '06:13', '11:45', '14:46', '17:13', '18:22'],
+    '10-28': ['04:50', '06:14', '11:45', '14:45', '17:12', '18:21'],
+    '10-29': ['04:51', '06:14', '11:45', '14:45', '17:10', '18:21'],
+    '10-30': ['04:52', '06:15', '11:45', '14:44', '17:09', '18:20'],
+    '10-31': ['04:53', '06:16', '11:45', '14:43', '17:08', '18:19'],
+    '11-01': ['04:54', '06:17', '11:45', '14:42', '17:07', '18:18'],
+    '11-02': ['04:55', '06:18', '11:45', '14:42', '17:06', '18:18'],
+    '11-03': ['04:56', '06:19', '11:45', '14:41', '17:05', '18:17'],
+    '11-04': ['04:57', '06:20', '11:45', '14:40', '17:05', '18:17'],
+    '11-05': ['04:58', '06:21', '11:45', '14:39', '17:04', '18:16'],
+    '11-06': ['04:59', '06:22', '11:45', '14:39', '17:03', '18:15'],
+    '11-07': ['05:00', '06:23', '11:45', '14:38', '17:02', '18:14'],
+    '11-08': ['05:01', '06:24', '11:45', '14:37', '17:01', '18:14'],
+    '11-09': ['05:02', '06:25', '11:45', '14:37', '17:00', '18:13'],
+    '11-10': ['05:03', '06:26', '11:45', '14:36', '16:59', '18:12'],
+    '11-11': ['05:04', '06:27', '11:45', '14:35', '16:58', '18:12'],
+    '11-12': ['05:05', '06:28', '11:45', '14:35', '16:58', '18:11'],
+    '11-13': ['05:06', '06:29', '11:45', '14:34', '16:57', '18:10'],
+    '11-14': ['05:07', '06:30', '11:45', '14:34', '16:56', '18:10'],
+    '11-15': ['05:08', '06:31', '11:46', '14:33', '16:56', '18:09'],
+    '11-16': ['05:09', '06:32', '11:46', '14:33', '16:55', '18:08'],
+    '11-17': ['05:10', '06:33', '11:46', '14:32', '16:54', '18:07'],
+    '11-18': ['05:11', '06:34', '11:46', '14:32', '16:54', '18:07'],
+    '11-19': ['05:12', '06:35', '11:46', '14:31', '16:53', '18:06'],
+    '11-20': ['05:13', '06:36', '11:47', '14:31', '16:53', '18:06'],
+    '11-21': ['05:14', '06:37', '11:47', '14:31', '16:52', '18:06'],
+    '11-22': ['05:15', '06:38', '11:47', '14:30', '16:52', '18:05'],
+    '11-23': ['05:16', '06:39', '11:47', '14:30', '16:51', '18:05'],
+    '11-24': ['05:16', '06:40', '11:48', '14:30', '16:51', '18:05'],
+    '11-25': ['05:17', '06:41', '11:48', '14:30', '16:51', '18:05'],
+    '11-26': ['05:18', '06:41', '11:48', '14:29', '16:50', '18:06'],
+    '11-27': ['05:18', '06:42', '11:49', '14:29', '16:50', '18:06'],
+    '11-28': ['05:19', '06:43', '11:49', '14:29', '16:50', '18:06'],
+    '11-29': ['05:19', '06:44', '11:49', '14:29', '16:49', '18:06'],
+    '11-30': ['05:20', '06:45', '11:50', '14:29', '16:49', '18:07'],
+    '12-01': ['05:20', '06:46', '11:50', '14:29', '16:49', '18:07'],
+    '12-02': ['05:21', '06:47', '11:50', '14:28', '16:49', '18:07'],
+    '12-03': ['05:21', '06:48', '11:51', '14:28', '16:49', '18:07'],
+    '12-04': ['05:22', '06:49', '11:51', '14:28', '16:49', '18:07'],
+    '12-05': ['05:23', '06:49', '11:51', '14:28', '16:49', '18:07'],
+    '12-06': ['05:23', '06:50', '11:52', '14:29', '16:49', '18:07'],
+    '12-07': ['05:24', '06:51', '11:52', '14:29', '16:49', '18:08'],
+    '12-08': ['05:25', '06:52', '11:53', '14:29', '16:49', '18:08'],
+    '12-09': ['05:26', '06:53', '11:53', '14:29', '16:49', '18:08'],
+    '12-10': ['05:27', '06:54', '11:54', '14:29', '16:49', '18:08'],
+    '12-11': ['05:27', '06:54', '11:54', '14:29', '16:49', '18:08'],
+    '12-12': ['05:28', '06:55', '11:55', '14:30', '16:50', '18:08'],
+    '12-13': ['05:29', '06:56', '11:55', '14:30', '16:50', '18:08'],
+    '12-14': ['05:30', '06:56', '11:56', '14:30', '16:50', '18:08'],
+    '12-15': ['05:31', '06:57', '11:56', '14:31', '16:50', '18:09'],
+    '12-16': ['05:32', '06:58', '11:57', '14:31', '16:51', '18:09'],
+    '12-17': ['05:33', '06:58', '11:57', '14:32', '16:51', '18:09'],
+    '12-18': ['05:34', '06:59', '11:58', '14:32', '16:51', '18:09'],
+    '12-19': ['05:34', '06:59', '11:58', '14:33', '16:52', '18:09'],
+    '12-20': ['05:35', '07:00', '11:59', '14:33', '16:52', '18:09'],
+    '12-21': ['05:35', '07:01', '11:59', '14:33', '16:53', '18:09'],
+    '12-22': ['05:35', '07:01', '12:00', '14:34', '16:53', '18:10'],
+    '12-23': ['05:35', '07:02', '12:00', '14:34', '16:54', '18:10'],
+    '12-24': ['05:35', '07:02', '12:01', '14:35', '16:54', '18:11'],
+    '12-25': ['05:35', '07:02', '12:01', '14:35', '16:55', '18:11'],
+    '12-26': ['05:35', '07:03', '12:02', '14:36', '16:55', '18:12'],
+    '12-27': ['05:35', '07:03', '12:02', '14:36', '16:56', '18:13'],
+    '12-28': ['05:36', '07:03', '12:03', '14:37', '16:57', '18:14'],
+    '12-29': ['05:36', '07:04', '12:03', '14:38', '16:58', '18:15'],
+    '12-30': ['05:36', '07:04', '12:04', '14:38', '16:58', '18:16'],
+    '12-31': ['05:36', '07:04', '12:04', '14:39', '16:59', '18:17'],
+  },
+  'کەلار': {},
+  'سۆران': {},
+  'زاخۆ': {},
+};
+
+/// Timetables that live in a data file instead of in the code.
+/// assets/prayer_times.json (copied to the app root by build.yml):
+///   {"cities": {"<city>": {"lat": 36.19, "lng": 44.0,
+///                          "days": {"MM-DD": [fajr, sunrise, dhuhr, asr, maghrib, isha]}}}}
+/// Days are merged into kAwqafSchedule; a city that is not in kPrayCities yet
+/// is added to the picker. A missing or broken file changes nothing (the
+/// built-in tables and the engine keep working). Call once, before
+/// locPrefs.ensureLoaded().
+class PrayerData {
+  static bool loaded = false;
+  static int cities = 0, days = 0, skipped = 0;
+
+  static bool _ok(List<String> v) {
+    if (v.length != 6) return false;
+    for (var i = 0; i < 6; i++) {
+      if (!PrayerCalc._hhmm.hasMatch(v[i])) return false;
+      if (i > 0 && v[i].compareTo(v[i - 1]) <= 0) return false; // must increase
+    }
+    return true;
+  }
+
+  static Future<void> load() async {
+    try {
+      final raw = await rootBundle.loadString('prayer_times.json');
+      final root = jsonDecode(raw) as Map<String, dynamic>;
+      final all = (root['cities'] as Map<String, dynamic>?) ?? const {};
+      for (final e in all.entries) {
+        final v = e.value as Map<String, dynamic>;
+        final src = (v['days'] as Map<String, dynamic>?) ?? const {};
+        final table = kAwqafSchedule.putIfAbsent(e.key, () => <String, List<String>>{});
+        for (final d in src.entries) {
+          final row = (d.value as List<dynamic>).map((x) => x.toString()).toList();
+          if (_ok(row)) {
+            table[d.key] = row;
+            days++;
+          } else {
+            skipped++;
+          }
+        }
+        if (!kPrayCities.any((c) => c.ku == e.key)) {
+          kPrayCities.add(
+              PrayCity(e.key, (v['lat'] as num?)?.toDouble() ?? 35.5,
+                  (v['lng'] as num?)?.toDouble() ?? 44.5,
+                  awqaf: true));
+        }
+        cities++;
+      }
+      loaded = true;
+      debugPrint('prayer_times.json: $cities cities, $days days, $skipped skipped');
+    } catch (e) {
+      debugPrint('prayer_times.json not used: $e');
+    }
+  }
+}
+
+class PrayerCalc {
+  static const double fajrAngle = 18; // Muslim World League
+  static const double ishaAngle = 17;
+
+  static double _rad(double d) => d * math.pi / 180;
+  static double _deg(double r) => r * 180 / math.pi;
+  static double _fix(double a, double b) {
+    final r = a - b * (a / b).floorToDouble();
+    return r < 0 ? r + b : r;
+  }
+
+  static double _julian(int y, int m, int d) {
+    var yy = y;
+    var mm = m;
+    if (mm <= 2) {
+      yy -= 1;
+      mm += 12;
+    }
+    final a = (yy / 100).floor();
+    final b = 2 - a + (a / 4).floor();
+    return (365.25 * (yy + 4716)).floorToDouble() +
+        (30.6001 * (mm + 1)).floorToDouble() +
+        d +
+        b -
+        1524.5;
+  }
+
+  /// [declination in degrees, equation of time in hours]
+  static List<double> _sun(double jd) {
+    final d = jd - 2451545.0;
+    final g = _fix(357.529 + 0.98560028 * d, 360);
+    final q = _fix(280.459 + 0.98564736 * d, 360);
+    final l = _fix(
+        q + 1.915 * math.sin(_rad(g)) + 0.020 * math.sin(_rad(2 * g)), 360);
+    final e = 23.439 - 0.00000036 * d;
+    var ra = _deg(math.atan2(
+            math.cos(_rad(e)) * math.sin(_rad(l)), math.cos(_rad(l)))) /
+        15;
+    ra = _fix(ra, 24);
+    var eqt = q / 15 - ra;
+    eqt = _fix(eqt + 12, 24) - 12;
+    final decl = _deg(math.asin(math.sin(_rad(e)) * math.sin(_rad(l))));
+    return [decl, eqt];
+  }
+
+  /// hours the sun needs to go from noon to [angle] degrees below the horizon
+  static double? _angleTime(double angle, double decl, double lat) {
+    final x = (-math.sin(_rad(angle)) -
+            math.sin(_rad(decl)) * math.sin(_rad(lat))) /
+        (math.cos(_rad(decl)) * math.cos(_rad(lat)));
+    if (x.isNaN || x < -1 || x > 1) return null;
+    return _deg(math.acos(x)) / 15;
+  }
+
+  /// [mins] after midnight on [date], read on the city's clock. With a fixed
+  /// zone (Asia/Baghdad) the result is the right instant even when the phone is
+  /// set to another zone; otherwise it is the phone's own wall clock.
+  static DateTime _mk(DateTime date, int mins, double? fixedTz) {
+    final off = fixedTz == null ? null : (fixedTz * 60).round();
+    if (off == null || off == date.timeZoneOffset.inMinutes) {
+      return DateTime(date.year, date.month, date.day)
+          .add(Duration(minutes: mins));
+    }
+    return DateTime.utc(date.year, date.month, date.day)
+        .add(Duration(minutes: mins - off))
+        .toLocal();
+  }
+
+  /// The day's times, with the user's minute adjustments (locPrefs.offset)
+  /// added. Everything in the app (card, monthly page, next prayer, Adhan
+  /// alarms) goes through here.
+  static PrayerDay compute(PrayCity c, DateTime date,
+      {bool hanafi = false, double? tzHours}) {
+    final d = _compute(c, date, hanafi: hanafi, tzHours: tzHours);
+    if (!locPrefs.hasOffsets) return d;
+    final o = locPrefs.offset;
+    DateTime? sh(DateTime? t, int i) =>
+        (t == null || o[i] == 0) ? t : t.add(Duration(minutes: o[i]));
+    return PrayerDay(sh(d.fajr, 0), sh(d.sunrise, 1), sh(d.dhuhr, 2),
+        sh(d.asr, 3), sh(d.maghrib, 4), sh(d.isha, 5));
+  }
+
+  /// The raw times (official day or calibrated engine), no user adjustment.
+  static PrayerDay _compute(PrayCity c, DateTime date,
+      {bool hanafi = false, double? tzHours, bool ignoreSchedule = false}) {
+    // Kurdistan / Iraq always use Asia/Baghdad (UTC+3), whatever the phone says.
+    final fixedTz = tzHours == null ? (c.tz ?? (c.awqaf ? 3.0 : null)) : null;
+    final exact = ignoreSchedule ? null : _fromSchedule(c, date, fixedTz);
+    if (exact != null && !hanafi) return exact;
+    if (exact != null) {
+      // Hanafi: the official day stays for every prayer; only Asr moves, by the
+      // engine's own Hanafi-minus-Shafi'i difference.
+      final s = _compute(c, date, tzHours: tzHours, ignoreSchedule: true);
+      final h = _compute(c, date, hanafi: true, tzHours: tzHours, ignoreSchedule: true);
+      final sa = s.asr, ha = h.asr, ea = exact.asr;
+      if (sa == null || ha == null || ea == null) return exact;
+      return PrayerDay(exact.fajr, exact.sunrise, exact.dhuhr,
+          ea.add(ha.difference(sa)), exact.maghrib, exact.isha);
+    }
+    final tz = tzHours ?? fixedTz ?? date.timeZoneOffset.inMinutes / 60.0;
+    final jd = _julian(date.year, date.month, date.day) - c.lng / (15 * 24);
+    final s = _sun(jd + 0.5);
+    final decl = s[0];
+    final eqt = s[1];
+    final noon = 12 + tz - c.lng / 15 - eqt;
+
+    double? before(double angle) {
+      final t = _angleTime(angle, decl, c.lat);
+      return t == null ? null : noon - t;
+    }
+
+    double? after(double angle) {
+      final t = _angleTime(angle, decl, c.lat);
+      return t == null ? null : noon + t;
+    }
+
+    final factor = hanafi ? 2.0 : 1.0;
+    final asrAngle = -_deg(
+        math.atan(1 / (factor + math.tan(_rad((c.lat - decl).abs())))));
+
+    DateTime? at(double? h) {
+      if (h == null || h.isNaN) return null;
+      final mins = (_fix(h, 24) * 60).round();
+      return _mk(date, mins, fixedTz);
+    }
+
+    final sunrise = before(0.833);
+    final sunset = after(0.833);
+    final asr = after(asrAngle);
+
+    // ---- Kurdistan Awqaf timetable ----
+    // The Awqaf tables are not a pure astronomical result: noon, sunset and
+    // Asr carry a few extra minutes, and Fajr / Isha are a (nearly) fixed
+    // number of minutes before sunrise / after sunset. The numbers per city
+    // were measured against the official tables.
+    if (c.awqaf && sunrise != null && sunset != null && asr != null) {
+      // 0 in winter ... 1 in mid-summer (day length 12h -> 14.5h)
+      final summer = ((sunset - sunrise - 12) / 2.5).clamp(0.0, 1.0).toDouble();
+      double m(double base, double summerExtra) => (base + summer * summerExtra) / 60;
+
+      final riseA = sunrise + m(c.dRise, c.sRise);
+      final noonA = noon + m(c.dNoon, c.sNoon);
+      final asrA = asr + m(c.dAsr, c.sAsr);
+      final setA = sunset + m(c.dSet, c.sSet);
+      return PrayerDay(
+        at(riseA - m(c.fajrGap, c.sFajr)),
+        at(riseA),
+        at(noonA),
+        at(asrA),
+        at(setA),
+        at(setA + m(c.ishaGap, c.sIsha)),
+      );
+    }
+
+    // ---- plain astronomical (Muslim World League) ----
+    return PrayerDay(
+      at(before(fajrAngle)),
+      at(sunrise),
+      at(noon),
+      at(asr),
+      at(sunset),
+      at(after(ishaAngle)),
+    );
+  }
+
+  static final RegExp _hhmm = RegExp(r'^([01]\d|2[0-3]):[0-5]\d$');
+
+  /// The exact Awqaf day from [kAwqafSchedule], or null (-> engine).
+  static PrayerDay? _fromSchedule(PrayCity c, DateTime date, double? fixedTz) {
+    final row = kAwqafSchedule[c.ku]?['${_two(date.month)}-${_two(date.day)}'];
+    if (row == null || row.length != 6) return null;
+    final out = <DateTime>[];
+    for (final v in row) {
+      if (!_hhmm.hasMatch(v)) return null; // malformed entry: use the engine
+      out.add(_mk(date, int.parse(v.substring(0, 2)) * 60 + int.parse(v.substring(3, 5)),
+          fixedTz));
+    }
+    return PrayerDay(out[0], out[1], out[2], out[3], out[4], out[5]);
+  }
+
+  /// true when [date] comes from the official Awqaf table for this city.
+  static bool isOfficial(PrayCity c, DateTime date) =>
+      kAwqafSchedule[c.ku]?['${_two(date.month)}-${_two(date.day)}']?.length == 6;
+
+  /// Checks every table entry (format, order, city name). Debug only.
+  static bool validateSchedule() {
+    final key = RegExp(r'^(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$');
+    for (final city in kAwqafSchedule.entries) {
+      if (!kPrayCities.any((x) => x.ku == city.key)) {
+        debugPrint('Awqaf schedule: unknown city ${city.key}');
+        return false;
+      }
+      for (final day in city.value.entries) {
+        final v = day.value;
+        var ok = key.hasMatch(day.key) && v.length == 6 && v.every(_hhmm.hasMatch);
+        for (var i = 1; ok && i < 6; i++) {
+          ok = v[i].compareTo(v[i - 1]) > 0; // fajr < sunrise < ... < isha
+        }
+        if (!ok) {
+          debugPrint('Awqaf schedule: bad entry ${city.key} ${day.key} $v');
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  /// Debug check against the official Awqaf benchmark of 29/10/2026.
+  /// Call once from main(): assert(PrayerCalc.selfTest());
+  static bool selfTest() {
+    const bench = {
+      'سلێمانی': ['04:55', '06:17', '11:48', '14:44', '17:15', '18:31'],
+      'سەیدسادق': ['04:53', '06:15', '11:46', '14:42', '17:13', '18:29'],
+    };
+    if (!validateSchedule()) return false;
+    // engine alone (schedule ignored) must also hit the benchmark
+    // fixed UTC+3 (Iraq) so the test does not depend on the device zone
+    for (final e in bench.entries) {
+      final c = kPrayCities.firstWhere((x) => x.ku == e.key);
+      final d = _compute(c, DateTime(2026, 10, 29),
+          hanafi: false, tzHours: 3, ignoreSchedule: true);
+      final got = d.list.map((t) => t == null ? '--' : _hm(t)).toList();
+      if (got.join() != e.value.join()) {
+        debugPrint('Awqaf self-test FAILED for ${e.key}: $got vs ${e.value}');
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static NextPrayer next(PrayCity c, DateTime now, {bool hanafi = false}) {
+    final today = compute(c, now, hanafi: hanafi).list;
+    for (final i in const [0, 2, 3, 4, 5]) {
+      final t = today[i];
+      if (t != null && t.isAfter(now)) return NextPrayer(i, t);
+    }
+    final tomorrow = DateTime(now.year, now.month, now.day + 1);
+    final tm = compute(c, tomorrow, hanafi: hanafi).list;
+    return NextPrayer(0, tm[0] ?? tomorrow.add(const Duration(hours: 5)));
+  }
+}
+
+// ---------- the dashboard ----------
+class DashboardPage extends StatefulWidget {
+  const DashboardPage({super.key});
+
+  @override
+  State<DashboardPage> createState() => _DashboardPageState();
+}
+
+class _DashboardPageState extends State<DashboardPage> {
+  Timer? _tick;
+
+  @override
+  void initState() {
+    super.initState();
+    locPrefs.ensureLoaded();
+    tajProgress.ensureLoaded();
+    _tick = Timer.periodic(const Duration(seconds: 30), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _tick?.cancel();
+    super.dispose();
+  }
+
+  void _open(Widget page) {
+    Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => page));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: Listenable.merge([settings, locPrefs, tajProgress]),
+      builder: (context, _) {
+        final city = locPrefs.c;
+        final now = DateTime.now();
+        final next = PrayerCalc.next(city, now, hanafi: locPrefs.hanafi);
+        final bearing = qiblaBearing(city.lat, city.lng);
+        final lv = (settings.coachLevel - 1).clamp(0, 2).toInt();
+        final dark = _isDark(context);
+        final s = (math.min(MediaQuery.of(context).size.width, 820.0) / 390)
+            .clamp(0.85, 1.2)
+            .toDouble();
+        final pageTop = dark ? _darkBg : _prCream;
+        final pageBottom = dark ? _darkBg : _prCreamDeep;
+        return Scaffold(
+          bottomNavigationBar: const PlayerBar(),
+          appBar: AppBar(
+            leading: PopupMenuButton<int>(
+              tooltip: 'مێنیو',
+              icon: const Icon(Icons.menu),
+              onSelected: (v) {
+                if (v == 0) {
+                  _open(const SearchPage());
+                } else if (v == 1) {
+                  _open(const BookmarksPage());
+                } else {
+                  settings.toggleDark();
+                }
+              },
+              itemBuilder: (_) => const [
+                PopupMenuItem<int>(value: 0, child: Text('گەڕان لە ئایەتەکان')),
+                PopupMenuItem<int>(value: 1, child: Text('نیشانەکان')),
+                PopupMenuItem<int>(value: 2, child: Text('تاریک / ڕووناک')),
+              ],
+            ),
+            title: const Text(
+              'قورئانی پیرۆز',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+          ),
+          body: Column(
+            children: [
+              // fixed banner: edge-to-edge, glued to the green app bar, it does
+              // NOT scroll. The photo itself is untouched; only a thin cream
+              // edge (gold line + diamond) lies over its bottom rim.
+              Stack(
+                children: [
+                  const _DashBanner(),
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    height: 26 * s,
+                    child: CustomPaint(painter: _DashEdgePainter(pageTop)),
+                  ),
+                ],
+              ),
+              Expanded(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [pageTop, pageBottom],
+                    ),
+                  ),
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      Positioned.fill(
+                        child: RepaintBoundary(
+                          child: CustomPaint(
+                            painter: _StarLatticePainter(
+                                color: _prGold, alpha: dark ? 0.05 : 0.09),
+                          ),
+                        ),
+                      ),
+                      Center(
+                        child: ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 820),
+                          child: CustomScrollView(
+                            slivers: [
+                              SliverToBoxAdapter(
+                                child: Padding(
+                                  padding: EdgeInsets.fromLTRB(
+                                      18 * s, 6 * s, 18 * s, 8 * s),
+                                  child: Row(
+                                    children: [
+                                      Text(
+                                        'بەشەکانی پرۆگرام:',
+                                        style: TextStyle(
+                                          fontSize: 19 * s,
+                                          fontWeight: FontWeight.bold,
+                                          color: dark
+                                              ? _inkColor(context)
+                                              : _prInk,
+                                        ),
+                                      ),
+                                      SizedBox(width: 10 * s),
+                                      Expanded(
+                                        child: SizedBox(
+                                          height: 16 * s,
+                                          child: const CustomPaint(
+                                              painter:
+                                                  _DashOrnamentLinePainter()),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                              SliverToBoxAdapter(
+                                child: Padding(
+                                  padding: EdgeInsets.fromLTRB(
+                                      14 * s, 6 * s, 14 * s, 18 * s),
+                                  child: GridView(
+                                    padding: EdgeInsets.zero,
+                                    shrinkWrap: true,
+                                    physics:
+                                        const NeverScrollableScrollPhysics(),
+                                    gridDelegate:
+                                        SliverGridDelegateWithFixedCrossAxisCount(
+                                      crossAxisCount: 2,
+                                      mainAxisSpacing: 12 * s,
+                                      crossAxisSpacing: 12 * s,
+                                      mainAxisExtent: 142 * s,
+                                    ),
+                                    children: [
+                        // 1) Quran
+                        _DashTile(
+                          icon: Icons.menu_book,
+                          title: 'قورئانی پیرۆز',
+                          subtitle: '١١٤ سوورەت',
+                          onTap: () => _open(const SurahListPage()),
+                        ),
+                        // 2) Microphone & levels
+                        _DashTile(
+                          icon: Icons.mic,
+                          title: 'خوێند بە تەجوید',
+                          subtitle: 'ئاست: ${_lvShort[lv]}',
+                          onTap: () => _open(const MicLevelsPage()),
+                        ),
+                        // 3) Qibla
+                        _DashTile(
+                          icon: Icons.explore,
+                          title: 'قیبلەنما',
+                          subtitle: '${city.ku} • ${bearing.round()}°',
+                          onTap: () => _open(const QiblaPage()),
+                        ),
+                        // 4) Azkar
+                        _DashTile(
+                          icon: Icons.auto_awesome,
+                          title: 'زیکرەکان',
+                          subtitle: 'بەیانیان و ئێواران',
+                          onTap: () => _open(const AzkarPage()),
+                        ),
+                        // 5) Prayer times
+                        _DashTile(
+                          icon: Icons.access_time_filled,
+                          title: 'کاتەکانی بانگ',
+                          subtitle:
+                              '${kPrayerShort[next.index]} ${_hm(next.time)}',
+                          onTap: () => _open(const PrayerTimesPage()),
+                        ),
+                        // 6) Tajweed & teaching
+                        _DashTile(
+                          icon: Icons.school,
+                          title: 'تەجوید و فێرکردن',
+                          subtitle:
+                              '${tajProgress.read.length}/${kTajweedLessons.length} وانە خوێندراوەتەوە',
+                          onTap: () => _open(const TajweedLessonsScreen()),
+                        ),
+                        // 7) Settings
+                        _DashTile(
+                          icon: Icons.settings,
+                          title: 'ڕێکخستنەکان',
+                          subtitle: 'قاری، ڕەنگ و قەبارە',
+                          onTap: () => _open(const SettingsPage()),
+                        ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+// ============================================================
+//  تەجوید و فێرکردن - offline Tajweed curriculum (29 lessons)
+// ============================================================
+
+/// Font list for the Quranic examples. If you bundle a Uthmani Quran font
+/// (e.g. KFGQPC Uthmanic Hafs), put its family name FIRST in this list.
+/// Must match the `family:` name of the font in pubspec.yaml. If the font is
+/// not bundled yet, Flutter silently falls back to the _arFonts list.
+const String _uthmaniFont = _quranFont;
+const List<String> _tajQuranFonts = [_uthmaniFont, ..._arFonts];
+
+class TajweedExample {
+  final String text; // Uthmani Arabic
+  final String ref; // 'surah:ayah' (empty when it is just a word)
+  final String note; // Kurdish note
+  const TajweedExample(this.text, {this.ref = '', this.note = ''});
+}
+
+class TajweedLesson {
+  final int id;
+  final String titleKu;
+  final String titleAr;
+  final String summary;
+  final List<String> rules;
+  final List<TajweedExample> examples;
+
+  /// true = the rules are shown as 1, 2, 3 ... (when their order matters)
+  final bool numberedRules;
+
+  /// which video of the teacher's playlist this lesson follows ('' = none)
+  final String video;
+
+  /// common mistakes of readers in this rule (shown in a red box)
+  final List<String> mistakes;
+  const TajweedLesson({
+    required this.id,
+    required this.titleKu,
+    required this.titleAr,
+    required this.summary,
+    required this.rules,
+    required this.examples,
+    this.numberedRules = false,
+    this.video = '',
+    this.mistakes = const <String>[],
+  });
+}
+
+/// The lessons follow the playlist "پوختەی زانستی تجوید 2025" by
+/// Sardar Nasr Al-Kurdi (lessons 1-22, same numbers as the videos).
+/// Lessons 23-24 are extra (not in the playlist): waqf and lahn.
+/// kind -> lesson mapping of the coach: see TajweedBridge._lessonOf.
+const List<TajweedLesson> kTajweedLessons = [
+  // ------------------------------------------------------------------ 1
+  TajweedLesson(
+    id: 1,
+    titleKu: 'ئیستعاذە و بەسمەلە',
+    titleAr: 'الاستعاذة والبسملة',
+    video: 'ڤیدیۆی ١ی پلەیلیستەکەی مامۆستا سەردار',
+    summary:
+        'ئیستعاذە واتە پەنا گرتن بە خودا لە شەیتان، پێش دەستپێکردنی خوێندنەوە. بەسمەلە واتە وتنی «بسم الله الرحمن الرحيم». ئەم وانەیە فێرت دەکات لە سەرەتای خوێندنەوە و لە نێوان سوورەتەکاندا چۆن ئەمانە بخوێنیتەوە.',
+    numberedRules: true,
+    rules: [
+      'ئیستعاذە: «أعوذ بالله من الشيطان الرجيم». پێش خوێندنەوەی قورئان دەوترێت. سوننەتە، واتە باشە بیڵێیت بەڵام واجب نییە.',
+      'بەسمەلە ئایەتێکی سوورەتی فاتیحەیە و لە سەرەتای هەموو سوورەتێک دێت، تەنها سوورەتی التوبە نەبێت کە بەسمەلەی نییە.',
+      'لە سەرەتای سوورەتێک (دوای ئیستعاذە) چوار شێوە دروستە:\n• هەموویان لە یەکتر جیا بکەیتەوە: ئیستعاذە، وەستان، بەسمەلە، وەستان، سەرەتای سوورەت.\n• هەموویان بە یەک هەناسە بخوێنیتەوە.\n• ئیستعاذە جیا بکەیتەوە، بەسمەلە بە سەرەتای سوورەتەوە ببەستیتەوە.\n• ئیستعاذە بە بەسمەلەوە ببەستیتەوە، پاشان بوەستیت پێش سەرەتای سوورەت.',
+      'لە نێوان دوو سوورەت (کۆتایی سوورەتی پێشوو + بەسمەلە + سەرەتای سوورەتی نوێ) سێ شێوە دروستە: هەمووی جیا بکەیتەوە؛ هەمووی بە یەک هەناسە بخوێنیتەوە؛ یان کۆتایی سوورەتی پێشوو جیا بکەیتەوە و بەسمەلە بە سوورەتی نوێوە ببەستیتەوە.',
+      'شێوەی چوارەم هەڵەیە: کۆتایی سوورەتی پێشوو بە بەسمەلەوە ببەستیتەوە و لەسەر بەسمەلە بوەستیت، چونکە وا دەردەکەوێت بەسمەلە کۆتایی سوورەتی پێشووە.',
+      'لە نێوان الأنفال و التوبە بەسمەلە نییە. سێ شێوە هەیە: بوەستیت، سەکتە بکەیت (وەستانێکی زۆر کورت بێ هەناسەدان)، یان بێ بەسمەلە بەیەکەوە ببەستیتەوە.',
+    ],
+    mistakes: [
+      'خوێندنی بەسمەلە لە سەرەتای سوورەتی التوبە.',
+      'بەستنەوەی کۆتایی سوورەتی پێشوو بە بەسمەلەوە و وەستان لەسەر بەسمەلە.',
+    ],
+    examples: [
+      TajweedExample('أَعُوذُ بِٱللَّهِ مِنَ ٱلشَّيْطَـٰنِ ٱلرَّجِيمِ',
+          note: 'ئیستعاذە'),
+      TajweedExample('بِسْمِ ٱللَّهِ ٱلرَّحْمَـٰنِ ٱلرَّحِيمِ',
+          ref: '1:1', note: 'بەسمەلە'),
+    ],
+  ),
+  // ------------------------------------------------------------------ 2
+  TajweedLesson(
+    id: 2,
+    titleKu: 'ئیدغام (چوونە ناو یەک)',
+    titleAr: 'الإدغام',
+    video: 'ڤیدیۆی ٢ی پلەیلیستەکەی مامۆستا سەردار',
+    summary:
+        'پێش دەستپێکردن، ئەم وشانە لە زۆربەی وانەکاندا دووبارە دەبنەوە:\n• ساکن: پیتێک کە نیشانەی «ْ»ی لەسەرە و بزوێنی نییە.\n• بزوێن: فەتحە (ـَ دەنگی «ە»)، کەسرە (ـِ دەنگی «ی»ی کورت)، زەمە (ـُ دەنگی «و»ی کورت). پیتێک کە یەکێکیانی هەبێت پێی دەڵێین بزوێنراو.\n• تەنوین: دوو فەتحە (ـً)، دوو کەسرە (ـٍ) یان دوو زەمە (ـٌ) لە کۆتایی وشە؛ دەنگی «ن» دەدەن.\n• غوننە: دەنگێکی نەرم کە لە لووتەوە دەردەچێت.\n• شەدە (ـّ): پیتەکە دوو جار دەخوێنرێتەوە.\n• حەرەکە: پێوەری ماوەی دەنگ؛ یەک حەرەکە بەقەد یەک جووڵەی پەنجە (داخستن یان کردنەوە) دەخایەنێت.\n\nنوونی ساکن (نْ) و تەنوین چوار حوکمیان هەیە: ئیدغام، ئیزهار، ئیقلاب، ئیخفا. حوکمەکە بەپێی پیتی دوای نوون یان تەنوین دیاری دەکرێت. ئیدغام واتە نوونەکە یان تەنوینەکە دەچێتە ناو پیتی دواتر و دوو پیتەکە دەبنە یەک پیتی شەددار.',
+    numberedRules: true,
+    rules: [
+      'پیتەکانی ئیدغام شەشن و لە وشەی «يرملون» کۆکراونەتەوە: ي ر م ل و ن.',
+      'ئیدغام لەگەڵ غوننە: چوار پیتی «ينمو» (ي ن م و). غوننەکە دوو حەرەکە دەخایەنێت. لە ن و م ئیدغامەکە تەواوە. لە ی و و نوونەکە نامێنێت بەڵام دەنگی غوننەکەی دەمێنێتەوە.',
+      'ئیدغام بێ غوننە: ل و ر. نوونەکە بە تەواوی دەچێتە ناو پیتەکە، غوننە نییە و پیتەکە شەددار دەبێت.',
+      'مەرج: نوون یان تەنوین لە کۆتایی وشەی یەکەم بێت و پیتی ئیدغام لە سەرەتای وشەی دواتر بێت.',
+      'ئەگەر نوون و پیتی ئیدغام لە یەک وشەدا بن، ئیدغام ناکرێت و نوونەکە ڕوون دەخوێنرێتەوە (ئیزهاری موتڵەق، واتە ڕوونکردنەوەی بێ مەرج)، وەک: دُنْيَا، بُنْيَان، صِنْوَان، قِنْوَان.',
+    ],
+    mistakes: [
+      'ئیدغامکردن لە یەک وشەدا (لە «ٱلدُّنْيَا» نابێت ئیدغام بکرێت).',
+      'نەکردنی غوننە لە چوار پیتی ی ن م و.',
+      'کردنی غوننە لەگەڵ ل و ر (نابێت غوننە بکرێت).',
+    ],
+    examples: [
+      TajweedExample('مَن يَعْمَلْ',
+          ref: '99:7', note: 'ن + ی: ئیدغام لەگەڵ غوننە'),
+      TajweedExample('مِن وَالٍ',
+          ref: '13:11', note: 'ن + و: ئیدغام لەگەڵ غوننە'),
+      TajweedExample('يَوْمَئِذٍ يَصْدُرُ',
+          ref: '99:6', note: 'تەنوین + ی: ئیدغام لەگەڵ غوننە'),
+      TajweedExample('مِن لَّدُنْ',
+          ref: '18:2', note: 'ن + ل: ئیدغام بێ غوننە'),
+      TajweedExample('مِّن رَّبِّهِمْ',
+          ref: '2:5', note: 'ن + ر: ئیدغام بێ غوننە'),
+      TajweedExample('ٱلدُّنْيَا',
+          note: 'ئیدغام نییە: نوون و ی لە یەک وشەدان'),
+    ],
+  ),
+  // ------------------------------------------------------------------ 3
+  TajweedLesson(
+    id: 3,
+    titleKu: 'ئیزهار (ڕوونکردنەوە)',
+    titleAr: 'الإظهار',
+    video: 'ڤیدیۆی ٣ی پلەیلیستەکەی مامۆستا سەردار',
+    summary:
+        'ئیزهار واتە ڕوونکردنەوە. نوونی ساکن یان تەنوین بە ڕوونی و بێ شاردنەوە لە شوێنی خۆیەوە دەخوێنرێتەوە، کاتێک یەکێک لە پیتەکانی قورگ دێتە دوایان. هۆکارەکەی ئەوەیە پیتەکانی قورگ لە شوێنی دەرچوونی نوون زۆر دوورن.',
+    numberedRules: true,
+    rules: [
+      'پیتەکانی ئیزهار شەشن و هەموویان پیتی قورگن: ء ه ع ح غ خ.',
+      'نوونەکە بە ڕوونی دەخوێنرێتەوە، بێ ئەوەی دەنگی لووت (غوننە) زیاد بکەیت و بێ ئەوەی بچێتە ناو پیتی دواتر.',
+      'هەم لە نێوان دوو وشە ڕوو دەدات (مِنْ هَادٍ) و هەم لە یەک وشەدا (أَنْعَمْتَ).',
+    ],
+    mistakes: [
+      'درێژکردنەوەی دەنگی لووت لە نوونەکەدا (ئەمە ئیخفایە، نەک ئیزهار).',
+      'تێکەڵکردنی نوونەکە لەگەڵ پیتی دوای.',
+    ],
+    examples: [
+      TajweedExample('مَنْ ءَامَنَ', ref: '2:62', note: 'ن + ء'),
+      TajweedExample('يَنْـَٔوْنَ', ref: '6:26', note: 'ن + ء لە یەک وشەدا'),
+      TajweedExample('مِنْ هَادٍ', ref: '13:33', note: 'ن + ه'),
+      TajweedExample('أَنْعَمْتَ', ref: '1:7', note: 'ن + ع'),
+      TajweedExample('مِنْ غِلٍّ', ref: '7:43', note: 'ن + غ'),
+      TajweedExample('سَمِيعٌ عَلِيمٌ', note: 'تەنوین + ع'),
+    ],
+  ),
+  // ------------------------------------------------------------------ 4
+  TajweedLesson(
+    id: 4,
+    titleKu: 'ئیقلاب (گۆڕین)',
+    titleAr: 'الإقلاب',
+    video: 'ڤیدیۆی ٤ی پلەیلیستەکەی مامۆستا سەردار',
+    summary:
+        'ئیقلاب واتە گۆڕین. نوونی ساکن یان تەنوین دەگۆڕێت بۆ دەنگی «م»ێکی شاراوە لەگەڵ غوننە (دەنگی لووت)، کاتێک پیتی «ب» دێتە دوایان.',
+    numberedRules: true,
+    rules: [
+      'ئیقلاب تەنها یەک پیتی هەیە: ب.',
+      'نوون یان تەنوینەکە دەگۆڕدرێت بۆ «م» و دەنگی لووتی (غوننە) دوو حەرەکە دەخایەنێت. لە قورئاندا میمێکی بچووک (ۢ) وەک نیشانە لەسەر نوونەکە دادەنرێت.',
+      'لێوەکان بە سووکی دەگەنە یەک، نەک بە توندی.',
+      'هەم لە یەک وشەدا (أَنۢبِئْهُم) و هەم لە نێوان دوو وشەدا ڕوو دەدات.',
+    ],
+    mistakes: [
+      'خوێندنەوەی نوونەکە وەک نوون (دەبێت بگۆڕدرێت بۆ «م»).',
+      'بە توندی گوشینی لێوەکان و نەکردنی غوننە.',
+    ],
+    examples: [
+      TajweedExample('مِنۢ بَعْدِ', note: 'دەخوێنرێتەوە: مِمْ بَعْدِ'),
+      TajweedExample('أَنۢبِئْهُم', ref: '2:33', note: 'ن + ب لە یەک وشەدا'),
+      TajweedExample('خَبِيرٌۢ بَصِيرٌ', note: 'تەنوین + ب'),
+    ],
+  ),
+  // ------------------------------------------------------------------ 5
+  TajweedLesson(
+    id: 5,
+    titleKu: 'ئیخفا (شاردنەوە)',
+    titleAr: 'الإخفاء الحقيقي',
+    video: 'ڤیدیۆی ٥ی پلەیلیستەکەی مامۆستا سەردار',
+    summary:
+        'ئیخفا واتە شاردنەوە. نوونی ساکن یان تەنوین نیوەچڵ دەخوێنرێتەوە، لەگەڵ دەنگی لووت (غوننە): نە وەک ئیزهار تەواو ڕوونە و نە وەک ئیدغام دەچێتە ناو پیتی دواتر. نووکی زمان ناگاتە شوێنی نوون (ڕەگی ددانە پێشەوەکانی سەرەوە).',
+    numberedRules: true,
+    rules: [
+      'پیتەکانی ئیخفا پازدەن، واتە ئەو پیتانەی لە ئیزهار و ئیدغام و ئیقلاب دا نین: ص ذ ث ك ج ش ق س د ط ز ف ت ض ظ.',
+      'چۆنیەتی: نوونەکە بە تەواوی ناخوێنرێتەوە، تەنها دەنگی لووتەکەی (غوننە) دەمێنێتەوە و دوو حەرەکە دەخایەنێت. لە هەمان کاتدا زمان بۆ خوێندنی پیتی دواتر ئامادە دەبێت.',
+      'ئیخفا لە دوای ط د ت بەهێزترە چونکە شوێنی دەرچوونیان لە نوون نزیکترە؛ لە دوای ق ك لاوازترە چونکە دوورترن.',
+      'هەم لە یەک وشەدا (أَنفُسُكُمْ) و هەم لە نێوان دوو وشەدا ڕوو دەدات.',
+    ],
+    mistakes: [
+      'نوونەکە بە تەواوی و ڕوون دەخوێنرێتەوە، وەک ئیزهار.',
+      'کورتکردنەوەی دەنگی لووت (غوننە) لە ئیخفا.',
+    ],
+    examples: [
+      TajweedExample('مِن صَلْصَـٰلٍ', ref: '15:26', note: 'ن + ص'),
+      TajweedExample('أَنفُسُكُمْ', note: 'ن + ف لە یەک وشەدا'),
+      TajweedExample('رِزْقًا كَرِيمًا', ref: '33:31', note: 'تەنوین + ك'),
+    ],
+  ),
+  // ------------------------------------------------------------------ 6
+  TajweedLesson(
+    id: 6,
+    titleKu: 'ئیخفای شەفەوی و ئیزهاری شەفەوی (میمی ساکن)',
+    titleAr: 'الإخفاء الشفوي والإظهار الشفوي',
+    video: 'ڤیدیۆی ٦ی پلەیلیستەکەی مامۆستا سەردار',
+    summary:
+        'ئەمە حوکمەکانی میمی ساکنە (مْ). «شەفەوی» واتە پەیوەندیدار بە لێوەکان، چونکە میم بە لێوەکان دەردەچێت. سێ حوکمی هەیە: ئیخفای شەفەوی (کاتێک «ب» دێت)، ئیدغامی مثلین (کاتێک «م» دێت، وانەی ٨) و ئیزهاری شەفەوی (لەگەڵ هەموو پیتەکانی تر).',
+    numberedRules: true,
+    rules: [
+      'ئیخفای شەفەوی: میمی ساکن + ب. میمەکە نیوەچڵ و لەگەڵ دەنگی لووت (دوو حەرەکە) دەخوێنرێتەوە، و لێوەکان بە سووکی دەگەنە یەک.',
+      'ئیزهاری شەفەوی: میمی ساکن + هەموو پیتەکان جگە لە ب و م. میمەکە ڕوون و بێ دەنگی لووتی زیادە دەخوێنرێتەوە.',
+      'ئاگاداربە کاتێک میمی ساکن دێتە پێش «و» یان «ف»: میمەکە ڕوون بخوێنەوە و مەیشارەوە، چونکە شوێنی دەرچوونیان لە میم نزیکە و بە ئاسانی دەشاردرێتەوە.',
+      'میمی ساکن + م: ئیدغامی مثلین (وانەی ٨).',
+    ],
+    mistakes: [
+      'بە توندی گوشینی لێوەکان لە ئیخفای شەفەوی.',
+      'شاردنەوەی میم پێش «و» و «ف» (دەبێت ڕوون بخوێنرێتەوە).',
+    ],
+    examples: [
+      TajweedExample('تَرْمِيهِم بِحِجَارَةٍ', ref: '105:4', note: 'ئیخفای شەفەوی'),
+      TajweedExample('وَمَن يَعْتَصِم بِٱللَّهِ',
+          ref: '3:101', note: 'ئیخفای شەفەوی'),
+      TajweedExample('أَمْ لَمْ تُنذِرْهُمْ', ref: '2:6', note: 'ئیزهاری شەفەوی (م + ل)'),
+      TajweedExample('عَلَيْهِمْ دَآئِرَةُ ٱلسَّوْءِ',
+          ref: '48:6', note: 'ئیزهاری شەفەوی (م + د)'),
+    ],
+  ),
+  // ------------------------------------------------------------------ 7
+  TajweedLesson(
+    id: 7,
+    titleKu: 'حوکمەکانی ڕاء (قورس و تەنک)',
+    titleAr: 'أحكام الراء',
+    video: 'ڤیدیۆی ٧ی پلەیلیستەکەی مامۆستا سەردار',
+    summary:
+        'پیتی «ر» هەندێک جار قورس (تفخیم: دەنگی پڕ و ئەستوور) و هەندێک جار تەنک (ترقیق: دەنگی ڕوون و ناسک) دەخوێنرێتەوە، بەپێی بزوێنی خۆی و پیتی پێش و دوای.',
+    rules: [
+      'قورس: کاتێک ڕا فەتحە یان زەمەی هەبێت (رَبِّ، رُسُل).',
+      'قورس: ڕای ساکن دوای فەتحە یان زەمە (يَرْجِعُونَ، قُرْءَان).',
+      'قورس: ڕای ساکن دوای کەسرەیەک کە ڕەسەن نییە و تەنها بۆ دەستپێکردنی وشەکە هاتووە (کەسرەی هەمزەی وەسڵ، وەک ٱرْتَابُوا).',
+      'قورس: ڕای ساکن دوای کەسرەی ڕەسەن لە هەمان وشەدا، ئەگەر یەکێک لە پیتە قورسەکان (خ ص ض غ ط ق ظ) بەدوایدا بێت (مِرْصَادًا). تەنها لە «فِرْقٍ» هەردوو شێوە دروستە.',
+      'تەنک: کاتێک ڕا کەسرەی هەبێت (رِجَال).',
+      'تەنک: ڕای ساکن دوای کەسرەی ڕەسەن، ئەگەر پیتی قورس بەدوایدا نەبێت (فِرْعَوْنَ).',
+      'لە کاتی وەستاندا: ڕا تەنک دەخوێنرێتەوە ئەگەر دوای یای ساکن یان کەسرە بێت (قَدِير، سِحْر).',
+    ],
+    mistakes: [
+      'قورسکردنی ڕای تەنک (وەک فِرْعَوْنَ و رِجَال).',
+      'تەنککردنی ڕای قورس (وەک رَبِّ و مِرْصَادًا).',
+    ],
+    examples: [
+      TajweedExample('رَبِّ', note: 'قورس: فەتحە'),
+      TajweedExample('مِرْصَادًا', ref: '78:21', note: 'قورس: ر + ص'),
+      TajweedExample('فِرْعَوْنَ', note: 'تەنک: ڕای ساکن دوای کەسرە'),
+      TajweedExample('رِجَالٌ', note: 'تەنک: کەسرە'),
+      TajweedExample('قَدِيرٌ', note: 'تەنک لە وەستان'),
+    ],
+  ),
+  // ------------------------------------------------------------------ 8
+  TajweedLesson(
+    id: 8,
+    titleKu: 'ئیدغامی مثلین (دوو پیتی وەک یەک)',
+    titleAr: 'الإدغام المتماثلين',
+    video: 'ڤیدیۆی ٨ی پلەیلیستەکەی مامۆستا سەردار',
+    summary:
+        'مثلین واتە دوو پیتی هاوشێوە (ب+ب، م+م، ت+ت) کە لە شوێنی دەرچوون و شێوەی دەنگدا وەک یەکن. ئەگەر یەکەمیان ساکن بێت و دووەمیان لە وشەی دواتر بێت، یەکەمیان دەچێتە ناو دووەمیان و دەبنە یەک پیتی شەددار.',
+    numberedRules: true,
+    rules: [
+      'مثلینی صغیر (بچووک): پیتی یەکەم ساکنە و دووەم بزوێنراوە. ئیدغامکردن واجبە.',
+      'مثلینی کبیر (گەورە): هەردووکیان بزوێنراون. ئیدغام نییە و بە ئاسایی دەخوێنرێتەوە (جگە لە چەند وشەیەکی دیاریکراو).',
+      'کاتێک میم دەچێتە ناو میم، یان نوون دەچێتە ناو نوون، غوننەی دوو حەرەکەی هەیە.',
+      'ئەگەر پیتی یەکەم پیتی مەد بێت (وەک فِي يَوْمٍ، ءَامَنُوا وَعَمِلُوا) ئیدغام ناکرێت، بۆ ئەوەی مەدەکە نەفەوتێت.',
+    ],
+    mistakes: [
+      'نەکردنی ئیدغام لە مثلینی صغیر (ڕوون خوێندنەوەی).',
+      'ئیدغامکردنی پیتی مەد لە پیتێکی وەک خۆی (وەک «فِي يَوْمٍ»).',
+    ],
+    examples: [
+      TajweedExample('إِذ ذَّهَبَ', ref: '21:87', note: 'ذ + ذ'),
+      TajweedExample('رَبِحَت تِّجَـٰرَتُهُمْ', ref: '2:16', note: 'ت + ت'),
+      TajweedExample('لَهُم مَّا يَشَآءُونَ', note: 'م + م: غوننە'),
+    ],
+  ),
+  // ------------------------------------------------------------------ 9
+  TajweedLesson(
+    id: 9,
+    titleKu: 'ئیدغامی متجانسین و متقاربین (پیتی هاوشوێن و نزیک)',
+    titleAr: 'الإدغام المتجانسين والمتقاربين',
+    video: 'ڤیدیۆی ٩ی پلەیلیستەکەی مامۆستا سەردار',
+    summary:
+        'متجانسین دوو پیتن کە شوێنی دەرچوونیان یەکە بەڵام شێوەی دەنگیان جیاوازە. متقاربین دوو پیتن کە شوێنی دەرچوونیان یان شێوەی دەنگیان نزیکە. ئەگەر یەکەمیان ساکن بێت و دووەمیان لە وشەی دواتر بێت، دەچنە ناو یەک (ئیدغام دەکرێن).',
+    numberedRules: true,
+    rules: [
+      'متجانسین (هاوشوێن): ت + د، د + ت، ت + ط، ط + ت، ذ + ظ، ث + ذ، ب + م. پیتی یەکەم دەچێتە ناو دووەم.',
+      'متقاربین (نزیک): ل + ر و ق + ك. پیتی یەکەم دەچێتە ناو دووەم.',
+      'لە ب + م ئیدغامەکە لەگەڵ غوننەیە (ب دەبێتە م).',
+      'ئەمانە ئیدغامی صغیرن (پیتی یەکەم ساکنە) و واجبن. ئەگەر پیتی یەکەم بزوێنراو بێت ئیدغام نییە.',
+    ],
+    mistakes: [
+      'نەکردنی ئیدغام لە قَد تَّبَيَّنَ و قُل رَّبِّ.',
+      'نەکردنی غوننە لە ب + م.',
+    ],
+    examples: [
+      TajweedExample('قَد تَّبَيَّنَ', ref: '2:256', note: 'د + ت'),
+      TajweedExample('وَدَّت طَّآئِفَةٌ', ref: '3:69', note: 'ت + ط'),
+      TajweedExample('إِذ ظَّلَمُوٓا۟', ref: '4:64', note: 'ذ + ظ'),
+      TajweedExample('يَلْهَث ذَّٰلِكَ', ref: '7:176', note: 'ث + ذ'),
+      TajweedExample('ٱرْكَب مَّعَنَا', ref: '11:42', note: 'ب + م: غوننە'),
+      TajweedExample('قُل رَّبِّ', ref: '23:93', note: 'ل + ر'),
+      TajweedExample('أَلَمْ نَخْلُقكُّم', ref: '77:20', note: 'ق + ك'),
+    ],
+  ),
+  // ----------------------------------------------------------------- 10
+  TajweedLesson(
+    id: 10,
+    titleKu: 'حەوت جۆرەکەی ئەلیف',
+    titleAr: 'الألفات السبع',
+    video: 'ڤیدیۆی ١٠ی پلەیلیستەکەی مامۆستا سەردار',
+    summary:
+        'ئەلیف لە قورئاندا حەوت جۆرە و هەر جۆرێک ڕێسای خۆی هەیە: هەندێکیان دەخوێنرێنەوە و هەندێکیان تەنها دەنووسرێن.',
+    numberedRules: true,
+    rules: [
+      'ئەلیفی مەد (قَالَ): دەنگەکە دوو حەرەکە درێژ دەکرێتەوە.',
+      'هەمزەی قطع (أَنْعَمْتَ): هەمزەیەکە کە هەمیشە دەخوێنرێتەوە، چ لە سەرەتا و چ لە ناوەڕاست. («قطع» واتە بڕین، چونکە لە وشەی پێشوو جیا دەبێتەوە.)',
+      'هەمزەی وەسڵ (ٱلْحَمْدُ): ئەلیفێکی سەرەتای وشەیە کە تەنها لە سەرەتای خوێندنەوە دەخوێنرێتەوە، و کاتێک وشەکە بە وشەی پێشوو دەبەستیتەوە نایخوێنیتەوە (وانەی ١٣).',
+      'ئەلیفی بچووکی سەر پیت (ٰ) (ٱلرَّحْمَـٰنِ): ئەلیفێکی بچووکە لەسەر پیتەکە نووسراوە و دوو حەرەکە درێژ دەکرێتەوە.',
+      'ئەلیفی نووسراوی ناخوێندراو دوای «و»ی کۆمەڵ (ءَامَنُوا۟): دەنووسرێت بەڵام نایخوێنرێتەوە، بە بازنەی بچووک (۟) نیشان کراوە.',
+      'ئەلیفی تەنوینی فەتح (عَلِيمًا): ئەگەر بوەستیت دەبێتە ئەلیفی مەد (عَلِيمَا)؛ ئەگەر بەردەوام بیت نایخوێنیتەوە.',
+      'ئەلیفی ئیتلاق (ٱلرَّسُولَا۠): ئەلیفێکە لە کۆتایی چەند وشەیەکی دیاریکراو. ئەگەر بوەستیت دەخوێنرێتەوە؛ ئەگەر بەردەوام بیت نایخوێنرێتەوە.',
+    ],
+    mistakes: [
+      'خوێندنەوەی ئەلیفی نووسراوی دوای «و»ی کۆمەڵ (ءَامَنُوا۟).',
+      'خوێندنەوەی هەمزەی وەسڵ لە ناوەڕاستی خوێندنەوە.',
+    ],
+    examples: [
+      TajweedExample('قَالَ', note: 'ئەلیفی مەد'),
+      TajweedExample('أَنْعَمْتَ', ref: '1:7', note: 'هەمزەی قطع'),
+      TajweedExample('ٱلْحَمْدُ', ref: '1:2', note: 'هەمزەی وەسڵ'),
+      TajweedExample('ٱلرَّحْمَـٰنِ', ref: '1:3', note: 'ئەلیفی بچووکی سەر پیت'),
+      TajweedExample('ءَامَنُوا۟', ref: '2:14', note: 'ئەلیفی دوای واو: نایخوێنرێت'),
+      TajweedExample('ٱلرَّسُولَا۠', ref: '33:66', note: 'ئەلیفی ئیتلاق'),
+    ],
+  ),
+  // ----------------------------------------------------------------- 11
+  TajweedLesson(
+    id: 11,
+    titleKu: 'لامی شەمسی و قەمەری (لامی «ال»)',
+    titleAr: 'لام الشمسي والقمري',
+    video: 'ڤیدیۆی ١١ی پلەیلیستەکەی مامۆستا سەردار',
+    summary:
+        'لامی «ال» لە سەرەتای ناوەکان دوو حاڵەتی هەیە. ئەگەر پیتی دوای لام یەکێک بێت لە ١٤ پیتی قەمەری، لامەکە ڕوون دەخوێنرێتەوە. ئەگەر یەکێک بێت لە ١٤ پیتی شەمسی، لامەکە نایخوێنرێتەوە و دەچێتە ناو پیتی دوای. (شەمسی لە «شەمس» = خۆر و قەمەری لە «قەمەر» = مانگ؛ ناوی نموونەی هەریەکەیانە.)',
+    numberedRules: true,
+    rules: [
+      'لامی قەمەری: ١٤ پیتە لە ڕستەی «ابغ حجك وخف عقيمه» کۆکراونەتەوە: ا ب غ ح ج ك و خ ف ع ق ي م ه. لامەکە ساکنە و ڕوون دەخوێنرێتەوە.',
+      'لامی شەمسی: ١٤ پیتەکەی تر، کە لە ڕستەی «طب ثم صل رحما تفز ضف ذا نعم دع سوء ظن زر شريفا للكرم» کۆکراونەتەوە: ت ث د ذ ر ز س ش ص ض ط ظ ل ن. لامەکە نایخوێنرێتەوە و پیتی دوای شەددار دەبێت.',
+      'لە نووسینی قورئاندا: لەسەر لامی قەمەری نیشانەی ساکن (ْ) دانراوە؛ لەسەر پیتی شەمسی شەدە (ـّ) دانراوە.',
+    ],
+    mistakes: [
+      'خوێندنی لام لە پیتی شەمسی (ٱلشَّمْس نابێت «ئەلشەمس» بێت، دەبێت «ئەششەمس» بێت).',
+      'نەخوێندنی لام لە پیتی قەمەری (ٱلْقَمَر).',
+    ],
+    examples: [
+      TajweedExample('ٱلْقَمَرُ', note: 'قەمەری: لام ڕوون'),
+      TajweedExample('ٱلْبَيْتُ', note: 'قەمەری: لام ڕوون'),
+      TajweedExample('ٱلشَّمْسُ', note: 'شەمسی: لام ناخوێنرێت، ش شەددارە'),
+      TajweedExample('ٱلرَّحْمَـٰنُ', note: 'شەمسی: لام ناخوێنرێت، ر شەددارە'),
+    ],
+  ),
+  // ----------------------------------------------------------------- 12
+  TajweedLesson(
+    id: 12,
+    titleKu: 'لامی «الله» (قورس یان تەنک)',
+    titleAr: 'لام لفظ الجلالة',
+    video: 'ڤیدیۆی ١٢ی پلەیلیستەکەی مامۆستا سەردار',
+    summary:
+        'لامی ناوی گەورەی «الله» بەپێی بزوێنی پیتی پێش خۆی، قورس (دەنگی پڕ و ئەستوور) یان تەنک (دەنگی ڕوون و ناسک) دەخوێنرێتەوە.',
+    rules: [
+      'قورس: ئەگەر پیتی پێش لام فەتحە یان زەمەی هەبێت (رَسُولُ ٱللَّهِ، قَالَ ٱللَّهُ).',
+      'تەنک: ئەگەر پیتی پێش لام کەسرەی هەبێت (بِسْمِ ٱللَّهِ).',
+      'لە سەرەتای خوێندنەوە: لامی «ٱللَّهُ» قورسە.',
+      'ئەم ڕێسایە تەنها بۆ ناوی «الله»یە، نەک هەموو لامێک.',
+    ],
+    mistakes: [
+      'تەنککردنی لام دوای فەتحە و زەمە.',
+      'قورسکردنی لام دوای کەسرە.',
+    ],
+    examples: [
+      TajweedExample('قَالَ ٱللَّهُ', ref: '3:55', note: 'قورس'),
+      TajweedExample('رَسُولُ ٱللَّهِ', note: 'قورس'),
+      TajweedExample('بِسْمِ ٱللَّهِ', ref: '1:1', note: 'تەنک'),
+    ],
+  ),
+  // ----------------------------------------------------------------- 13
+  TajweedLesson(
+    id: 13,
+    titleKu: 'هەمزەی وەسڵ (هەمزەی بەستنەوە)',
+    titleAr: 'همزة الوصل',
+    video: 'ڤیدیۆی ١٣ی پلەیلیستەکەی مامۆستا سەردار',
+    summary:
+        'هەمزەی وەسڵ تەنها لە سەرەتای خوێندنەوە دەخوێنرێتەوە؛ ئەگەر وشەکە بە وشەی پێشوو ببەستیتەوە نایخوێنیتەوە. هەمزەی قطع هەمیشە دەخوێنرێتەوە.',
+    numberedRules: true,
+    rules: [
+      'شوێنەکانی: «ال»؛ فەرمانی فرمانە سێ پیتییەکان (ٱقْرَأْ = بخوێنە)؛ فرمانی ڕابردووی پێنج و شەش پیتی (ٱنطَلَقَ، ٱسْتَغْفَرَ)؛ و چەند ناوێک: ٱسْم، ٱبْن، ٱبْنَة، ٱمْرُؤ، ٱمْرَأَة، ٱثْنَان، ٱثْنَتَان.',
+      'لە «ال» بە فەتحە دەست پێدەکەیت (ٱلْحَمْدُ).',
+      'لە ناوەکان (ٱسْم) بە کەسرە دەست پێدەکەیت.',
+      'لە فرمانەکاندا سەیری پیتی سێیەمی فرمانەکە بکە (هەمزەکە بە یەکەم بژمێرە): ئەگەر زەمەی هەبوو بە زەمە دەست پێدەکەیت (ٱقْتُلُوا)، ئەگەر نا بە کەسرە (ٱهْدِنَا، ٱقْرَأْ).',
+      'هەمزەی قطع هەمیشە دەخوێنرێتەوە (أَنزَلَ، أَنْعَمْتَ).',
+    ],
+    mistakes: [
+      'خوێندنی هەمزەی وەسڵ لە ناوەڕاستی ڕستە (کاتێک بە وشەی پێشوو دەبەستیتەوە).',
+      'دەستپێکردن بە زەمە لە ٱهْدِنَا (دەبێت بە کەسرە بێت).',
+    ],
+    examples: [
+      TajweedExample('ٱهْدِنَا', ref: '1:6', note: 'دەستپێک بە کەسرە'),
+      TajweedExample('ٱقْرَأْ', ref: '96:1', note: 'دەستپێک بە کەسرە'),
+      TajweedExample('ٱقْتُلُوا۟ يُوسُفَ', ref: '12:9', note: 'دەستپێک بە زەمە'),
+      TajweedExample('ٱلْحَمْدُ', ref: '1:2', note: 'دەستپێک بە فەتحە'),
+      TajweedExample('أَنْعَمْتَ', ref: '1:7', note: 'هەمزەی قطع'),
+    ],
+  ),
+  // ----------------------------------------------------------------- 14
+  TajweedLesson(
+    id: 14,
+    titleKu: 'کۆبوونەوەی دوو ساکن بەهۆی تەنوینەوە',
+    titleAr: 'التقاء الساكنين بسبب التنوين',
+    video: 'ڤیدیۆی ١٤ی پلەیلیستەکەی مامۆستا سەردار',
+    summary:
+        'تەنوین لە ڕاستیدا نوونێکی ساکنە (دەنگی «ن»). ئەگەر وشەی دواتر بە هەمزەی وەسڵ دەست پێبکات، لە کاتی بەستنەوەدا دوو پیتی ساکن (بێ بزوێن) دەکەونە تەنیشت یەک. بۆ ئەوەی دەنگەکە بخوێنرێتەوە، یەکێکیان دەبزوێنرێت.',
+    numberedRules: true,
+    rules: [
+      'نوونی تەنوین بە کەسرە دەبزوێت: «أَحَدٌ ٱللَّهُ» دەخوێنرێتەوە «أَحَدُنِ ٱللَّهُ».',
+      'نوونی «مِنْ» پێش «ال» بە فەتحە دەبزوێت (مِنَ ٱلْجِنَّةِ)، بەڵام پێش هەمزەی وەسڵی تر بە کەسرە (مَنِ ٱسْتَطَاعَ).',
+      '«و»ی کۆمەڵ بە زەمە دەبزوێت (ٱشْتَرَوُا۟ ٱلضَّلَـٰلَةَ).',
+      'ئەمە تەنها لە کاتی بەستنەوەدایە؛ ئەگەر بوەستیت ئەم کێشەیە نامێنێت.',
+    ],
+    mistakes: [
+      'نەبزواندنی نوونی تەنوین کاتێک پێش هەمزەی وەسڵ دێت.',
+      'نەبزواندنی نوونی «مِنْ» پێش هەمزەی وەسڵ.',
+    ],
+    examples: [
+      TajweedExample('أَحَدٌ ٱللَّهُ',
+          ref: '112:1-2', note: 'دەخوێنرێتەوە: أَحَدُنِ ٱللَّهُ'),
+      TajweedExample('مَنِ ٱسْتَطَاعَ', ref: '3:97', note: 'نوون بە کەسرە'),
+      TajweedExample('مِنَ ٱلْجِنَّةِ وَٱلنَّاسِ',
+          ref: '114:6', note: 'نوون بە فەتحە پێش «ال»'),
+    ],
+  ),
+  // ----------------------------------------------------------------- 15
+  TajweedLesson(
+    id: 15,
+    titleKu: 'مەدی ئەسڵی (سروشتی)',
+    titleAr: 'المد الأصلي',
+    video: 'ڤیدیۆی ١٥ی پلەیلیستەکەی مامۆستا سەردار',
+    summary:
+        'مەد واتە درێژکردنەوەی دەنگی پیتێکی نەرم (ا، و، ی). مەدی ئەسڵی ئەو درێژکردنەوە ئاساییەیە کە هیچ هۆکارێکی تری نییە جگە لە خودی پیتی مەدەکە: نە هەمزە و نە ساکن لە پاش پیتی مەدەکە نایەت.',
+    numberedRules: true,
+    rules: [
+      'پیتەکانی مەد سێن: ئەلیف (دوای فەتحە)، واو (ساکن، دوای زەمە)، یاء (ساکن، دوای کەسرە). لە وشەی «نُوحِيهَا» کۆکراونەتەوە.',
+      'ماوەی مەدەکە دوو حەرەکەیە، نە کەمتر و نە زیاتر. یەک حەرەکە بەقەد یەک جووڵەی پەنجەیە، واتە دوو حەرەکە بەقەد دوو جووڵەی پەنجە.',
+      'پێی دەوترێت «ئەسڵی» (بنەڕەتی)، چونکە بنەمای هەموو مەدەکانی ترە.',
+      'مەدی سیلەی سوغرا: «ه»ی جێناوی (ـهُ / ـهِ) کە لە نێوان دوو پیتی بزوێنراودایە و هەمزەی بەدوادا نایەت، دوو حەرەکە درێژ دەکرێتەوە (لَهُۥ مَا).',
+    ],
+    mistakes: [
+      'کورتکردنەوەی مەدی ئەسڵی لە دوو حەرەکە.',
+      'درێژکردنەوەی بۆ زیاتر لە دوو حەرەکە (وەک مەدی متصل).',
+    ],
+    examples: [
+      TajweedExample('قَالَ', note: 'مەد بە ئەلیف'),
+      TajweedExample('يَقُولُ', note: 'مەد بە واو'),
+      TajweedExample('قِيلَ', ref: '2:11', note: 'مەد بە یاء'),
+      TajweedExample('لَّهُۥ مَا فِى ٱلسَّمَـٰوَٰتِ',
+          ref: '2:255', note: 'مەدی سیلەی سوغرا'),
+    ],
+  ),
+  // ----------------------------------------------------------------- 16
+  TajweedLesson(
+    id: 16,
+    titleKu: 'مەدی لاوەکی بەهۆی هەمزە و ساکنەوە',
+    titleAr: 'المد الفرعي بسبب الهمزة والسكون',
+    video: 'ڤیدیۆی ١٦ی پلەیلیستەکەی مامۆستا سەردار',
+    summary:
+        'مەدی لاوەکی (فەرعی) ئەو مەدەیە کە دەنگەکە لە دوو حەرەکە زیاتر درێژ دەکرێتەوە، بەهۆی هەمزە یان پیتێکی ساکنەوە لە پاش (یان پێش) پیتی مەد.',
+    numberedRules: true,
+    rules: [
+      'بەهۆی هەمزەوە:\n• متصل (بەیەکەوەبەستراو): مەد و هەمزە لە یەک وشەدان (جَآءَ). واجبە، ٤ یان ٥ حەرەکە.\n• منفصل (جیابووەوە): مەد لە کۆتایی وشەیەکە و هەمزە لە سەرەتای وشەی دواتر (بِمَآ أُنزِلَ). جایزە، ٤ یان ٥ حەرەکە.\n• بەدەل (جێگرەوە): هەمزە پێش پیتی مەد دێت (ءَامَنُوا۟). تەنها دوو حەرەکە.',
+      'بەهۆی ساکنەوە:\n• لازم (پێویست): دوای پیتی مەد ساکنێکی ڕەسەن یان شەدە دێت (ٱلضَّآلِّينَ). واجبە، ٦ حەرەکە. چوار جۆرە: کەلیمی موسەقەل (لە وشەدا، لەگەڵ شەدە: ٱلضَّآلِّينَ)، کەلیمی موخەففەف (لە وشەدا، بێ شەدە: ءَآلْـَٔـٰنَ)، حەرفی موسەقەل و حەرفی موخەففەف (لە پیتە بڕاوەکانی سەرەتای سوورەتەکان وەک الٓمٓ).\n• عارض (کاتی): ساکن لە کاتی وەستاندا دروست دەبێت (نَسْتَعِينُ). ٢ یان ٤ یان ٦ حەرەکە.\n• لین (نەرم): واو یان یاءی ساکن دوای فەتحە، لە کاتی وەستاندا (خَوْفٍ). ٢ یان ٤ یان ٦ حەرەکە.',
+      'ئەگەر بەردەوام بیت و نەوەستیت، مەدی عارض و لین نامێنن.',
+      'ئەگەر دوو هۆکاری مەد پێکەوە کۆبوونەوە، بەهێزترینیان جێبەجێ دەکرێت. ڕیزبەندی لە بەهێزترەوە: لازم، متصل، عارض، منفصل، بەدەل.',
+    ],
+    mistakes: [
+      'کورتکردنەوەی مەدی متصل یان لازم.',
+      'درێژکردنەوەی مەدی عارض لە ناوەڕاستی ئایەت کاتێک نەوەستاویت.',
+      'خوێندنەوەی مەدی لازم کەمتر لە شەش حەرەکە.',
+    ],
+    examples: [
+      TajweedExample('سَوَآءٌ', ref: '2:6', note: 'متصل'),
+      TajweedExample('بِمَآ أُنزِلَ', ref: '2:4', note: 'منفصل'),
+      TajweedExample('ءَامَنُوا۟', ref: '2:14', note: 'بەدەل'),
+      TajweedExample('ٱلضَّآلِّينَ', ref: '1:7', note: 'لازمی کەلیمی موسەقەل (شەدە لە وشەدا)'),
+      TajweedExample('ٱلْحَآقَّةُ', ref: '69:1', note: 'لازمی کەلیمی موسەقەل (شەدە لە وشەدا)'),
+      TajweedExample('ءَآلْـَٔـٰنَ', ref: '10:51', note: 'لازمی کەلیمی موخەففەف (ساکن لە وشەدا)'),
+      TajweedExample('الٓمٓ', ref: '2:1', note: 'لازمی حەرفی: لام شەش حەرەکە'),
+      TajweedExample('نَسْتَعِينُ', ref: '1:5', note: 'عارض لە کاتی وەستان'),
+      TajweedExample('خَوْفٍ', ref: '106:4', note: 'لین'),
+    ],
+  ),
+  // ----------------------------------------------------------------- 17
+  TajweedLesson(
+    id: 17,
+    titleKu: 'مەخرەجی پیتەکان (١): پێشەکی، بۆشایی دەم، لێوەکان، لووت',
+    titleAr: 'مخارج الحروف (الجوف والشفتان والخيشوم)',
+    video:
+        'ڤیدیۆی ١٧ی پلەیلیستەکەی مامۆستا سەردار (ناونیشانەکەی لە سکرینشۆتەکەدا تەواو نەبوو)',
+    summary:
+        'مەخرەج واتە شوێنی دەرچوونی دەنگی پیتەکە. پیتەکانی عەرەبی لە ١٧ شوێنی تایبەتەوە دەردەچن، کە لە ٥ ناوچەی گشتی کۆکراونەتەوە: جەوف (بۆشایی دەم و قورگ) ١ شوێن، قورگ ٣ شوێن، زمان ١٠ شوێن، لێوەکان ٢ شوێن، خەیشوم (لووت) ١ شوێن.',
+    numberedRules: true,
+    rules: [
+      'بۆ دۆزینەوەی مەخرەجی پیتێک: پیتەکە ساکن بکە و هەمزەیەکی پێش بخە (أَبْ، أَتْ، أَقْ)، پاشان ببینە دەنگەکە لە کوێ دەوەستێت.',
+      'جەوف (بۆشایی دەم و قورگ): سێ پیتی مەد، واتە ئەلیف و واو و یاء (کاتێک مەدن). شوێنێکی دیاریکراویان نییە؛ دەنگەکە لەگەڵ هەناسە دەڕوات تا کۆتایی دێت.',
+      'لێوەکان دوو مەخرەجن: «ف» لە ناوەوەی لێوی خوارەوە و سەری ددانە پێشەوەکانی سەرەوە. «ب م و» لە هەردوو لێوەکانەوە: «ب» بە ناوەوەی تەڕی لێوەکان، «م» بە بەشی وشکی لێوەکان، و «و» بە خڕکردنەوەی لێوەکان بێ ئەوەی بیانگوشیت.',
+      'خەیشوم (لووت): مەخرەجی غوننەیە (لە ن و م ی شەددار، ئیخفا، ئیقلاب و ئیدغام لەگەڵ غوننە).',
+    ],
+    mistakes: [
+      'تێکەڵکردنی ب و م: ب دەنگێکی لێوییە، م لەگەڵ دەنگی لووت دەخوێنرێتەوە.',
+      'بە توندی گوشینی لێوەکان لە «و».',
+    ],
+    examples: [
+      TajweedExample('قَالَ', note: 'جەوف: ئەلیفی مەد'),
+      TajweedExample('يَقُولُ', note: 'جەوف: واوی مەد'),
+      TajweedExample('بِسْمِ', ref: '1:1', note: 'ب و م: لێوەکان'),
+      TajweedExample('ٱلْحَمْدُ', ref: '1:2', note: 'م: لێوەکان'),
+      TajweedExample('فَ', note: 'ف: لێوی خوارەوە و ددانەکانی سەرەوە'),
+    ],
+  ),
+  // ----------------------------------------------------------------- 18
+  TajweedLesson(
+    id: 18,
+    titleKu: 'مەخرەجی پیتەکان (٢): زمان',
+    titleAr: 'مخارج الحروف (اللسان)',
+    video: 'ڤیدیۆی ١٨ و ١٩ (هەردووکیان یەک ڤیدیۆن)',
+    summary:
+        'زمان دە شوێنی دەرچوونی هەیە و ١٨ پیتی لێوە دەردەچن. لە قووڵترینیەوە (کۆتایی زمان) بۆ نووکی زمان ڕیز دەکرێن.',
+    numberedRules: true,
+    rules: [
+      'کۆتایی زمان لەگەڵ ئاسمانی نەرمی دەم (بەشی نەرمی سەرەوەی ناوەوەی دەم، نزیک قورگ): ق.',
+      'کۆتایی زمان، کەمێک بەرەو دەم لە ق: ك.',
+      'ناوەڕاستی زمان لەگەڵ ئاسمانی ڕەقی دەم: ج ش ي.',
+      'لای زمان (بەزۆری لای چەپ) لەگەڵ ددانە ئاشەکان (ددانە پشتەوەکانی سەرەوە): ض.',
+      'لای زمان، نزیک نووکەکەی، لەگەڵ ددانە پێشەوەکان: ل.',
+      'نووکی زمان لەگەڵ ڕەگی ددانە پێشەوەکانی سەرەوە: ن؛ و ڕ کەمێک بەرەو ناوەوەتر.',
+      'نووکی زمان لەگەڵ ڕەگی ددانە پێشەوەکانی سەرەوە: ط د ت (دەنگی ط لەوان قورستر و پڕترە).',
+      'نووکی زمان لەگەڵ سەری ددانە پێشەوەکانی خوارەوە (دەنگی فیکەئامێز): ص س ز.',
+      'نووکی زمان لەگەڵ سەری ددانە پێشەوەکانی سەرەوە: ظ ذ ث.',
+    ],
+    mistakes: [
+      'ض بخوێنرێتەوە وەک ظ یان د.',
+      'ق بخوێنرێتەوە وەک ك.',
+      'ص بخوێنرێتەوە وەک س.',
+      'ط بخوێنرێتەوە وەک ت.',
+    ],
+    examples: [
+      TajweedExample('قُلْ', ref: '112:1', note: 'ق: کۆتایی زمان'),
+      TajweedExample('ٱلصِّرَٰطَ', ref: '1:6', note: 'ص و ط: نووکی زمان'),
+      TajweedExample('ٱلضَّآلِّينَ', ref: '1:7', note: 'ض: لای زمان'),
+      TajweedExample('وَٱلشَّمْسِ', ref: '91:1', note: 'ش: ناوەڕاستی زمان'),
+    ],
+  ),
+  // ----------------------------------------------------------------- 19
+  TajweedLesson(
+    id: 19,
+    titleKu: 'مەخرەجی پیتەکان (٣): قورگ',
+    titleAr: 'مخارج الحروف (الحلق)',
+    video: 'ڤیدیۆی ١٨ و ١٩ (هەردووکیان یەک ڤیدیۆن)',
+    summary:
+        'قورگ سێ شوێنی دەرچوونی هەیە و شەش پیتی لێ دەردەچێت.',
+    numberedRules: true,
+    rules: [
+      'کۆتایی قورگ (دوورترین بەش لە دەم): ء ه.',
+      'ناوەڕاستی قورگ: ع ح.',
+      'سەرەوەی قورگ (نزیکترین بەش لە دەم): غ خ.',
+      'ئەم شەش پیتە هەمان پیتەکانی ئیزهارن (وانەی ٣).',
+    ],
+    mistakes: [
+      'ع بخوێنرێتەوە وەک ء.',
+      'ح بخوێنرێتەوە وەک ه.',
+      'خ بخوێنرێتەوە وەک ه یان غ.',
+    ],
+    examples: [
+      TajweedExample('ٱلْعَـٰلَمِينَ', ref: '1:2', note: 'ع: ناوەڕاستی قورگ'),
+      TajweedExample('ٱلْحَمْدُ', ref: '1:2', note: 'ح: ناوەڕاستی قورگ'),
+      TajweedExample('أَعُوذُ', note: 'ء: کۆتایی قورگ'),
+      TajweedExample('ٱلْمَغْضُوبِ', ref: '1:7', note: 'غ: سەرەوەی قورگ'),
+    ],
+  ),
+  // ----------------------------------------------------------------- 20
+  TajweedLesson(
+    id: 20,
+    titleKu: 'سیفاتی پیتەکان (١): جووتە دژەکان، بەشی یەکەم',
+    titleAr: 'صفات الحروف (التي لها ضد): الهمس والجهر والشدة والرخاوة',
+    video: 'ڤیدیۆی ٢٠ و ٢١ (هەردووکیان یەک ڤیدیۆن)',
+    summary:
+        'سیفەت واتە تایبەتمەندیی دەنگی پیتەکە، کە دەنگەکە چۆن لە شوێنی دەرچوونی خۆیەوە دەردەچێت (بە هێز یان بە نەرمی). پێنج جووتە سیفەتی دژبەیەک هەیە (هەر جووتێک دوو شتی پێچەوانەی یەکە). ئەم بەشە دوو جووتی یەکەم دەگرێتەوە.',
+    numberedRules: true,
+    rules: [
+      'هەمس (دەنگ لاوازە و هەناسەی لەگەڵ دەڕوات) دژی جەهر (دەنگ بەهێزە و هەناسە ڕادەگیرێت). پیتەکانی هەمس دەن و لە ڕستەی «فَحَثَّهُ شَخْصٌ سَكَتَ» کۆکراونەتەوە. ١٨ پیتەکەی تر جەهرن.',
+      'شدة (توندی: دەنگ لە شوێنی دەرچوونی ڕادەگیرێت) دژی ڕخاوە (نەرمی: دەنگ بەردەوام دەڕوات). پیتەکانی شدة هەشتن و لە «أَجِدُ قَطٍ بَكَتْ» کۆکراونەتەوە. باقیان ڕخاوەن.',
+      'لە نێوان شدة و ڕخاوە بەینییە (ناوەند): پیتەکانی «لِنْ عُمَرْ» (ل ن ع م ر)، کە نە تەواو توندن و نە تەواو نەرم.',
+    ],
+    mistakes: [
+      'ح و ه وەک یەک بخوێندرێنەوە: هەردووکیان هەمسن بەڵام شوێنی دەرچوونیان جیاوازە.',
+      'نەگرتنەوەی دەنگ لە پیتەکانی شدة (وەک ب و ت).',
+    ],
+    examples: [
+      TajweedExample('نَسْتَعِينُ', ref: '1:5', note: 'ت و س: هەمس'),
+      TajweedExample('ٱلصِّرَٰطَ', ref: '1:6', note: 'ط: شدة و جەهر'),
+      TajweedExample('ٱلْحَمْدُ', ref: '1:2', note: 'ح: هەمس'),
+    ],
+  ),
+  // ----------------------------------------------------------------- 21
+  TajweedLesson(
+    id: 21,
+    titleKu: 'سیفاتی پیتەکان (٢): جووتە دژەکان، بەشی دووەم',
+    titleAr: 'صفات الحروف (التي لها ضد): الاستعلاء والإطباق والإذلاق',
+    video: 'ڤیدیۆی ٢٠ و ٢١ (هەردووکیان یەک ڤیدیۆن)',
+    summary:
+        'ئەم بەشە سێ جووتە سیفەتی تر دەگرێتەوە. ئەمانە دیاری دەکەن کام پیت قورس (تفخیم: دەنگی پڕ و ئەستوور) و کام تەنکە (ترقیق: دەنگی ڕوون و ناسک).',
+    numberedRules: true,
+    rules: [
+      'استعلاء (بەرزبوونەوە: زمان بەرز دەبێتەوە بۆ ئاسمانی دەم و پیتەکە قورس دەبێت) دژی استفال (نزمبوونەوە: زمان نزم دەبێت و پیتەکە تەنکە). پیتەکانی استعلاء حەوتن و لە «خُصَّ ضَغْطٍ قِظْ» کۆکراونەتەوە (خ ص ض غ ط ق ظ). ٢١ پیتەکەی تر استفالن.',
+      'ئیتباق (لکان: زمان بە ئاسمانی دەمەوە دەلکێت) دژی ئینفیتاح (کراوەیی: زمان نالکێت و دەم دەکرێتەوە). پیتەکانی ئیتباق چوارن: ص ض ط ظ. ئەمانە قورسترین پیتەکانن.',
+      'ئیزڵاق (سووکی و خێرایی) دژی ئیسمات (قورسی). پیتەکانی ئیزڵاق شەشن و لە «فَرَّ مِنْ لُبّ» کۆکراونەتەوە (ف ر م ن ل ب).',
+      'ڕیزبەندیی قورسیی پیتەکانی استعلاء بەپێی بزوێنەکەیان، لە قورسترەوە: فەتحەی هەبێت و ئەلیفی بەدوادا بێت (قَالَ)، پاشان فەتحەی تەنها، پاشان زەمە، پاشان ساکن، و لاوازترینیان کەسرەیە.',
+    ],
+    mistakes: [
+      'تەنککردنی پیتە قورسەکان: ص وەک س، ض وەک د، ط وەک ت، ظ وەک ز، ق وەک ك.',
+      'قورسکردنی پیتی تەنک.',
+    ],
+    examples: [
+      TajweedExample('ٱلصِّرَٰطَ', ref: '1:6', note: 'ص و ط: ئیتباق و قورس'),
+      TajweedExample('ٱلْمَغْضُوبِ', ref: '1:7', note: 'غ و ض: استعلاء'),
+      TajweedExample('قَالَ', note: 'ق: قورس، ئەلیفیش قورس دەبێت'),
+    ],
+  ),
+  // ----------------------------------------------------------------- 22
+  TajweedLesson(
+    id: 22,
+    titleKu: 'سیفاتی بێ دژ و غوننە',
+    titleAr: 'صفات الحروف (التي لا ضد لها)',
+    video: 'ڤیدیۆی ٢٢ی پلەیلیستەکەی مامۆستا سەردار',
+    summary:
+        'ئەم حەوت سیفەتە دژیان نییە (جووتی پێچەوانەیان نییە). هەر پیتێک یەک یان چەند سیفەتی تێدایە. لەم وانەیەدا غوننە (دەنگی لووت)یش ڕوون دەکرێتەوە، کە سیفەتێکی تایبەتی ن و مە.',
+    numberedRules: true,
+    rules: [
+      'صفیر (فیکە): ص ز س. دەنگێکی فیکەئامێزیان هەیە.',
+      'قەڵقەلە (لەرینەوەی دەنگ): کاتێک ئەم پیتانە ساکن دەبن دەنگەکە کەمێک دەلەرێتەوە: ق ط ب ج د، لە ڕستەی «قُطْبُ جَدٍّ» کۆکراونەتەوە. قەڵقەلەی بچووک (صغرى): ساکن لە ناوەڕاستی وشەدا (يَطْمَعُونَ). قەڵقەلەی گەورە (کبرى): لە کۆتایی وشە، کاتێک دەوەستیت (ٱلْفَلَقِ، أَحَدْ).',
+      'لین (نەرمی): واو و یاءی ساکن دوای فەتحە (خَوْف، بَيْت).',
+      'ئینحراف (لادان): ل و ر لە شوێنی خۆیانەوە دەنگەکەیان بەرەو لای زمان یان پشتی زمان دەڕوات.',
+      'تکریر (دووبارەبوونەوە): ر لەرینەوەی هەیە، بەڵام نابێت زیاد لە پێویست دووبارە بکرێتەوە.',
+      'تفشی (بڵاوبوونەوە): ش، هەوا لە دەمدا بڵاو دەبێتەوە.',
+      'ئیستتاڵە (درێژبوونەوە): ض، دەنگەکە لە لای زمانەوە درێژ دەبێتەوە.',
+      'غوننە: دەنگێکی لووتییە لە ن و م. بەهێزترین کاتی لە ن و م ی شەددار (إِنَّ، ثُمَّ)، لە ئیدغام لەگەڵ غوننە و ئیخفا و ئیقلابدا؛ لاوازتر لە ئیزهار و لە ن و م ی بزوێنراودا. ماوەی غوننە دوو حەرەکەیە.',
+    ],
+    mistakes: [
+      'نەکردنی قەڵقەلە لە ساکنی ق ط ب ج د.',
+      'زیادەڕۆیی لە قەڵقەلە یان لە تکریری ڕ.',
+      'نەکردنی غوننە لە ن و م ی شەددار.',
+    ],
+    examples: [
+      TajweedExample('ٱلصَّـٰبِرِينَ', ref: '2:153', note: 'صفیر لە ص'),
+      TajweedExample('يَطْمَعُونَ', note: 'قەڵقەلەی بچووک لە ط'),
+      TajweedExample('قُلْ أَعُوذُ بِرَبِّ ٱلْفَلَقِ',
+          ref: '113:1', note: 'قەڵقەلەی گەورە لە ق (لە وەستاندا)'),
+      TajweedExample('ٱلْيَوْمَ', note: 'لین لە واو'),
+      TajweedExample('وَٱلشَّمْسِ', ref: '91:1', note: 'تفشی لە ش'),
+      TajweedExample('إِنَّ', note: 'غوننە لە ن ی شەددار'),
+    ],
+  ),
+  // ----------------------------------------------------------------- 23
+  TajweedLesson(
+    id: 23,
+    titleKu: 'وەستان و دەستپێکردنەوە (زیادە)',
+    titleAr: 'الوقف والابتداء',
+    video: 'وانەی زیادە: لە پلەیلیستەکەی مامۆستا سەردار نییە',
+    summary:
+        'وەستان بۆ هەناسەدانە و دەبێت لە شوێنێک بێت کە واتا تێک نەچێت؛ دەستپێکردنەوەش دەبێت لە شوێنێکەوە بێت کە واتای ڕاست بدات.',
+    numberedRules: true,
+    rules: [
+      'چۆن دەوەستیت: پیتی کۆتایی ساکن دەکەیت (بێ بزوێن). تەنوینی فەتح دەبێتە ئەلیف (عَلِيمًا ← عَلِيمَا)، تەنوینی زەمە و کەسرە لادەچن (عَلِيمٌ ← عَلِيمْ).',
+      'تای خڕ (ة: ئەو تایەی لە کۆتایی وشە دێت و دوو خاڵی لەسەرە) لە کاتی وەستاندا دەبێتە «ه» (جَنَّةٌ ← جَنَّهْ) و لە کاتی بەردەوامبووندا «ت». تای کراوە (ت) لە هەموو حاڵەتێکدا «ت»ە (رَحْمَتُ ← رَحْمَتْ).',
+      'وەستانی تەواو (تام): واتا و ڕستە تەواوە و هیچ پەیوەندییەکی بە وشەکانی دوای خۆیەوە نییە.',
+      'وەستانی کافی: ڕستەکە تەواوە بەڵام لە ڕووی واتاوە هێشتا بە دوای خۆیەوە پەیوەستە.',
+      'وەستانی حەسەن: واتایەکی باشی هەیە بەڵام لە ڕووی ڕێزمانەوە بە دوای خۆیەوە بەستراوە. دەتوانیت لەسەری بوەستیت بەڵام لە دوایەوە دەست پێناکەیتەوە.',
+      'وەستانی قەبیح (ناشیرین): واتا دەشێوێنێت (وەک وەستان لەسەر «لَا» بەتەنها). نابێت، مەگەر بە ناچاری (وەک هەناسە بڕان).',
+      'نیشانەکانی مصحف: م = پێویستە بوەستیت؛ لا = مەوەستە؛ ج = ڕێگەپێدراوە (هەردوو شێوە دروستە)؛ قلى = وەستان باشترە؛ صلى = بەردەوامبوون باشترە.',
+      'نیشانەی ۛ (موعانەقە: سێ خاڵ) کە لە دوو شوێنی نزیک یەک دێت: لە یەکێکیان دەوەستیت نەک هەردووکیان.',
+    ],
+    mistakes: [
+      'وەستان لەسەر پیتی بزوێنراو بێ ساکنکردنی.',
+      'وەستان لە شوێنێک کە واتا دەشێوێنێت.',
+    ],
+    examples: [
+      TajweedExample('ذَٰلِكَ ٱلْكِتَـٰبُ لَا رَيْبَ ۛ فِيهِ ۛ هُدًى لِّلْمُتَّقِينَ',
+          ref: '2:2', note: 'موعانەقە: لە یەکێکیان بوەستە'),
+      TajweedExample('جَنَّةٍ عَرْضُهَا', ref: '57:21', note: 'ة: لە وەستان «ه»'),
+      TajweedExample('رَحْمَتُ ٱللَّهِ', ref: '11:73', note: 'ت: لە وەستانیش «ت»'),
+    ],
+  ),
+  // ----------------------------------------------------------------- 24
+  TajweedLesson(
+    id: 24,
+    titleKu: 'هەڵەکانی خوێندنەوە و ئاداب (زیادە)',
+    titleAr: 'اللحن الجلي والخفي وآداب التلاوة',
+    video: 'وانەی زیادە: لە پلەیلیستەکەی مامۆستا سەردار نییە',
+    summary:
+        'لەحن واتە هەڵە لە خوێندنەوەی قورئاندا. دوو جۆرە: ئاشکرا (جەلی) و شاراوە (خەفی).',
+    rules: [
+      'لەحنی جەلی (هەڵەی ئاشکرا): گۆڕینی پیت یان بزوێنێک بە شێوەیەک کە واتا بگۆڕێت، وەک خوێندنەوەی ع وەک ء. خوێندنەوەکە دەشێوێنێت.',
+      'لەحنی خەفی (هەڵەی شاراوە): هەڵەیەکی ورد کە واتا ناگۆڕێت، وەک نەکردنی غوننە، کورتکردنی مەد، یان قورسکردنی پیتی تەنک.',
+      'ئاداب (ڕێزگرتن): بە دەنگی ئارام و ڕوون بخوێنە، بە تەرتیل (هێواش و ڕێک) و بێ پەلە، لە شوێنێکی پاک و بە دڵی ئامادە.',
+      'تەجوید بە مامۆستایەکی شارەزا و گوێگرتن لێی وەردەگیرێت. ئەم وانانە و مایکی ئەپەکە تەنها یارمەتیدەرن.',
+    ],
+    mistakes: [
+      'حەدسکردنی وشە بێ ئەوەی ڕاستەوخۆ لە مصحفەکە بیخوێنیتەوە.',
+      'پشت بەستن بە ئەپەکە بێ ئەوەی بۆ مامۆستا بخوێنیتەوە.',
+    ],
+    examples: [
+      TajweedExample('ٱلْعَـٰلَمِينَ', ref: '1:2', note: 'ع نابێت وەک ء بخوێندرێتەوە'),
+      TajweedExample('ٱلصِّرَٰطَ', ref: '1:6', note: 'ص نابێت وەک س بخوێندرێتەوە'),
+    ],
+  ),
+];
+
+/// Which Tajweed lessons the user has opened, kept on the phone (offline).
+// ============================================================
+//  Tajweed bridge: Recitation coach <-> Tajweed lessons
+//
+//  1. Strictness by coach level (kCoachLevels):
+//       level 1  tajweed slips are ignored (only wrong words are corrected)
+//       level 2  the core rules are checked (madd lazim / muttasil / badal /
+//                asli, ghunna, idgham, ikhfa, iqlab, shadda, tanween); fine
+//                details (qalqala, tafkhim, ra, lam of Allah, jaiz madds and
+//                every "too long" remark: madd / ghunna) are not reported
+//       level 3  everything the engine reports is checked: madd length,
+//                ghunna timing, qalqala, ...
+//  2. Context-aware: an engine report is dropped when the lessons say the
+//     reading is allowed or the rule does not apply to this word:
+//       - madd arid / lin (lesson 16): 2, 4 or 6 counts are all correct
+//         (only a lost madd, "too short", is a mistake)
+//       - tanween at the end of an ayah is dropped when stopping (lesson 23)
+//       - idgham needs a noon / tanween at the END of a word and a letter of
+//         (ي ر م ل و ن) at the start of the next word (lesson 2): never
+//         inside one word (ٱلدُّنْيَا), never when stopping
+//       - qalqala needs a sakin qalqala letter (lesson 22), shadda needs a
+//         shadda, tanween needs a tanween
+//  3. Lesson mapping: every reported error is mapped to the lesson that
+//     teaches it (see _lessonOf), using the real ids of kTajweedLessons
+//     1..24 (1..22 = the teacher's playlist, 23..24 = waqf and lahn).
+//
+//  The engine (package recite_quran) does the acoustic measuring. Its error
+//  maps are classified by keywords (Arabic / English). Set kTajweedDebug to
+//  see the raw errors in the log and extend the keyword lists if needed.
+// ============================================================
+const bool kTajweedDebug = false;
+
+enum TajweedKind {
+  maddAsli,
+  maddMuttasil,
+  maddMunfasil,
+  maddBadal,
+  maddLazim,
+  maddArid,
+  maddLin,
+  maddOther,
+  ghunna,
+  izhar,
+  idgham,
+  iqlab,
+  ikhfa,
+  qalqala,
+  shadda,
+  tanween,
+  tafkhim,
+  raa,
+  lamJalala,
+  lamTarif,
+  waqf,
+  hamzaWasl,
+  other,
+}
+
+enum TajweedDir { unknown, tooShort, tooLong }
+
+class TajweedFinding {
+  final TajweedKind kind;
+  final TajweedDir dir;
+  final int lessonId; // 0 = no lesson
+  final bool flag; // true: the coach reports it
+  final String why; // for the log
+  const TajweedFinding(this.kind, this.dir, this.lessonId, this.flag, this.why);
+}
+
+class TajweedVerdict {
+  final bool flag; // at least one finding must be reported
+  final int lessonId; // lesson of the first reported finding (else first finding)
+  final String detail; // Kurdish text for the coach message
+  final TajweedKind kind; // kind of the first reported finding
+  final TajweedDir dir; // too short / too long / unknown
+  const TajweedVerdict(this.flag, this.lessonId, this.detail,
+      [this.kind = TajweedKind.other, this.dir = TajweedDir.unknown]);
+  static const TajweedVerdict none = TajweedVerdict(false, 0, '');
+}
+
+class _TajCls {
+  final TajweedKind kind;
+  final TajweedDir dir;
+  const _TajCls(this.kind, this.dir);
+}
+
+/// The lesson with this id (null when it does not exist).
+TajweedLesson? tajweedLessonById(int id) {
+  for (final l in kTajweedLessons) {
+    if (l.id == id) return l;
+  }
+  return null;
+}
+
+class TajweedBridge {
+  TajweedBridge._();
+
+  /// kind -> lesson id of kTajweedLessons
+  static const Map<TajweedKind, int> _lessonOf = <TajweedKind, int>{
+    TajweedKind.maddAsli: 15,
+    TajweedKind.maddMuttasil: 16,
+    TajweedKind.maddMunfasil: 16,
+    TajweedKind.maddBadal: 16,
+    TajweedKind.maddLazim: 16,
+    TajweedKind.maddArid: 16,
+    TajweedKind.maddLin: 16,
+    TajweedKind.maddOther: 15,
+    TajweedKind.ghunna: 22,
+    TajweedKind.izhar: 3,
+    TajweedKind.idgham: 2,
+    TajweedKind.iqlab: 4,
+    TajweedKind.ikhfa: 5,
+    TajweedKind.qalqala: 22,
+    TajweedKind.shadda: 22, // refined by the word (_shaddaLesson)
+    TajweedKind.tanween: 3, // refined by the next word (nunLesson)
+    TajweedKind.tafkhim: 21,
+    TajweedKind.raa: 7,
+    TajweedKind.lamJalala: 12,
+    TajweedKind.lamTarif: 11,
+    TajweedKind.waqf: 23,
+    TajweedKind.hamzaWasl: 13,
+    TajweedKind.other: 24, // lahn: lesson of reading mistakes
+  };
+
+  static const Map<TajweedKind, String> _label = <TajweedKind, String>{
+    TajweedKind.maddAsli: 'مەددی سروشتی',
+    TajweedKind.maddMuttasil: 'مەددی متصل',
+    TajweedKind.maddMunfasil: 'مەددی منفصل',
+    TajweedKind.maddBadal: 'مەددی بەدەل',
+    TajweedKind.maddLazim: 'مەددی لازم',
+    TajweedKind.maddArid: 'مەددی عارض',
+    TajweedKind.maddLin: 'مەددی لین',
+    TajweedKind.maddOther: 'مەد',
+    TajweedKind.ghunna: 'غوننە',
+    TajweedKind.izhar: 'ئیزهار',
+    TajweedKind.idgham: 'ئیدغام',
+    TajweedKind.iqlab: 'ئیقلاب',
+    TajweedKind.ikhfa: 'ئیخفا',
+    TajweedKind.qalqala: 'قەڵقەلە',
+    TajweedKind.shadda: 'شەدە',
+    TajweedKind.tanween: 'تەنوین',
+    TajweedKind.tafkhim: 'قورس و تەنک',
+    TajweedKind.raa: 'حوکمی ڕاء',
+    TajweedKind.lamJalala: 'لامی «الله»',
+    TajweedKind.lamTarif: 'لامی تەعریف',
+    TajweedKind.waqf: 'وەستان',
+    TajweedKind.hamzaWasl: 'هەمزەی وەسڵ',
+    TajweedKind.other: 'هەڵەی تەجوید',
+  };
+
+  /// Fine details: reported from level 3 on only.
+  static const Set<TajweedKind> _fine = <TajweedKind>{
+    TajweedKind.qalqala,
+    TajweedKind.tafkhim,
+    TajweedKind.raa,
+    TajweedKind.lamJalala,
+    TajweedKind.maddMunfasil,
+    TajweedKind.maddArid,
+    TajweedKind.maddLin,
+    TajweedKind.waqf,
+  };
+
+  /// Strongest cause first (lesson 16: the stronger madd wins).
+  static const List<TajweedKind> _rank = <TajweedKind>[
+    TajweedKind.maddLazim,
+    TajweedKind.maddMuttasil,
+    TajweedKind.maddArid,
+    TajweedKind.maddMunfasil,
+    TajweedKind.maddBadal,
+    TajweedKind.maddAsli,
+  ];
+
+  static const List<int> _idghamLetters = <int>[
+    0x064A, 0x0631, 0x0645, 0x0644, 0x0648, 0x0646, // ي ر م ل و ن
+  ];
+  static const List<int> _izharLetters = <int>[
+    0x0621, 0x0622, 0x0623, 0x0625, 0x0647, 0x0639, 0x062D, 0x063A, 0x062E,
+  ];
+
+  static final RegExp _maddRe = RegExp(
+      r'madd|elongat|prolong|(?<![\u0621-\u064A])ال?مد(?![\u0621-\u064A])');
+  static final RegExp _linRe = RegExp(r'\bleen\b|\blin\b');
+  static final RegExp _shortRe = RegExp(
+      r'\bshort|underheld|defect|insufficient|missing|omitted|not\s+(?:enough|held|extended|prolonged)|قصير|قصر|ناقص|نقص|عدم|لم يمد');
+  static final RegExp _longRe = RegExp(
+      r'\blong|overheld|surplus|excess|too much|over[-\s]?(?:extend|prolong)|طويل|زائد|زياده|اطال|مبالغ');
+
+  // ---------------------------------------------------------------
+  //  1. engine error -> kind + direction
+  // ---------------------------------------------------------------
+  static String _blob(dynamic e) {
+    final sb = StringBuffer();
+    void add(dynamic v, int depth) {
+      if (v == null || depth > 4) return;
+      if (v is Map) {
+        v.forEach((k, x) {
+          if (x == true) {
+            sb.write(' ');
+            sb.write(k);
+          }
+          add(x, depth + 1);
+        });
+      } else if (v is Iterable) {
+        for (final x in v) {
+          add(x, depth + 1);
+        }
+      } else if (v is! bool) {
+        sb.write(' ');
+        sb.write(v);
+      }
+    }
+
+    add(e, 0);
+    if (e is! Map && e is! Iterable && e is! String) {
+      try {
+        add((e as dynamic).toJson(), 0);
+      } catch (_) {}
+    }
+    return sb.toString().toLowerCase();
+  }
+
+  static _TajCls classify(dynamic err) {
+    final t = _blob(err);
+    final a = t
+        .replaceAll(_arStrip, '')
+        .replaceAll(RegExp('[أإآٱ]'), 'ا')
+        .replaceAll('ى', 'ي')
+        .replaceAll('ة', 'ه');
+    bool has(List<String> keys) {
+      for (final k in keys) {
+        if (t.contains(k) || a.contains(k)) return true;
+      }
+      return false;
+    }
+
+    final sh = _shortRe.hasMatch(t) || _shortRe.hasMatch(a);
+    final lg = _longRe.hasMatch(t) || _longRe.hasMatch(a);
+    // The engine states it directly (TajweedDurationStatus: valid = 0,
+    // underheld = 1, overheld = 2, sent as an index or as a name). That is
+    // more reliable than keywords, and an index has no keyword at all.
+    TajweedDir? direct;
+    if (err is Map) {
+      final ds = err['durationStatus'] ?? err['durationStatusIndex'];
+      if (ds is int) {
+        direct = ds == 1
+            ? TajweedDir.tooShort
+            : (ds == 2 ? TajweedDir.tooLong : null);
+      } else if (ds is String) {
+        final n = ds.toLowerCase();
+        if (n.contains('under') || n.contains('defect')) {
+          direct = TajweedDir.tooShort;
+        } else if (n.contains('over') || n.contains('surplus')) {
+          direct = TajweedDir.tooLong;
+        }
+      }
+    }
+    final dir = direct ??
+        (sh == lg
+            ? TajweedDir.unknown
+            : (sh ? TajweedDir.tooShort : TajweedDir.tooLong));
+
+    TajweedKind k = TajweedKind.other;
+    if (has(const ['qalqal', 'قلقل'])) {
+      k = TajweedKind.qalqala;
+    } else if (has(const ['lazim', 'لازم'])) {
+      k = TajweedKind.maddLazim;
+    } else if (has(const ['muttasil', 'متصل'])) {
+      k = TajweedKind.maddMuttasil;
+    } else if (has(const ['munfasil', 'منفصل'])) {
+      k = TajweedKind.maddMunfasil;
+    } else if (has(const ['badal', 'بدل'])) {
+      k = TajweedKind.maddBadal;
+    } else if (has(const ['arid', 'عارض'])) {
+      k = TajweedKind.maddArid;
+    } else if (_linRe.hasMatch(t) || a.contains('لين')) {
+      k = TajweedKind.maddLin;
+    } else if (has(const ['asli', 'natural', 'tabii', 'اصلي', 'طبيعي'])) {
+      k = TajweedKind.maddAsli;
+    } else if (_maddRe.hasMatch(t) || _maddRe.hasMatch(a)) {
+      k = TajweedKind.maddOther;
+    } else if (has(const ['iqlab', 'اقلاب'])) {
+      k = TajweedKind.iqlab;
+    } else if (has(const ['ikhfa', 'اخفاء'])) {
+      k = TajweedKind.ikhfa;
+    } else if (has(const ['idgham', 'ادغام'])) {
+      k = TajweedKind.idgham;
+    } else if (has(const ['izhar', 'اظهار'])) {
+      k = TajweedKind.izhar;
+    } else if (has(const ['ghunn', 'غنه', 'nasal'])) {
+      k = TajweedKind.ghunna;
+    } else if (has(const ['shadd', 'tashdid', 'شده', 'تشديد'])) {
+      k = TajweedKind.shadda;
+    } else if (has(const ['tanw', 'تنوين', 'تنوین'])) {
+      k = TajweedKind.tanween;
+    } else if (has(const ['tafkh', 'tarqiq', 'تفخيم', 'ترقيق'])) {
+      k = TajweedKind.tafkhim;
+    } else if (has(const ['shams', 'qamar', 'شمسي', 'قمري'])) {
+      k = TajweedKind.lamTarif;
+    } else if (has(const ['waqf', 'وقف'])) {
+      k = TajweedKind.waqf;
+    } else if (has(const ['wasl', 'وصل'])) {
+      k = TajweedKind.hamzaWasl;
+    }
+    return _TajCls(k, dir);
+  }
+
+  static bool _isMadd(TajweedKind k) =>
+      k == TajweedKind.maddAsli ||
+      k == TajweedKind.maddMuttasil ||
+      k == TajweedKind.maddMunfasil ||
+      k == TajweedKind.maddBadal ||
+      k == TajweedKind.maddLazim ||
+      k == TajweedKind.maddArid ||
+      k == TajweedKind.maddLin ||
+      k == TajweedKind.maddOther;
+
+  // ---------------------------------------------------------------
+  //  2. what the vowelled text of the word says (the lessons' rules)
+  // ---------------------------------------------------------------
+  static bool _has(_Cluster c, int code) {
+    var first = true;
+    for (final r in c.text.runes) {
+      if (first) {
+        first = false;
+        continue;
+      }
+      if (r == code) return true;
+    }
+    return false;
+  }
+
+  static int _raw(_Cluster c) => c.text.runes.first;
+  static int _base(_Cluster c) => _foldRune(c.text.runes.first);
+  static bool _isSakin(_Cluster c) => _has(c, 0x0652) || _has(c, 0x06E1);
+  static bool _hasTanween(_Cluster c) =>
+      _has(c, 0x064B) || _has(c, 0x064C) || _has(c, 0x064D);
+  static bool _hasVowel(_Cluster c) =>
+      _has(c, 0x064E) || _has(c, 0x064F) || _has(c, 0x0650);
+  static bool _isHamza(int r) =>
+      r == 0x0621 ||
+      r == 0x0622 ||
+      r == 0x0623 ||
+      r == 0x0624 ||
+      r == 0x0625 ||
+      r == 0x0626;
+
+  /// The cluster [i] is (or carries) a long-vowel letter: alef after fatha,
+  /// waw after damma, ya after kasra, a letter with a dagger alef, or آ.
+  static bool _carrier(List<_Cluster> cl, int i) {
+    final c = cl[i];
+    final raw = _raw(c);
+    if (_has(c, 0x0670)) return true;
+    if (raw == 0x0622) return true;
+    if (i == 0 || raw == 0x0671) return false;
+    if (_hasVowel(c) || _has(c, _kShadda) || _hasTanween(c)) return false;
+    final f = _foldRune(raw);
+    final prev = cl[i - 1];
+    if (f == 0x0627) return _has(prev, 0x064E);
+    if (f == 0x0648) return _has(prev, 0x064F);
+    if (f == 0x064A) {
+      return _has(prev, 0x0650) ||
+          ((raw == 0x0649 || raw == 0x06CC) && _has(prev, 0x064E));
+    }
+    return false;
+  }
+
+  static int _firstRaw(String s) {
+    for (final r in s.runes) {
+      if (_arStrip.hasMatch(String.fromCharCode(r))) continue;
+      return r;
+    }
+    return 0;
+  }
+
+  /// Which madd the word contains (the strongest one), from its own text.
+  /// [next] = next word of the ayah ('' = none), [atWaqf] = last word of an ayah.
+  static TajweedKind maddKind(List<_Cluster> cl, String next, bool atWaqf) {
+    final found = <TajweedKind>{};
+    for (var i = 0; i < cl.length; i++) {
+      if (!_carrier(cl, i)) continue;
+      if (_has(cl[i], 0x0621)) {
+        // a hamza written right after the madd letter (جَآءَ): same word
+        found.add(TajweedKind.maddMuttasil);
+        continue;
+      }
+      if (i + 1 < cl.length) {
+        final nx = cl[i + 1];
+        if (_isHamza(_raw(nx))) {
+          found.add(TajweedKind.maddMuttasil);
+          continue;
+        }
+        if (_has(nx, _kShadda) || _isSakin(nx)) {
+          found.add(TajweedKind.maddLazim);
+          continue;
+        }
+        if (atWaqf && i + 2 == cl.length) {
+          found.add(TajweedKind.maddArid);
+          continue;
+        }
+      } else if (next.isNotEmpty && _isHamza(_firstRaw(next))) {
+        found.add(TajweedKind.maddMunfasil);
+        continue;
+      }
+      if ((i > 0 &&
+              (_isHamza(_raw(cl[i - 1])) || _has(cl[i - 1], 0x0621))) ||
+          (i == 0 && _raw(cl[i]) == 0x0622)) {
+        found.add(TajweedKind.maddBadal);
+        continue;
+      }
+      found.add(TajweedKind.maddAsli);
+    }
+    for (final k in _rank) {
+      if (found.contains(k)) return k;
+    }
+    // disconnected letters at the start of a surah (الٓمٓ): madd lazim harfi
+    if (cl.length <= 3 && cl.any((c) => _has(c, 0x0653))) {
+      return TajweedKind.maddLazim;
+    }
+    if (atWaqf && cl.length >= 3) {
+      final i = cl.length - 2;
+      final f = _base(cl[i]);
+      if ((f == 0x0648 || f == 0x064A) &&
+          _isSakin(cl[i]) &&
+          _has(cl[i - 1], 0x064E)) {
+        return TajweedKind.maddLin;
+      }
+    }
+    return TajweedKind.maddOther;
+  }
+
+  /// Lesson of the noon-sakin / tanween / meem-sakin rule that applies to
+  /// this word (its end, then its inside); 0 = the text does not say.
+  static int nunLesson(List<_Cluster> cl, String next) {
+    if (cl.isEmpty) return 0;
+    final last = cl.last;
+    final lb = _base(last);
+    final plain = !(_hasVowel(last) || _has(last, _kShadda) || _hasTanween(last));
+    var tanween = _hasTanween(last);
+    if (!tanween && cl.length >= 2 && lb == 0x0627 && _has(cl[cl.length - 2], 0x064B)) {
+      tanween = true; // fathatan written on the letter before the alef
+    }
+    final nunSakin = lb == 0x0646 && plain;
+    final mimSakin = lb == 0x0645 && plain;
+    if (next.isNotEmpty && (tanween || nunSakin || mimSakin)) {
+      final r = _firstRaw(next);
+      if (r != 0 && r != 0x0671) {
+        final f = _foldRune(r);
+        if (mimSakin) {
+          if (f == 0x0628) return 9; // ikhfa shafawi
+          if (f == 0x0645) return 21; // two meems meet
+          return 10; // izhar shafawi
+        }
+        if (_izharLetters.contains(r)) return 5;
+        if (_idghamLetters.contains(f)) return 6;
+        if (f == 0x0628) return 7;
+        return 8;
+      }
+      return 0;
+    }
+    // inside the word: izhar / iqlab / ikhfa (never idgham)
+    for (var i = 0; i + 1 < cl.length; i++) {
+      final c = cl[i];
+      if (_base(c) != 0x0646) continue;
+      if (_hasVowel(c) || _has(c, _kShadda) || _hasTanween(c)) continue;
+      final r = _raw(cl[i + 1]);
+      final f = _foldRune(r);
+      if (_izharLetters.contains(r) || _idghamLetters.contains(f)) return 5;
+      if (f == 0x0628) return 7;
+      return 8;
+    }
+    return 0;
+  }
+
+  /// Lesson for a doubled letter: after a madd letter 14, noon / meem 11,
+  /// lam of al- before a sun letter 20, any other doubled letter 21.
+  static int _shaddaLesson(List<_Cluster> cl) {
+    for (var i = 1; i < cl.length; i++) {
+      // a madd letter before the doubled letter wins (ٱلضَّآلِّينَ)
+      if (_has(cl[i], _kShadda) && _carrier(cl, i - 1)) return 14;
+    }
+    for (var i = 0; i < cl.length; i++) {
+      if (!_has(cl[i], _kShadda)) continue;
+      final f = _base(cl[i]);
+      if (f == 0x0646 || f == 0x0645) return 11;
+      if (i >= 2 &&
+          _base(cl[i - 1]) == 0x0644 &&
+          _foldRune(_raw(cl[i - 2])) == 0x0627) {
+        return 20;
+      }
+      return 21;
+    }
+    return 0;
+  }
+
+  static bool _hasQalqala(List<_Cluster> cl, bool atWaqf) {
+    const q = <int>[0x0642, 0x0637, 0x0628, 0x062C, 0x062F]; // ق ط ب ج د
+    for (var i = 0; i < cl.length; i++) {
+      if (!q.contains(_base(cl[i]))) continue;
+      if (_isSakin(cl[i]) || (atWaqf && i == cl.length - 1)) return true;
+    }
+    return false;
+  }
+
+  static bool _hasNunMim(List<_Cluster> cl) {
+    for (final c in cl) {
+      final b = _base(c);
+      if (b == 0x0646 || b == 0x0645 || _hasTanween(c)) return true;
+    }
+    return false;
+  }
+
+  /// Does the engine's claim make sense for this word? (the lessons' rules)
+  static bool _fits(
+      TajweedKind k, List<_Cluster> cl, String next, bool atWaqf) {
+    if (cl.isEmpty) return true;
+    switch (k) {
+      case TajweedKind.qalqala:
+        return _hasQalqala(cl, atWaqf);
+      case TajweedKind.shadda:
+        return cl.any((c) => _has(c, _kShadda));
+      case TajweedKind.tanween:
+        return cl.any(_hasTanween) ||
+            (cl.length >= 2 && _has(cl[cl.length - 2], 0x064B));
+      case TajweedKind.ghunna:
+      case TajweedKind.izhar:
+      case TajweedKind.ikhfa:
+        return _hasNunMim(cl);
+      case TajweedKind.idgham:
+        {
+          if (next.isEmpty) return false; // stopping: nothing to merge with
+          final l = nunLesson(cl, next);
+          return l == 6 || (l == 0 && _hasNunMim(cl));
+        }
+      case TajweedKind.iqlab:
+        {
+          if (next.isEmpty) return false;
+          final l = nunLesson(cl, next);
+          return l == 7 || (l == 0 && _hasNunMim(cl));
+        }
+      default:
+        return true;
+    }
+  }
+
+  /// Is the reading allowed by the lessons although the engine complains?
+  static bool _permissible(TajweedKind k, TajweedDir d, bool atWaqf) {
+    switch (k) {
+      case TajweedKind.maddArid:
+      case TajweedKind.maddLin:
+        return d != TajweedDir.tooShort; // 2, 4 or 6 counts are all correct
+      case TajweedKind.tanween:
+        return atWaqf; // the tanween is dropped when stopping
+      default:
+        return false;
+    }
+  }
+
+  /// nunLesson() rule code (5 izhar, 6 idgham, 7 iqlab, 8 ikhfa, 9 ikhfa
+  /// shafawi, 10 izhar shafawi, 21 mithlayn) -> lesson id of kTajweedLessons.
+  static int _nunLessonId(int code) {
+    switch (code) {
+      case 5:
+        return 3;
+      case 6:
+        return 2;
+      case 7:
+        return 4;
+      case 8:
+        return 5;
+      case 9:
+      case 10:
+        return 6;
+      case 21:
+        return 8;
+      default:
+        return 0;
+    }
+  }
+
+  /// _shaddaLesson() code (14 madd + shaddah, 11 noon / meem, 20 lam of al-,
+  /// 21 other doubled letter) -> lesson id of kTajweedLessons.
+  static int _shaddaLessonId(int code) {
+    switch (code) {
+      case 14:
+        return 16;
+      case 11:
+        return 22;
+      case 20:
+        return 11;
+      case 21:
+        return 8;
+      default:
+        return 0;
+    }
+  }
+
+  static int _lessonFor(TajweedKind k, List<_Cluster> cl, String next) {
+    switch (k) {
+      case TajweedKind.tanween:
+        {
+          final l = _nunLessonId(nunLesson(cl, next));
+          return l != 0 ? l : 3;
+        }
+      case TajweedKind.shadda:
+        {
+          final l = _shaddaLessonId(_shaddaLesson(cl));
+          return l != 0 ? l : 22;
+        }
+      case TajweedKind.idgham:
+      case TajweedKind.ikhfa:
+      case TajweedKind.izhar:
+      case TajweedKind.iqlab:
+        {
+          final l = _nunLessonId(nunLesson(cl, next));
+          return l != 0 ? l : (_lessonOf[k] ?? 0);
+        }
+      default:
+        return _lessonOf[k] ?? 0;
+    }
+  }
+
+  // ---------------------------------------------------------------
+  //  3. the verdict of the coach
+  // ---------------------------------------------------------------
+  /// [errs] = tajweedErrors of the engine for [word]. [level] = settings.coachLevel.
+  static TajweedVerdict judge(List<dynamic>? errs,
+      {required String word,
+      String next = '',
+      bool atWaqf = false,
+      required int level}) {
+    if (errs == null || errs.isEmpty) return TajweedVerdict.none;
+    final cl = word.isEmpty ? <_Cluster>[] : _clustersCached(word);
+    final out = <TajweedFinding>[];
+    final seen = <String>{};
+    for (final e in errs) {
+      if (kTajweedDebug) debugPrint('[tajweed] engine error: $e');
+      final c = classify(e);
+      var kind = c.kind;
+      // The word's own text decides WHICH madd it is (except arid / lin,
+      // which depend on a stop the engine heard).
+      if (_isMadd(kind) &&
+          kind != TajweedKind.maddArid &&
+          kind != TajweedKind.maddLin &&
+          cl.isNotEmpty) {
+        final tk = maddKind(cl, next, atWaqf);
+        if (tk != TajweedKind.maddOther) kind = tk;
+      }
+      if (!seen.add('${kind.index}_${c.dir.index}')) continue;
+      final lesson = _lessonFor(kind, cl, next);
+      var flag = true;
+      var why = 'reported by the engine';
+      if (level <= 1) {
+        flag = false;
+        why = 'level 1: tajweed slips are not corrected';
+      } else if (!_fits(kind, cl, next, atWaqf)) {
+        flag = false;
+        why = 'the rule does not apply to this word (lesson $lesson)';
+      } else if (_permissible(kind, c.dir, atWaqf)) {
+        flag = false;
+        why = 'allowed by lesson $lesson';
+      } else if (level == 2 &&
+          (_fine.contains(kind) || c.dir == TajweedDir.tooLong)) {
+        flag = false;
+        why = 'fine detail: reported from level 3';
+      }
+      if (kTajweedDebug) {
+        debugPrint(
+            '[tajweed]   -> ${kind.name} ${c.dir.name} lesson $lesson flag=$flag ($why)');
+      }
+      out.add(TajweedFinding(kind, c.dir, lesson, flag, why));
+    }
+    if (out.isEmpty) return TajweedVerdict.none;
+    final flagged = out.where((f) => f.flag).toList();
+    final first = flagged.isNotEmpty ? flagged.first : out.first;
+    var detail = '';
+    if (flagged.isNotEmpty) {
+      final parts = <String>[];
+      for (final f in flagged.take(2)) {
+        final d = f.dir == TajweedDir.tooShort
+            ? ' (کورتە)'
+            : (f.dir == TajweedDir.tooLong ? ' (زۆر درێژە)' : '');
+        parts.add('${_label[f.kind] ?? 'هەڵەی تەجوید'}$d');
+      }
+      detail = parts.join(' • ');
+      if (first.lessonId != 0) detail = '$detail • وانەی ${first.lessonId}';
+    }
+    return TajweedVerdict(
+        flagged.isNotEmpty, first.lessonId, detail, first.kind, first.dir);
+  }
+
+  /// Lesson for the exact glyphs the coach marked red in a word (a wrong
+  /// word the engine gave no tajweed error for): madd sign, shadda, tanween,
+  /// a vowel (lahn) or a letter (makhraj). 0 = none.
+  static int lessonForGlyphs(
+      Iterable<int> faults, String word, String next, bool atWaqf) {
+    if (word.isEmpty) return 0;
+    final cl = _clustersCached(word);
+    var madd = false, shad = false, tan = false, vow = false, letter = false;
+    for (final key in faults) {
+      final code = key & 0xFFFF;
+      final pos = key >> 16;
+      if (code == _kShadda) {
+        shad = true;
+      } else if (_isTanweenRune(code)) {
+        tan = true;
+      } else if (code == 0x0653 || code == 0x0670) {
+        madd = true;
+      } else if (_isVowelRune(code)) {
+        vow = true;
+      } else if (code == 0) {
+        if (pos >= 0 && pos < cl.length && _carrier(cl, pos)) {
+          madd = true;
+        } else {
+          letter = true;
+        }
+      }
+    }
+    if (madd) return _lessonOf[maddKind(cl, next, atWaqf)] ?? 15;
+    if (shad) {
+      final l = _shaddaLessonId(_shaddaLesson(cl));
+      return l != 0 ? l : 22;
+    }
+    if (tan) {
+      final l = _nunLessonId(nunLesson(cl, next));
+      return l != 0 ? l : 3;
+    }
+    if (vow) return 24;
+    if (letter) return 17;
+    return 0;
+  }
+}
+
+// ============================================================
+//  Tajweed explainer: tells the reader EXACTLY what went wrong
+//  ("the shaddah of ل was forgotten", "the tanween of this word ...").
+//  For a wrong letter it also says where the letter is pronounced and
+//  which letter it is usually confused with (kLetterInfo, all 28 letters
+//  + hamza). Used by RecitationCoach (_flagNeural / _correct).
+// ============================================================
+class _LetterInfo {
+  final String name; // Kurdish name of the letter
+  final String makhraj; // where it is pronounced
+  final String sifa; // its main characteristics
+  final String mix; // letters it is usually confused with ('' = none)
+  final String tip; // how to tell them apart
+  const _LetterInfo(this.name, this.makhraj, this.sifa,
+      [this.mix = '', this.tip = '']);
+}
+
+const Map<int, _LetterInfo> kLetterInfo = <int, _LetterInfo>{
+  0x0621: _LetterInfo('هەمزە', 'کۆتایی قوڕگ (ئەقصای حەلق)',
+      'دەنگدار و توند، لەناکاو دەردەچێت', 'ع',
+      'هەمزە لەناکاو و بێ گوشار دەردەچێت، عەین بە گوشاری قوڕگی ناوەڕاست'),
+  0x0627: _LetterInfo('ئەلیف', 'بۆشایی دەم و قوڕگ (جەوف)',
+      'پیتی مەدە، نەرم و کێشراو'),
+  0x0628: _LetterInfo('بێ', 'دوو لێو بە تەڕی بەیەکەوە',
+      'دەنگدار، توند، قەلقەلە', 'م',
+      'ب لێوەکان دەبەستێت و دەیانکاتەوە، م غوننەی لووتی لەگەڵە'),
+  0x062A: _LetterInfo('تێ', 'سەری زمان و ڕەگی ددانە پێشەوەکانی سەرەوە',
+      'بێ دەنگ، توند، تەنک', 'ط', 'ت تەنکە، ط قورس و قەلقەلەیە'),
+  0x062B: _LetterInfo('سێ', 'سەری زمان و سەری ددانە پێشەوەکانی سەرەوە',
+      'بێ دەنگ، نەرم، تەنک', 'س',
+      'ث زمان بە نەرمی دێتە دەرەوەی ددانەکان، س زمان لە پشت ددانەکانە'),
+  0x062C: _LetterInfo('جیم', 'ناوەڕاستی زمان و ئاسمانی دەم',
+      'دەنگدار، توند، قەلقەلە', 'ش',
+      'ج دەنگدارە و قەلقەلەی هەیە، ش نەرمە و بڵاودەبێتەوە'),
+  0x062D: _LetterInfo('حێ', 'ناوەڕاستی قوڕگ', 'بێ دەنگ، نەرم، تەنک', 'ه',
+      'ح لە ناوەڕاستی قوڕگ بە گوشار دەردەچێت، ه لە کۆتایی قوڕگ بە ئاسانی'),
+  0x062E: _LetterInfo('خێ', 'سەرەوەی قوڕگ (ئەدنای حەلق)',
+      'بێ دەنگ، نەرم، قورس', 'غ', 'خ بێ دەنگە (هەمس)، غ دەنگدارە (جەهر)'),
+  0x062F: _LetterInfo('دال', 'سەری زمان و ڕەگی ددانە پێشەوەکانی سەرەوە',
+      'دەنگدار، توند، قەلقەلە، تەنک', 'ض',
+      'د تەنکە، ض قورسە و لە لای زمانەوە دەردەچێت'),
+  0x0630: _LetterInfo('زاڵ', 'سەری زمان و سەری ددانە پێشەوەکانی سەرەوە',
+      'دەنگدار، نەرم، تەنک', 'ز',
+      'ذ سەری زمان لەنێوان ددانەکانە، ز ددانەکان لێک نزیکن و فیکەی هەیە'),
+  0x0631: _LetterInfo('ڕێ', 'سەری زمان (کەمێک لە نوون قووڵتر)',
+      'دەنگدار، لەرزۆک (تکریر)، قورس یان تەنک بەپێی ڕێسا', 'ل',
+      'ر زمان دەلەرێتەوە، ل لای زمان دەبزوێت'),
+  0x0632: _LetterInfo('زێ', 'سەری زمان و سەری ددانە پێشەوەکانی خوارەوە',
+      'دەنگدار، فیکە (صفیر)', 'ذ',
+      'ز فیکەی هەیە و زمان لە ددان نادات'),
+  0x0633: _LetterInfo('سین', 'سەری زمان و سەری ددانە پێشەوەکانی خوارەوە',
+      'بێ دەنگ، فیکە، تەنک', 'ص', 'س تەنکە، ص قورس و پڕە'),
+  0x0634: _LetterInfo('شین', 'ناوەڕاستی زمان و ئاسمانی دەم',
+      'بێ دەنگ، نەرم، بڵاوبوونەوە (تفشی)', 'ج',
+      'ش بڵاودەبێتەوە و قەلقەلەی نییە'),
+  0x0635: _LetterInfo('سواد', 'سەری زمان و سەری ددانە پێشەوەکانی خوارەوە',
+      'بێ دەنگ، فیکە، قورس', 'س', 'ص دەبێت قورس و پڕ بخوێنرێت'),
+  0x0636: _LetterInfo('زواد', 'لای زمان و ددانە ڕەنگەکان (حافة اللسان)',
+      'دەنگدار، قورس، درێژبوونەوە (استطالة)', 'د ظ',
+      'ض لە لای زمانەوە دەردەچێت، ظ لە سەری زمانەوە لەگەڵ ددان'),
+  0x0637: _LetterInfo('تواء', 'سەری زمان و ڕەگی ددانە پێشەوەکانی سەرەوە',
+      'دەنگدار، توند، قورس، قەلقەلە', 'ت',
+      'ط قورس و قەلقەلەیە، ت تەنکە'),
+  0x0638: _LetterInfo('زواء', 'سەری زمان و سەری ددانە پێشەوەکانی سەرەوە',
+      'دەنگدار، نەرم، قورس', 'ض ذ',
+      'ظ سەری زمانە لەگەڵ ددان و قورسە، ذ تەنکە'),
+  0x0639: _LetterInfo('عەین', 'ناوەڕاستی قوڕگ',
+      'دەنگدار، نێوان توندی و نەرمی', 'ء ح',
+      'ع دەنگێکی قوڕگیی گوشراوە و دەنگدارە'),
+  0x063A: _LetterInfo('غەین', 'سەرەوەی قوڕگ', 'دەنگدار، نەرم، قورس', 'خ',
+      'غ دەنگدارە، خ بێ دەنگە'),
+  0x0641: _LetterInfo('فێ', 'ددانە پێشەوەکانی سەرەوە و ناوەڕاستی لێوی خوارەوە',
+      'بێ دەنگ، نەرم'),
+  0x0642: _LetterInfo('قاف', 'کۆتایی زمان و ئاسمانی نەرمی دەم',
+      'دەنگدار، توند، قورس، قەلقەلە', 'ك',
+      'ق قورس و قووڵە و قەلقەلەی هەیە، ك تەنک و بێ دەنگە'),
+  0x0643: _LetterInfo('کاف', 'کۆتایی زمان، کەمێک لە قاف نزیکتر بە دەمەوە',
+      'بێ دەنگ، توند، تەنک', 'ق', 'ك تەنکە و قەلقەلەی نییە'),
+  0x0644: _LetterInfo('لام', 'لای زمان نزیک سەری',
+      'دەنگدار، نەرم (لامی «الله» دوای فەتحە/زەمە قورس دەبێت)', 'ر',
+      'ل لای زمان دەبزوێت، ر زمان دەلەرێتەوە'),
+  0x0645: _LetterInfo('میم', 'دوو لێو، غوننە لە لووتەوە',
+      'دەنگدار، غوننە', 'ب',
+      'م بە لووت دەگوزەرێت و لێوەکان تەواو دەبەسترێن'),
+  0x0646: _LetterInfo('نوون', 'سەری زمان و ڕەگی ددانەکانی پێشەوە، غوننە لە لووتەوە',
+      'دەنگدار، غوننە'),
+  0x0647: _LetterInfo('هێ', 'کۆتایی قوڕگ', 'بێ دەنگ، نەرم', 'ح',
+      'ه لە کۆتایی قوڕگەوە بە هەناسەی ئاسایی دەردەچێت'),
+  0x0648: _LetterInfo('واو', 'دوو لێو (بازنەیی)، یان بۆشایی دەم کاتێک مەدە',
+      'دەنگدار، نەرم'),
+  0x064A: _LetterInfo('یێ', 'ناوەڕاستی زمان و ئاسمانی دەم، یان بۆشایی دەم کاتێک مەدە',
+      'دەنگدار، نەرم'),
+};
+
+class TajweedExplainer {
+  TajweedExplainer._();
+
+  /// Folds letter variants onto the key used in kLetterInfo.
+  static int _key(int r) {
+    switch (r) {
+      case 0x0622:
+      case 0x0623:
+      case 0x0624:
+      case 0x0625:
+      case 0x0626:
+        return 0x0621;
+      case 0x0629:
+        return 0x062A;
+      case 0x0649:
+      case 0x06CC:
+        return 0x064A;
+      case 0x0671:
+        return 0x0627;
+      case 0x06A9:
+        return 0x0643;
+      default:
+        return r;
+    }
+  }
+
+  static const Map<int, String> _vowelName = <int, String>{
+    0x064E: 'فەتحە (ـَ)',
+    0x064F: 'زەمە (ـُ)',
+    0x0650: 'کەسرە (ـِ)',
+  };
+
+  static const Map<int, String> _tanweenName = <int, String>{
+    0x064B: 'تەنوینی فەتح (ـً)',
+    0x064C: 'تەنوینی زەم (ـٌ)',
+    0x064D: 'تەنوینی کەسرە (ـٍ)',
+  };
+
+  /// What the reader must do with a noon sakin / tanween (lesson id of the rule).
+  static String _nunRule(int lesson) {
+    switch (lesson) {
+      case 5:
+        return 'ئیزهار (ڕوون و بێ غوننە)';
+      case 6:
+        return 'ئیدغام (بچێتە ناو پیتی دواتر)';
+      case 7:
+        return 'ئیقلاب (بکرێتە میمی شاراوە)';
+      case 8:
+        return 'ئیخفا (بە غوننەوە بشاردرێتەوە)';
+      case 9:
+        return 'ئیخفای شەفەوی';
+      case 10:
+        return 'ئیزهاری شەفەوی';
+      case 21:
+        return 'ئیدغامی مثلین';
+      default:
+        return '';
+    }
+  }
+
+  static String _maddName(TajweedKind k) {
+    switch (k) {
+      case TajweedKind.maddAsli:
+        return 'مەدی سروشتی: ٢ حەرەکە درێژ بکە';
+      case TajweedKind.maddMuttasil:
+        return 'مەدی متصل (هەمزە لە هەمان وشەدایە): ٤ یان ٥ حەرەکە';
+      case TajweedKind.maddMunfasil:
+        return 'مەدی منفصل (هەمزە لە وشەی دواتر): ٤ یان ٥ حەرەکە';
+      case TajweedKind.maddBadal:
+        return 'مەدی بەدەل: ٢ حەرەکە';
+      case TajweedKind.maddLazim:
+        return 'مەدی لازم: ٦ حەرەکە';
+      case TajweedKind.maddArid:
+        return 'مەدی عارض بۆ وەستان: ٢ یان ٤ یان ٦ حەرەکە';
+      case TajweedKind.maddLin:
+        return 'مەدی لین لە وەستاندا: ٢ یان ٤ یان ٦ حەرەکە';
+      default:
+        return 'مەدەکە دەبێت لانی کەم ٢ حەرەکە درێژ بکرێت';
+    }
+  }
+
+  /// Where a letter is pronounced and what it is confused with.
+  static String letterHint(int r) {
+    final i = kLetterInfo[_key(r)];
+    final ch = String.fromCharCode(r);
+    if (i == null) return 'پیتی «$ch» ڕاست دەرنەچووە';
+    final b = StringBuffer(
+        'پیتی «$ch» (${i.name}) ڕاست دەرنەچووە - مەخرەج: ${i.makhraj}');
+    if (i.mix.isNotEmpty) {
+      b.write(' • زۆر تێکەڵ دەکرێت لەگەڵ «${i.mix.replaceAll(' ', ' / ')}»: ${i.tip}');
+    }
+    return b.toString();
+  }
+
+  /// Makhraj tip for the letter at [idx] of the normalised expected word.
+  static String letterTipAt(String normExpected, int idx) {
+    if (idx < 0 || idx >= normExpected.length) return '';
+    final r = normExpected.codeUnitAt(idx);
+    final i = kLetterInfo[_key(r)];
+    if (i == null) return '';
+    final ch = String.fromCharCode(r);
+    final b = StringBuffer('مەخرەجی «$ch»: ${i.makhraj}');
+    if (i.mix.isNotEmpty) b.write(' • ${i.tip}');
+    return b.toString();
+  }
+
+  /// Exact hint from the faulty glyphs of a word ([signs] = _faultKey values:
+  /// position of the letter cluster + the sign, or 0 = the letter itself).
+  /// '' = could not tell.
+  static String explain({
+    required String word,
+    required Set<int> signs,
+    String next = '',
+    bool atWaqf = false,
+  }) {
+    if (word.isEmpty || signs.isEmpty) return '';
+    final cl = _clustersCached(word);
+    final keys = signs.toList()..sort();
+    final out = <String>[];
+    final seen = <String>{};
+    for (final key in keys) {
+      final code = key & 0xFFFF;
+      final pos = key >> 16;
+      if (pos < 0 || pos >= cl.length) continue;
+      final r = cl[pos].text.runes.first;
+      final ch = String.fromCharCode(r);
+      var tag = '';
+      var msg = '';
+      if (code == _kShadda) {
+        tag = 'shadda';
+        msg = 'شەدەی پیتی «$ch» لەبیرچووە - دەبێت دووجار بخوێنرێتەوە';
+        final f = _foldRune(r);
+        if (f == 0x0646 || f == 0x0645) msg += ' و غوننەکەی ٢ حەرەکە بێت';
+      } else if (_isTanweenRune(code)) {
+        tag = 'tanween';
+        msg =
+            '${_tanweenName[code] ?? 'تەنوین'} لەسەر «$ch» ڕاست نەخوێندراوەتەوە - دەبێت لە کۆتاییدا دەنگی «ن»ی ساکن هەبێت';
+        final l = next.isEmpty ? 0 : TajweedBridge.nunLesson(cl, next);
+        final rl = _nunRule(l);
+        if (rl.isNotEmpty) msg += '، لەگەڵ وشەی دواتر: $rl';
+      } else if (code == 0x0653 ||
+          code == 0x0670 ||
+          (code == 0 && TajweedBridge._carrier(cl, pos))) {
+        tag = 'madd';
+        final k = TajweedBridge.maddKind(cl, next, atWaqf);
+        msg = 'مەدی «$ch» کورت خوێندراوەتەوە - ${_maddName(k)}';
+      } else if (_isVowelRune(code)) {
+        tag = 'vowel';
+        msg =
+            'حەرەکەی پیتی «$ch» هەڵەیە - دەبوایە ${_vowelName[code] ?? 'حەرەکەی ڕاست'} بوایە';
+      } else if (code == 0) {
+        tag = 'letter';
+        msg = letterHint(r);
+      }
+      if (msg.isEmpty) continue;
+      if (!seen.add('$tag')) continue; // one line per kind of mistake
+      out.add(msg);
+      if (out.length >= 2) break;
+    }
+    return out.join(' • ');
+  }
+
+  /// Hint from the engine's own tajweed finding (when no exact glyph is known).
+  static String kindHint(
+      TajweedKind k, TajweedDir d, String word, String next, bool atWaqf) {
+    if (word.isEmpty) return '';
+    final cl = _clustersCached(word);
+    final dirTxt = d == TajweedDir.tooShort
+        ? 'کورتە'
+        : (d == TajweedDir.tooLong ? 'زۆر درێژە' : '');
+    final pre = dirTxt.isEmpty ? '' : '($dirTxt) ';
+    switch (k) {
+      case TajweedKind.maddAsli:
+      case TajweedKind.maddMuttasil:
+      case TajweedKind.maddMunfasil:
+      case TajweedKind.maddBadal:
+      case TajweedKind.maddLazim:
+      case TajweedKind.maddArid:
+      case TajweedKind.maddLin:
+      case TajweedKind.maddOther:
+        return 'مەدەکە $pre- ${_maddName(k)}';
+      case TajweedKind.qalqala:
+        {
+          const q = <int>[0x0642, 0x0637, 0x0628, 0x062C, 0x062F];
+          for (var i = 0; i < cl.length; i++) {
+            final b = _foldRune(cl[i].text.runes.first);
+            final sk = TajweedBridge._isSakin(cl[i]) ||
+                (atWaqf && i == cl.length - 1);
+            if (q.contains(b) && sk) {
+              return 'قەڵقەلەی پیتی «${String.fromCharCode(cl[i].text.runes.first)}» نەبیسترا - دوای ساکنبوون دەبێت دەنگێکی لێدانەوەی کورت هەبێت';
+            }
+          }
+          return 'قەڵقەلە: پیتەکانی ق ط ب ج د کاتێک ساکن دەبن دەبێت دەنگی لێدانەوە هەبێت';
+        }
+      case TajweedKind.ghunna:
+        return 'غوننە $pre- لە «ن» و «م»ی شەددار دەبێت ٢ حەرەکە بە لووت بخوێنرێت';
+      case TajweedKind.izhar:
+      case TajweedKind.idgham:
+      case TajweedKind.iqlab:
+      case TajweedKind.ikhfa:
+        {
+          final l = next.isEmpty ? 0 : TajweedBridge.nunLesson(cl, next);
+          final rl = _nunRule(l);
+          return rl.isEmpty
+              ? 'ڕێسای نوونی ساکن و تەنوین لەم وشەیەدا ڕاست نەخوێندراوەتەوە'
+              : 'نوونی ساکن/تەنوین لەگەڵ وشەی «$next»: $rl';
+        }
+      case TajweedKind.shadda:
+        return 'شەدە لەم وشەیەدا ڕاست نەخوێندراوەتەوە - پیتی شەددار دەبێت دووجار بخوێنرێتەوە';
+      case TajweedKind.tanween:
+        return 'تەنوینەکە ڕاست نەخوێندراوەتەوە - دەبێت دەنگی «ن»ی ساکن لە کۆتاییدا هەبێت';
+      case TajweedKind.tafkhim:
+        return 'پیتە قورسەکان (خ ص ض غ ط ق ظ) دەبێت قورس و پڕ بخوێنرێن، پیتەکانی دیکە تەنک';
+      case TajweedKind.raa:
+        return 'ڕاء: قورس یان تەنک دەخوێنرێتەوە بەپێی حەرەکەی خۆی و پیتی پێشی';
+      case TajweedKind.lamJalala:
+        return 'لامی «الله»: دوای فەتحە و زەمە قورس، دوای کەسرە تەنک';
+      case TajweedKind.lamTarif:
+        return 'لامی «ال»: پێش پیتی خۆر (شەمسی) نابیسترێت و ئیدغام دەکرێت، پێش پیتی مانگ (قەمەری) ڕوون دەخوێنرێت';
+      case TajweedKind.waqf:
+        return 'لە وەستاندا حەرەکەی کۆتایی لادەچێت و پیتەکە ساکن دەبێت';
+      case TajweedKind.hamzaWasl:
+        return 'هەمزەی وەسڵ لە ناوەڕاستی ڕستە نابیسترێت، تەنها لە دەستپێکردندا دەخوێنرێتەوە';
+      default:
+        return '';
+    }
+  }
+}
+
+class TajweedProgress extends ChangeNotifier {
+  final Set<int> read = <int>{};
+  bool _loaded = false;
+
+  Future<void> ensureLoaded() async {
+    if (_loaded) return;
+    _loaded = true;
+    try {
+      final p = await SharedPreferences.getInstance();
+      read
+        ..clear()
+        ..addAll((p.getStringList('tajRead2') ?? const <String>[])
+            .map(int.tryParse)
+            .whereType<int>());
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  bool isRead(int id) => read.contains(id);
+
+  Future<void> markRead(int id) async {
+    if (!read.add(id)) return;
+    notifyListeners();
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setStringList('tajRead2', read.map((e) => '$e').toList());
+    } catch (_) {}
+  }
+
+  Future<void> reset() async {
+    read.clear();
+    notifyListeners();
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.remove('tajRead2');
+    } catch (_) {}
+  }
+}
+
+final TajweedProgress tajProgress = TajweedProgress();
+
+class TajweedLessonsScreen extends StatefulWidget {
+  /// Opens the screen at this lesson (expanded and marked as read), e.g. the
+  /// lesson the Recitation coach points to. 0 = the normal list.
+  final int initialLessonId;
+  const TajweedLessonsScreen({super.key, this.initialLessonId = 0});
+
+  @override
+  State<TajweedLessonsScreen> createState() => _TajweedLessonsScreenState();
+}
+
+class _TajweedLessonsScreenState extends State<TajweedLessonsScreen> {
+  @override
+  void initState() {
+    super.initState();
+    tajProgress.ensureLoaded().then((_) {
+      if (widget.initialLessonId != 0) {
+        tajProgress.markRead(widget.initialLessonId);
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final startAt = kTajweedLessons
+        .indexWhere((l) => l.id == widget.initialLessonId);
+    return ListenableBuilder(
+      listenable: tajProgress,
+      builder: (context, _) {
+        final done = tajProgress.read.length;
+        final total = kTajweedLessons.length;
+        return Scaffold(
+          appBar: AppBar(
+            title: const Text('تەجوید و فێرکردن',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+            actions: [
+              if (done > 0)
+                IconButton(
+                  tooltip: 'سفرکردنەوەی پێشکەوتن',
+                  icon: const Icon(Icons.restart_alt),
+                  onPressed: () => tajProgress.reset(),
+                ),
+            ],
+          ),
+          body: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 820),
+              child: ScrollablePositionedList.builder(
+                initialScrollIndex: startAt >= 0 ? startAt + 2 : 0,
+                padding: const EdgeInsets.fromLTRB(14, 14, 14, 28),
+                itemCount: total + 2,
+                itemBuilder: (context, i) {
+                  if (i == 0) return _TajProgressCard(done: done, total: total);
+                  if (i == 1) return const _TajQuizBanner();
+                  final lesson = kTajweedLessons[i - 2];
+                  return _TajLessonCard(
+                    lesson: lesson,
+                    isRead: tajProgress.isRead(lesson.id),
+                    initiallyExpanded: lesson.id == widget.initialLessonId,
+                  );
+                },
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _TajProgressCard extends StatelessWidget {
+  final int done;
+  final int total;
+  const _TajProgressCard({required this.done, required this.total});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 14),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: _cardColor(context),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: _lineColor(context)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.school, color: _green),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text('پێشکەوتنی تۆ',
+                    style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                        color: _inkColor(context))),
+              ),
+              Text('$done / $total',
+                  style: TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.bold,
+                      color: _mutedColor(context))),
+            ],
+          ),
+          const SizedBox(height: 10),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(6),
+            child: LinearProgressIndicator(
+              value: total == 0 ? 0 : done / total,
+              minHeight: 8,
+              color: _green,
+              backgroundColor: _lineColor(context),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text('هەر وانەیەک کە بیکەیتەوە وەک خوێندراو دیاری دەکرێت. هەموو وانەکان بێ ئینتەرنێت کار دەکەن.',
+              style: TextStyle(
+                  fontSize: 12.5, height: 1.6, color: _mutedColor(context))),
+        ],
+      ),
+    );
+  }
+}
+
+class _TajQuizBanner extends StatelessWidget {
+  const _TajQuizBanner();
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: Material(
+        color: const Color(0xFFB5552B),
+        borderRadius: BorderRadius.circular(16),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(builder: (_) => const TajweedQuizPage())),
+          child: const Padding(
+            padding: EdgeInsets.all(16),
+            child: Row(
+              children: [
+                Icon(Icons.quiz, color: Colors.white, size: 40),
+                SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('تاقیکردنەوە',
+                          style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 19,
+                              fontWeight: FontWeight.bold)),
+                      SizedBox(height: 2),
+                      Text('٨ پرسیار لەسەر حوکمەکانی تەجوید',
+                          style: TextStyle(color: Colors.white70, fontSize: 13)),
+                    ],
+                  ),
+                ),
+                Icon(Icons.chevron_left, color: Colors.white),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _TajLessonCard extends StatelessWidget {
+  final TajweedLesson lesson;
+  final bool isRead;
+  final bool initiallyExpanded;
+  const _TajLessonCard(
+      {required this.lesson,
+      this.isRead = false,
+      this.initiallyExpanded = false});
+
+  @override
+  Widget build(BuildContext context) {
+    final ink = _inkColor(context);
+    final muted = _mutedColor(context);
+    return Card(
+      margin: const EdgeInsets.only(bottom: 10),
+      elevation: 0,
+      color: _cardColor(context),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(14),
+        side: BorderSide(color: _lineColor(context)),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Theme(
+        data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+        child: ExpansionTile(
+          key: PageStorageKey<int>(lesson.id),
+          initiallyExpanded: initiallyExpanded,
+          onExpansionChanged: (open) {
+            if (open) tajProgress.markRead(lesson.id);
+          },
+          leading: CircleAvatar(
+            backgroundColor: isRead ? _green : _green.withAlpha(30),
+            child: isRead
+                ? const Icon(Icons.check, color: Colors.white, size: 20)
+                : Text('${lesson.id}',
+                    style: const TextStyle(
+                        color: _green, fontWeight: FontWeight.bold)),
+          ),
+          title: Text('وانەی ${lesson.id}: ${lesson.titleKu}',
+              style: TextStyle(
+                  fontSize: 17, fontWeight: FontWeight.bold, color: ink)),
+          subtitle: Text(lesson.titleAr,
+              style: TextStyle(
+                  fontSize: 15, color: muted, fontFamilyFallback: _arFonts)),
+          childrenPadding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
+          expandedCrossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(lesson.summary,
+                style: TextStyle(fontSize: 15, height: 1.8, color: ink)),
+            if (lesson.video.isNotEmpty) ...[
+              const SizedBox(height: 6),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Padding(
+                    padding: EdgeInsets.only(top: 2, left: 6),
+                    child: Icon(Icons.ondemand_video, size: 16, color: _gold),
+                  ),
+                  Expanded(
+                    child: Text(lesson.video,
+                        style: TextStyle(
+                            fontSize: 12.5, height: 1.5, color: muted)),
+                  ),
+                ],
+              ),
+            ],
+            const SizedBox(height: 10),
+            for (final r in lesson.rules)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (lesson.numberedRules)
+                      Container(
+                        width: 24,
+                        height: 24,
+                        margin: const EdgeInsets.only(top: 4, left: 8),
+                        alignment: Alignment.center,
+                        decoration: const BoxDecoration(
+                            color: _gold, shape: BoxShape.circle),
+                        child: Text('${lesson.rules.indexOf(r) + 1}',
+                            style: const TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.white)),
+                      )
+                    else
+                      const Padding(
+                        padding: EdgeInsets.only(top: 8, left: 8),
+                        child: Icon(Icons.circle, size: 7, color: _gold),
+                      ),
+                    Expanded(
+                      child: Text(r,
+                          style: TextStyle(
+                              fontSize: 14.5, height: 1.75, color: ink)),
+                    ),
+                  ],
+                ),
+              ),
+            if (lesson.mistakes.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFE53935).withAlpha(18),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('هەڵەی باو:',
+                        style: TextStyle(
+                            fontSize: 14.5,
+                            fontWeight: FontWeight.bold,
+                            color: ink)),
+                    for (final m in lesson.mistakes)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4),
+                        child: Text('• $m',
+                            style: TextStyle(
+                                fontSize: 14, height: 1.7, color: ink)),
+                      ),
+                  ],
+                ),
+              ),
+            ],
+            if (lesson.examples.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text('نموونە:',
+                  style: TextStyle(
+                      fontSize: 15, fontWeight: FontWeight.bold, color: ink)),
+              for (final e in lesson.examples)
+                Container(
+                  width: double.infinity,
+                  margin: const EdgeInsets.only(top: 8),
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: _green.withAlpha(16),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Directionality(
+                        textDirection: TextDirection.rtl,
+                        child: SizedBox(
+                          width: double.infinity,
+                          child: Text(e.text,
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                  fontSize: 26,
+                                  height: 2.0,
+                                  color: ink,
+                                  fontFamily: _uthmaniFont,
+                                  fontFamilyFallback: _tajQuranFonts)),
+                        ),
+                      ),
+                      if (e.ref.isNotEmpty || e.note.isNotEmpty)
+                        Text(
+                          [
+                            if (e.ref.isNotEmpty) '(${e.ref})',
+                            if (e.note.isNotEmpty) e.note,
+                          ].join('  •  '),
+                          textAlign: TextAlign.center,
+                          style: TextStyle(fontSize: 12.5, color: muted),
+                        ),
+                    ],
+                  ),
+                ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _TajQ {
+  final String phrase;
+  final String answer;
+  const _TajQ(this.phrase, this.answer);
+}
+
+const List<_TajQ> _kTajQuiz = [
+  _TajQ('مِنْ قَبْلُ', 'إخفاء'),
+  _TajQ('مِنْ هَادٍ', 'إظهار'),
+  _TajQ('مِنْ بَعْدِ', 'إقلاب'),
+  _TajQ('مَنْ يَقُولُ', 'إدغام'),
+  _TajQ('جَاءَ', 'مد متصل'),
+  _TajQ('الضَّالِّينَ', 'مد لازم'),
+  _TajQ('يَقْطَعُونَ', 'قلقلة'),
+  _TajQ('إِنَّ', 'غنة'),
+];
+
+const List<String> _kTajChoices = [
+  'إظهار', 'إدغام', 'إقلاب', 'إخفاء', 'مد متصل', 'مد لازم', 'قلقلة', 'غنة',
+];
+
+class TajweedQuizPage extends StatefulWidget {
+  const TajweedQuizPage({super.key});
+
+  @override
+  State<TajweedQuizPage> createState() => _TajweedQuizPageState();
+}
+
+class _TajweedQuizPageState extends State<TajweedQuizPage> {
+  int _i = 0;
+  int _score = 0;
+  String? _picked;
+  late List<List<String>> _options;
+
+  @override
+  void initState() {
+    super.initState();
+    _shuffle();
+  }
+
+  void _shuffle() {
+    final rnd = math.Random();
+    _options = [
+      for (final q in _kTajQuiz)
+        ([
+          q.answer,
+          ...(_kTajChoices.where((c) => c != q.answer).toList()..shuffle(rnd))
+              .take(3),
+        ]..shuffle(rnd)),
+    ];
+    _i = 0;
+    _score = 0;
+    _picked = null;
+  }
+
+  void _pick(String v) {
+    if (_picked != null) return;
+    setState(() {
+      _picked = v;
+      if (v == _kTajQuiz[_i].answer) _score++;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final done = _i >= _kTajQuiz.length;
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('تاقیکردنەوەی تەجوید',
+            style: TextStyle(fontWeight: FontWeight.bold)),
+      ),
+      body: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 600),
+          child: Padding(
+            padding: const EdgeInsets.all(18),
+            child: done ? _result(context) : _question(context),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _result(BuildContext context) {
+    return Column(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        const Icon(Icons.emoji_events, size: 72, color: _gold),
+        const SizedBox(height: 12),
+        Text('$_score / ${_kTajQuiz.length}',
+            style: TextStyle(
+                fontSize: 36,
+                fontWeight: FontWeight.bold,
+                color: _inkColor(context))),
+        const SizedBox(height: 6),
+        Text(
+          _score == _kTajQuiz.length
+              ? 'ماشاءالله، هەموو وەڵامەکانت ڕاستن'
+              : 'باشە، وانەکان دووبارە بخوێنەرەوە و هەوڵبدەرەوە',
+          textAlign: TextAlign.center,
+          style: TextStyle(fontSize: 15, color: _mutedColor(context)),
+        ),
+        const SizedBox(height: 20),
+        FilledButton.icon(
+          onPressed: () => setState(_shuffle),
+          icon: const Icon(Icons.refresh),
+          label: const Text('دووبارە'),
+        ),
+      ],
+    );
+  }
+
+  Widget _question(BuildContext context) {
+    final q = _kTajQuiz[_i];
+    final opts = _options[_i];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        LinearProgressIndicator(value: (_i + 1) / _kTajQuiz.length),
+        const SizedBox(height: 8),
+        Text('پرسیاری ${_i + 1} لە ${_kTajQuiz.length}',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: _mutedColor(context))),
+        const SizedBox(height: 18),
+        Text('ئەم نموونەیە کام حوکمی تجویدە؟',
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 16, color: _inkColor(context))),
+        const SizedBox(height: 14),
+        Container(
+          padding: const EdgeInsets.symmetric(vertical: 22),
+          decoration: BoxDecoration(
+            color: _cardColor(context),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: _lineColor(context)),
+          ),
+          child: Text(q.phrase,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                  fontSize: 32,
+                  color: _inkColor(context),
+                  fontFamilyFallback: _arFonts)),
+        ),
+        const SizedBox(height: 16),
+        for (final o in opts)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: OutlinedButton(
+              style: OutlinedButton.styleFrom(
+                minimumSize: const Size.fromHeight(50),
+                backgroundColor: _picked == null
+                    ? null
+                    : o == q.answer
+                        ? const Color(0x331E7A3E)
+                        : o == _picked
+                            ? const Color(0x33C0392B)
+                            : null,
+              ),
+              onPressed: () => _pick(o),
+              child: Text(o,
+                  style: TextStyle(
+                      fontSize: 19,
+                      color: _inkColor(context),
+                      fontFamilyFallback: _arFonts)),
+            ),
+          ),
+        const Spacer(),
+        if (_picked != null)
+          FilledButton(
+            onPressed: () => setState(() {
+              _i++;
+              _picked = null;
+            }),
+            child: Text(_i + 1 == _kTajQuiz.length ? 'ئەنجام' : 'دواتر'),
+          ),
+      ],
+    );
+  }
+}
+
+/// Top banner: the city photo (assets/banner.jpg), full width, no padding,
+/// no rounded corners, glued to the app bar. The box uses the photo's own
+/// ratio (1392x748), so nothing is cropped.
+class _DashBanner extends StatelessWidget {
+  const _DashBanner();
+
+  // Brightness / colour boost so the flag stands out.
+  // Raise the first number on each row (1.18) for stronger colour, and the
+  // last number (14) for more light.
+  static const List<double> _boost = <double>[
+    1.18, 0, 0, 0, 14, //
+    0, 1.18, 0, 0, 14, //
+    0, 0, 1.18, 0, 14, //
+    0, 0, 0, 1, 0, //
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: double.infinity,
+      child: AspectRatio(
+        aspectRatio: 1392 / 748,
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            ColorFiltered(
+              colorFilter: const ColorFilter.matrix(_boost),
+              child: Image.asset(
+                'assets/banner.jpg',
+                fit: BoxFit.cover, // ratio is identical, so no part is cut
+                filterQuality: FilterQuality.medium,
+                errorBuilder: (_, __, ___) => const DecoratedBox(
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [Color(0xFF17394F), Color(0xFF1E7A3E)],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            // soft dark glow ONLY behind the Bismillah (top-start corner),
+            // so the flag on the other side stays bright and clear
+            const DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: RadialGradient(
+                  center: AlignmentDirectional.topStart,
+                  radius: 0.95,
+                  colors: [Color(0x99000000), Color(0x00000000)],
+                ),
+              ),
+            ),
+            const Positioned.fill(
+              child: Padding(
+                padding: EdgeInsets.fromLTRB(22, 16, 22, 10),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.start,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'بِسْمِ ٱللَّهِ ٱلرَّحْمَٰنِ ٱلرَّحِيمِ',
+                      style: TextStyle(
+                        fontSize: 18,
+                        color: Colors.white,
+                        fontFamilyFallback: _arFonts,
+                        shadows: [Shadow(color: Color(0xCC000000), blurRadius: 6)],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// One card of the dashboard: cream card, thin gold line, lace corners and an
+/// emerald star badge with a gold icon (same look as the prayer-times cards).
+class _DashTile extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final VoidCallback onTap;
+  const _DashTile({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final dark = _isDark(context);
+    final s = (math.min(MediaQuery.of(context).size.width, 820.0) / 390)
+        .clamp(0.85, 1.2)
+        .toDouble();
+    final ink = dark ? _inkColor(context) : _prInk;
+    final muted = dark ? _mutedColor(context) : _prMuted;
+    return Container(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(22 * s),
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: dark
+              ? const [Color(0xFF22302A), Color(0xFF1B2620)]
+              : const [Color(0xFFFFFDF6), _prCream],
+        ),
+        border: Border.all(
+            color: _prGold.withAlpha(dark ? 130 : 205), width: 1.4),
+        boxShadow: const [
+          BoxShadow(
+              color: Color(0x2E000000), blurRadius: 9, offset: Offset(0, 4)),
+        ],
+      ),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(22 * s),
+          onTap: onTap,
+          child: Stack(
+            children: [
+              const Positioned.fill(
+                child: CustomPaint(painter: _DashLacePainter()),
+              ),
+              Padding(
+                padding: EdgeInsets.all(10 * s),
+                child: Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      SizedBox(
+                        width: 64 * s,
+                        height: 64 * s,
+                        child: CustomPaint(
+                          painter: const _DashStarPainter(),
+                          child: Center(
+                            child: Icon(icon,
+                                size: 31 * s, color: _prGoldLight),
+                          ),
+                        ),
+                      ),
+                      SizedBox(height: 8 * s),
+                      FittedBox(
+                        fit: BoxFit.scaleDown,
+                        child: Text(
+                          title,
+                          maxLines: 1,
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            fontSize: 17 * s,
+                            fontWeight: FontWeight.bold,
+                            color: ink,
+                          ),
+                        ),
+                      ),
+                      SizedBox(height: 2 * s),
+                      FittedBox(
+                        fit: BoxFit.scaleDown,
+                        child: Text(
+                          subtitle,
+                          maxLines: 1,
+                          textAlign: TextAlign.center,
+                          style: TextStyle(fontSize: 12.5 * s, color: muted),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Faint gold eight-pointed-star lattice (page background and footer).
+class _StarLatticePainter extends CustomPainter {
+  final Color color;
+  final double alpha; // 0..1
+  const _StarLatticePainter({required this.color, required this.alpha});
+
+  static void draw(Canvas canvas, Rect area, Color color, double alpha) {
+    const step = 46.0;
+    final p = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 0.8
+      ..color = color.withAlpha((alpha * 255).round());
+    for (var row = 0; area.top + row * step < area.bottom + step; row++) {
+      final cy = area.top + row * step + step / 2;
+      for (var col = 0; area.left + col * step < area.right + step; col++) {
+        final cx = area.left + col * step + (row.isOdd ? step / 2 : 0.0);
+        const r = step * 0.46;
+        for (final off in const [0.0, math.pi / 4]) {
+          final path = Path();
+          for (var k = 0; k < 4; k++) {
+            final ang = off + k * math.pi / 2 + math.pi / 4;
+            final x = cx + r * math.cos(ang);
+            final y = cy + r * math.sin(ang);
+            if (k == 0) {
+              path.moveTo(x, y);
+            } else {
+              path.lineTo(x, y);
+            }
+          }
+          path.close();
+          canvas.drawPath(path, p);
+        }
+      }
+    }
+  }
+
+  @override
+  void paint(Canvas canvas, Size size) =>
+      draw(canvas, Offset.zero & size, color, alpha);
+
+  @override
+  bool shouldRepaint(covariant _StarLatticePainter old) =>
+      old.color != color || old.alpha != alpha;
+}
+
+/// Emerald eight-pointed badge with a double gold outline (behind tile icons).
+class _DashStarPainter extends CustomPainter {
+  const _DashStarPainter();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final c = size.center(Offset.zero);
+    final big = size.width / 2 - 1;
+    Path star(double scale) {
+      final path = Path();
+      for (var k = 0; k < 16; k++) {
+        final ang = k * math.pi / 8;
+        final r = (k.isEven ? big : big * 0.84) * scale;
+        final pt = c + Offset(math.cos(ang), math.sin(ang)) * r;
+        if (k == 0) {
+          path.moveTo(pt.dx, pt.dy);
+        } else {
+          path.lineTo(pt.dx, pt.dy);
+        }
+      }
+      return path..close();
+    }
+
+    canvas.drawShadow(star(1), const Color(0xFF000000), 3, false);
+    canvas.drawPath(
+      star(1),
+      Paint()
+        ..shader = const LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [Color(0xFF16664B), _prEmerald],
+        ).createShader(Offset.zero & size),
+    );
+    canvas.drawPath(
+      star(1),
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.7
+        ..color = _prGold,
+    );
+    canvas.drawPath(
+      star(0.86),
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 0.7
+        ..color = _prGold.withAlpha(120),
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+/// Gold lace in the two top corners of a tile.
+class _DashLacePainter extends CustomPainter {
+  const _DashLacePainter();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    void corner() {
+      final p = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 0.8;
+      const n = 6;
+      for (var i = 0; i < n; i++) {
+        for (var j = 0; j < n; j++) {
+          if (i + j >= n) continue;
+          final a = (1 - (i + j) / n) * 0.5;
+          p.color = _prGold.withAlpha((a * 255).round());
+          final cx = 10.0 + i * 9;
+          final cy = 10.0 + j * 9;
+          canvas.drawPath(
+            Path()
+              ..moveTo(cx, cy - 5)
+              ..lineTo(cx + 5, cy)
+              ..lineTo(cx, cy + 5)
+              ..lineTo(cx - 5, cy)
+              ..close(),
+            p,
+          );
+        }
+      }
+    }
+
+    canvas.save();
+    canvas.clipRect(Offset.zero & size);
+    corner();
+    canvas.translate(size.width, 0);
+    canvas.scale(-1, 1);
+    corner();
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+/// Cream ogee edge laid over the very bottom rim of the city photo
+/// (gold line + emerald diamond). The photo itself is not changed.
+class _DashEdgePainter extends CustomPainter {
+  final Color bg;
+  const _DashEdgePainter(this.bg);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final w = size.width, h = size.height;
+    final edge = Path()
+      ..moveTo(0, h * 0.72)
+      ..cubicTo(w * 0.20, h * 0.74, w * 0.34, h * 0.60, w * 0.42, h * 0.36)
+      ..cubicTo(w * 0.46, h * 0.24, w * 0.48, h * 0.10, w * 0.5, 0)
+      ..cubicTo(w * 0.52, h * 0.10, w * 0.54, h * 0.24, w * 0.58, h * 0.36)
+      ..cubicTo(w * 0.66, h * 0.60, w * 0.80, h * 0.74, w, h * 0.72);
+    final fill = Path.from(edge)
+      ..lineTo(w, h + 1)
+      ..lineTo(0, h + 1)
+      ..close();
+    canvas.drawPath(fill, Paint()..color = bg);
+    canvas.drawPath(
+      edge,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.8
+        ..shader = const LinearGradient(
+          colors: [_prGoldLight, _prGold, _prGoldLight, _prGold, _prGoldLight],
+        ).createShader(Offset.zero & size),
+    );
+    final c = Offset(w / 2, h * 0.56);
+    final d = Path()
+      ..moveTo(c.dx, c.dy - h * 0.42)
+      ..lineTo(c.dx + h * 0.55, c.dy)
+      ..lineTo(c.dx, c.dy + h * 0.42)
+      ..lineTo(c.dx - h * 0.55, c.dy)
+      ..close();
+    canvas.drawPath(d, Paint()..color = _prEmerald);
+    canvas.drawPath(
+      d,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.2
+        ..color = _prGold,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _DashEdgePainter old) => old.bg != bg;
+}
+
+/// Gold line with a small diamond, next to the section title.
+class _DashOrnamentLinePainter extends CustomPainter {
+  const _DashOrnamentLinePainter();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final y = size.height / 2;
+    canvas.drawLine(
+      Offset(0, y),
+      Offset(size.width, y),
+      Paint()
+        ..strokeWidth = 1.3
+        ..shader = LinearGradient(
+          colors: [_prGold.withAlpha(0), _prGold],
+        ).createShader(Offset.zero & size),
+    );
+    final c = Offset(size.width * 0.62, y);
+    final r = size.height * 0.34;
+    canvas.drawPath(
+      Path()
+        ..moveTo(c.dx, c.dy - r)
+        ..lineTo(c.dx + r, c.dy)
+        ..lineTo(c.dx, c.dy + r)
+        ..lineTo(c.dx - r, c.dy)
+        ..close(),
+      Paint()..color = _prGold,
+    );
+    for (final dx in const [-1.0, 1.0]) {
+      canvas.drawCircle(c + Offset(dx * r * 2.2, 0), r * 0.32, Paint()..color = _prGold);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+/// Emerald band at the bottom of the dashboard with a small mosque.
+class _DashFooterPainter extends CustomPainter {
+  final Color bg; // page colour behind the mosque (for the crescent cut-out)
+  const _DashFooterPainter(this.bg);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final w = size.width, h = size.height;
+    final top = Path()
+      ..moveTo(0, h * 0.28)
+      ..cubicTo(w * 0.22, h * 0.30, w * 0.30, h * 0.72, w * 0.5, h * 0.72)
+      ..cubicTo(w * 0.70, h * 0.72, w * 0.78, h * 0.30, w, h * 0.28);
+    final band = Path.from(top)
+      ..lineTo(w, h)
+      ..lineTo(0, h)
+      ..close();
+    canvas.drawPath(
+      band,
+      Paint()
+        ..shader = const LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [_prEmeraldMid, _prEmerald],
+        ).createShader(Offset.zero & size),
+    );
+    canvas.save();
+    canvas.clipPath(band);
+    _StarLatticePainter.draw(canvas, Offset.zero & size, _prGoldLight, 0.13);
+    canvas.restore();
+    canvas.drawPath(
+      top,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2
+        ..shader = const LinearGradient(
+          colors: [_prGoldLight, _prGold, _prGoldLight, _prGold, _prGoldLight],
+        ).createShader(Offset.zero & size),
+    );
+
+    // ---- mosque ----
+    final cx = w / 2;
+    final base = h * 0.76;
+    final mw = math.min(w * 0.34, 150.0 * (h / 118));
+    final mh = h * 0.66;
+    final fill = Paint()
+      ..shader = const LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [Color(0xFF1B7A55), _prEmerald],
+      ).createShader(Rect.fromLTWH(cx - mw / 2, base - mh, mw, mh));
+    final line = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1
+      ..color = _prGold.withAlpha(210);
+    final gold = Paint()..color = _prGold;
+
+    void minaret(double x) {
+      final half = mw * 0.04;
+      final topY = base - mh * 0.76;
+      final shaft = Rect.fromLTRB(x - half, topY, x + half, base);
+      canvas.drawRect(shaft, fill);
+      canvas.drawRect(shaft, line);
+      canvas.drawRect(
+          Rect.fromLTRB(x - half * 1.9, base - mh * 0.58, x + half * 1.9,
+              base - mh * 0.54),
+          gold);
+      final cap = Path()
+        ..moveTo(x - half * 1.4, topY)
+        ..quadraticBezierTo(x, topY - mh * 0.22, x + half * 1.4, topY)
+        ..close();
+      canvas.drawPath(cap, fill);
+      canvas.drawPath(cap, line);
+      canvas.drawCircle(Offset(x, topY - mh * 0.15), half * 0.55, gold);
+    }
+
+    minaret(cx - mw * 0.44);
+    minaret(cx + mw * 0.44);
+
+    final bodyTop = base - mh * 0.30;
+    final body = Rect.fromLTRB(cx - mw * 0.31, bodyTop, cx + mw * 0.31, base);
+    canvas.drawRect(body, fill);
+    canvas.drawRect(body, line);
+
+    final dome = Path()
+      ..moveTo(cx - mw * 0.25, bodyTop)
+      ..cubicTo(cx - mw * 0.25, bodyTop - mh * 0.44, cx + mw * 0.25,
+          bodyTop - mh * 0.44, cx + mw * 0.25, bodyTop)
+      ..close();
+    canvas.drawPath(dome, fill);
+    canvas.drawPath(dome, line);
+
+    // finial + crescent
+    final tip = Offset(cx, bodyTop - mh * 0.33);
+    canvas.drawLine(tip, tip + Offset(0, -mh * 0.07), line..strokeWidth = 1.2);
+    final cc = tip + Offset(0, -mh * 0.12);
+    final cr = mh * 0.055;
+    canvas.drawCircle(cc, cr, gold);
+    canvas.drawCircle(cc + Offset(cr * 0.5, -cr * 0.15), cr * 0.85, Paint()..color = bg);
+
+    // arched windows
+    final win = Paint()..color = _prGoldLight.withAlpha(215);
+    for (final k in const [-1.0, 0.0, 1.0]) {
+      final wx = cx + k * mw * 0.15;
+      canvas.drawRRect(
+        RRect.fromRectAndCorners(
+          Rect.fromLTRB(wx - mw * 0.035, base - mh * 0.20, wx + mw * 0.035,
+              base - mh * 0.03),
+          topLeft: Radius.circular(mw * 0.035),
+          topRight: Radius.circular(mw * 0.035),
+        ),
+        win,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _DashFooterPainter old) => old.bg != bg;
+}
+
+// ---------- shared small widgets for the new pages ----------
+class _RadioTile extends StatelessWidget {
+  final String label;
+  final String? sub;
+  final bool on;
+  final VoidCallback onTap;
+  const _RadioTile({
+    required this.label,
+    required this.on,
+    required this.onTap,
+    this.sub,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Material(
+        color: _cardColor(context),
+        clipBehavior: Clip.antiAlias,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(14),
+          side: BorderSide(color: on ? _gold : _lineColor(context)),
+        ),
+        child: ListTile(
+          onTap: onTap,
+          leading: Icon(
+            on ? Icons.radio_button_checked : Icons.radio_button_off,
+            color: _gold,
+          ),
+          title: Text(label, style: TextStyle(fontSize: 16, color: _inkColor(context))),
+          subtitle: sub == null
+              ? null
+              : Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Text(
+                    sub!,
+                    style: TextStyle(fontSize: 12.5, height: 1.6, color: _mutedColor(context)),
+                  ),
+                ),
+        ),
+      ),
+    );
+  }
+}
+
+Widget _sectionHead(String t) => Padding(
+      padding: const EdgeInsets.fromLTRB(4, 22, 4, 6),
+      child: Text(
+        t,
+        style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: _gold),
+      ),
+    );
+
+Future<int?> _pickSurah(BuildContext context) {
+  return showModalBottomSheet<int>(
+    context: context,
+    isScrollControlled: true,
+    showDragHandle: true,
+    builder: (ctx) => SizedBox(
+      height: MediaQuery.of(ctx).size.height * 0.7,
+      child: ListView.builder(
+        itemCount: kSurahs.length,
+        itemBuilder: (ctx, i) {
+          final s = kSurahs[i];
+          return ListTile(
+            leading: _Badge(s.n),
+            title: Text(
+              s.ar,
+              style: const TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.bold,
+                fontFamilyFallback: _arFonts,
+              ),
+            ),
+            subtitle: Text(s.en, textDirection: TextDirection.ltr),
+            onTap: () => Navigator.of(ctx).pop(s.n),
+          );
+        },
+      ),
+    ),
+  );
+}
+
+// ============================================================
+//  2) Microphone & levels  (guide + difficulty + start the teacher)
+// ============================================================
+class MicLevelsPage extends StatefulWidget {
+  const MicLevelsPage({super.key});
+
+  @override
+  State<MicLevelsPage> createState() => _MicLevelsPageState();
+}
+
+class _MicLevelsPageState extends State<MicLevelsPage> {
+  late int _surah;
+
+  @override
+  void initState() {
+    super.initState();
+    if (settings.coachSurah >= 1 && settings.coachSurah <= 114) {
+      _surah = settings.coachSurah;
+    } else if (settings.lastSurah >= 1 && settings.lastSurah <= 114) {
+      _surah = settings.lastSurah;
+    } else {
+      _surah = 1;
+    }
+  }
+
+  Future<void> _choose() async {
+    final n = await _pickSurah(context);
+    if (n != null && mounted) setState(() => _surah = n);
+  }
+
+  // Opens the surah and switches the smart teacher (RecitationCoach) on.
+  void _start() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SurahPage(number: _surah, autoCoach: true),
+      ),
+    );
+  }
+
+  Widget _feature(BuildContext context, IconData icon, String title, String text) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: _cardColor(context),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: _lineColor(context)),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              width: 40,
+              height: 40,
+              decoration: BoxDecoration(
+                color: _gold.withAlpha(40),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(icon, color: _gold, size: 22),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: TextStyle(
+                      fontSize: 15.5,
+                      fontWeight: FontWeight.bold,
+                      color: _inkColor(context),
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    text,
+                    style: TextStyle(fontSize: 13, height: 1.7, color: _mutedColor(context)),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: settings,
+      builder: (context, _) {
+        final info = kSurahs[_surah - 1];
+        return Scaffold(
+          appBar: AppBar(
+            title: const Text('خوێند بە تەجوید',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+          bottomNavigationBar: Material(
+            color: _cardColor(context),
+            elevation: 8,
+            child: SafeArea(
+              top: false,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+                child: Row(
+                  children: [
+                    OutlinedButton.icon(
+                      onPressed: _choose,
+                      icon: const Icon(Icons.menu_book, size: 24),
+                      label: Text(
+                        info.ar,
+                        style: const TextStyle(
+                            fontSize: 21,
+                            fontWeight: FontWeight.w600,
+                            fontFamilyFallback: _arFonts),
+                      ),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: _gold,
+                        side: const BorderSide(color: _gold, width: 1.6),
+                        padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 17),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: FilledButton.icon(
+                        onPressed: _start,
+                        icon: const Icon(Icons.mic),
+                        label: const Text('دەستپێکردنی مامۆستا',
+                            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                        style: FilledButton.styleFrom(
+                          backgroundColor: _green,
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          body: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 820),
+              child: ListView(
+                padding: const EdgeInsets.fromLTRB(12, 12, 12, 24),
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(18),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(20),
+                      gradient: const LinearGradient(
+                        begin: Alignment.topRight,
+                        end: Alignment.bottomLeft,
+                        colors: [Color(0xFFC48A0E), Color(0xFF9A6A05)],
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        Container(
+                          width: 56,
+                          height: 56,
+                          decoration: const BoxDecoration(
+                            color: Color(0x33FFFFFF),
+                            shape: BoxShape.circle,
+                          ),
+                          child: const Icon(Icons.mic, color: Colors.white, size: 30),
+                        ),
+                        const SizedBox(width: 14),
+                        const Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'مامۆستای زیرەکی قورئان',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 19,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              SizedBox(height: 4),
+                              Text(
+                                'بخوێنە، مامۆستا گوێت لێ دەگرێت و کاتێک هەڵە بکەیت یەکسەر ڕاستت دەکاتەوە.',
+                                style: TextStyle(
+                                  color: Color(0xE6FFFFFF),
+                                  fontSize: 13,
+                                  height: 1.6,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  _sectionHead('چۆن کار دەکات؟'),
+                  _feature(
+                    context,
+                    Icons.shuffle,
+                    'خوێندنەوەی ئازاد',
+                    'لە هەر ئایەتێکی سوورەتەکەوە دەست بە خوێندن بکە. مامۆستا بە گوێگرتن خۆی شوێنەکەت دەدۆزێتەوە و دەتبات بۆ ئەو ئایەتە، پێویست ناکات بە دەست بگەڕێیت.',
+                  ),
+                  _feature(
+                    context,
+                    Icons.bolt,
+                    'وەڵامی دەنگیی دەستبەجێ',
+                    'کاتێک وشەیەک هەڵە دەخوێنیت، ئەو وشەیە سوور دەبێت و مامۆستا یەکسەر دەنگی ڕاستی دەڵێتەوە (وشەی پێش، هەڵە و دوای). تۆش دووبارەی دەکەیتەوە و بەردەوام دەبیت.',
+                  ),
+                  _feature(
+                    context,
+                    Icons.spellcheck,
+                    'نیشاندانی وردی هەڵە',
+                    'تەنها ئەو پیت، شەدە، تەنوین، حەرەکە یان مەدەی هەڵەیە سوور دەبێت، نەک هەموو وشەکە.',
+                  ),
+                  _feature(
+                    context,
+                    Icons.timer_off,
+                    'کوژانەوەی خۆکار',
+                    'ئەگەر ١ خولەک هیچ دەنگێک نەبیسترێت، مایکرۆفۆن خۆی دەکوژێتەوە بۆ پاراستنی باتری.',
+                  ),
+                  _sectionHead('ئاستی وردی'),
+                  for (var i = 0; i < kCoachLevels.length; i++)
+                    _RadioTile(
+                      label: kCoachLevels[i],
+                      sub: kCoachLevelHints[i],
+                      on: settings.coachLevel == i + 1,
+                      onTap: () => settings.setCoachLevel(i + 1),
+                    ),
+                  _sectionHead('خێرایی خوێندنەوە'),
+                  Text(
+                    'دیاری دەکات مەدەکان چەند درێژ بن. ئەگەر بە خێرایی دەخوێنیت (حدر) مەدی کورت وەک هەڵە نابینرێت، و ئەگەر بە خاوی (تحقیق) مەدی درێژ وەک هەڵە نابینرێت.',
+                    style: TextStyle(fontSize: 13, height: 1.7, color: _mutedColor(context)),
+                  ),
+                  const SizedBox(height: 6),
+                  _RadioTile(
+                    label: 'خێرا - حدر (مەد 2 دەنگ)',
+                    on: settings.coachSpeed == 0,
+                    onTap: () => settings.setCoachSpeed(0),
+                  ),
+                  _RadioTile(
+                    label: 'ناوەند - تدویر (مەد 4 دەنگ)',
+                    on: settings.coachSpeed == 1,
+                    onTap: () => settings.setCoachSpeed(1),
+                  ),
+                  _RadioTile(
+                    label: 'خاو - تحقیق (مەد 5 تا 6 دەنگ)',
+                    on: settings.coachSpeed == 2,
+                    onTap: () => settings.setCoachSpeed(2),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    'ئاست و خێرایی خۆکارانە پاشەکەوت دەکرێن و لە دەستپێکردنی داهاتووی مامۆستادا بەکاردێن.',
+                    style: TextStyle(fontSize: 12.5, height: 1.7, color: _mutedColor(context)),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+// ============================================================
+//  3) Qibla compass
+// ============================================================
+class QiblaPage extends StatefulWidget {
+  const QiblaPage({super.key});
+
+  @override
+  State<QiblaPage> createState() => _QiblaPageState();
+}
+
+enum _GpsState { waiting, gps, denied, deniedForever, off, error }
+
+class _QiblaPageState extends State<QiblaPage> with WidgetsBindingObserver {
+  StreamSubscription<fc.CompassEvent>? _sub;
+  StreamSubscription<geo.Position>? _gpsSub;
+  double? _heading; // TRUE heading: degrees clockwise from true north
+  bool _noSensor = false;
+  bool _poor = false; // sensor says it is not calibrated / not reliable
+  bool _aligned = false; // facing the Qibla (with hysteresis, no flicker)
+
+  // Phone position (GPS). Used only on this page, never stored or sent.
+  _GpsState _gps = _GpsState.waiting;
+  double? _gpsLat, _gpsLng, _gpsAcc; // acc = metres
+  bool get _hasGps => _gps == _GpsState.gps && _gpsLat != null && _gpsLng != null;
+
+  // Qibla bearing + declination for the position in use, calculated only when
+  // that position changes. Without a GPS fix the chosen city is the position.
+  double? _calcLat, _calcLng;
+  double _q = 0;
+  double? _decl; // null = outside the area the declination model is valid for
+
+  void _ensureCalc(PrayCity c) {
+    final lat = _hasGps ? _gpsLat! : c.lat;
+    final lng = _hasGps ? _gpsLng! : c.lng;
+    if (_calcLat == lat && _calcLng == lng) return;
+    _calcLat = lat;
+    _calcLng = lng;
+    _q = qiblaBearing(lat, lng);
+    _decl = magneticDeclinationOrNull(lat, lng, DateTime.now());
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    locPrefs.ensureLoaded();
+    try {
+      final stream = fc.FlutterCompass.events;
+      if (stream == null) {
+        _noSensor = true;
+      } else {
+        _sub = stream.listen(_onCompass, onError: (Object _) {
+          if (mounted) setState(() => _noSensor = true);
+        });
+      }
+    } catch (_) {
+      _noSensor = true;
+    }
+    _startGps();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _sub?.cancel();
+    _gpsSub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState s) {
+    // Back from the phone settings (GPS switched on / permission granted).
+    if (s == AppLifecycleState.resumed &&
+        (_gps == _GpsState.off ||
+            _gps == _GpsState.deniedForever ||
+            _gps == _GpsState.error)) {
+      _startGps();
+    }
+  }
+
+  void _setGps(_GpsState s) {
+    if (!mounted) return;
+    setState(() {
+      _gps = s;
+      if (s != _GpsState.gps) {
+        _gpsLat = null;
+        _gpsLng = null;
+        _gpsAcc = null;
+      }
+    });
+  }
+
+  Future<void> _startGps() async {
+    await _gpsSub?.cancel();
+    _gpsSub = null;
+    if (!mounted) return;
+    if (_gps != _GpsState.gps) _setGps(_GpsState.waiting);
+    try {
+      if (!await geo.Geolocator.isLocationServiceEnabled()) {
+        _setGps(_GpsState.off);
+        return;
+      }
+      var perm = await geo.Geolocator.checkPermission();
+      if (perm == geo.LocationPermission.denied) {
+        perm = await geo.Geolocator.requestPermission();
+      }
+      if (perm == geo.LocationPermission.deniedForever) {
+        _setGps(_GpsState.deniedForever);
+        return;
+      }
+      if (perm == geo.LocationPermission.denied ||
+          perm == geo.LocationPermission.unableToDetermine) {
+        _setGps(_GpsState.denied);
+        return;
+      }
+      if (!mounted) return;
+      // A new reading arrives after every 20 m of walking; the first one as
+      // soon as the phone has a fix.
+      _gpsSub = geo.Geolocator.getPositionStream(
+        locationSettings: const geo.LocationSettings(
+          accuracy: geo.LocationAccuracy.high,
+          distanceFilter: 20,
+        ),
+      ).listen(_onPosition, onError: (Object _) {
+        _setGps(_GpsState.error);
+      });
+    } catch (_) {
+      _setGps(_GpsState.error);
+    }
+  }
+
+  void _onPosition(geo.Position p) {
+    if (!mounted) return;
+    // A reading worse than 5 km (cell-tower guess) is not trusted: the chosen
+    // city stays in use until a better one arrives.
+    if (p.accuracy > 5000 ||
+        p.latitude.abs() > 90 ||
+        p.longitude.abs() > 180) {
+      return;
+    }
+    setState(() {
+      _gps = _GpsState.gps;
+      _gpsLat = p.latitude;
+      _gpsLng = p.longitude;
+      _gpsAcc = p.accuracy;
+    });
+  }
+
+  Future<void> _onLocationTap() async {
+    try {
+      if (_gps == _GpsState.deniedForever) {
+        await geo.Geolocator.openAppSettings();
+      } else if (_gps == _GpsState.off) {
+        await geo.Geolocator.openLocationSettings();
+      } else {
+        await _startGps();
+      }
+    } catch (_) {}
+  }
+
+  void _onCompass(fc.CompassEvent e) {
+    if (!mounted) return;
+    final raw = e.heading;
+    if (raw == null) {
+      if (_heading == null) setState(() => _noSensor = true);
+      return;
+    }
+    // Heading accuracy when the plugin reports it (iOS: degrees, -1 = invalid).
+    // Read dynamically so an older plugin version without it still works.
+    var poor = false;
+    try {
+      final a = (e as dynamic).accuracy;
+      if (a is num && (a < 0 || a > 30)) poor = true;
+    } catch (_) {}
+    _ensureCalc(locPrefs.c);
+    // The sensor gives MAGNETIC north; the Qibla bearing is from TRUE north.
+    final decl = _decl;
+    final trueHeading = ((raw + (decl ?? 0)) % 360 + 360) % 360;
+    var v = trueHeading;
+    final old = _heading;
+    if (old != null) {
+      // Adaptive smoothing on the circle: steady when still, quick when the
+      // phone really turns.
+      final d = ((v - old + 540) % 360) - 180;
+      final k = (d.abs() / 25).clamp(0.2, 0.7).toDouble();
+      v = (old + d * k + 360) % 360;
+    }
+    final diff = ((_q - v + 540) % 360) - 180;
+    final ad = diff.abs();
+    // Enter at 3 degrees, leave at 5: the green state does not flicker.
+    // Never green when the declination is unknown (outside the supported area).
+    final aligned = !poor && decl != null && (_aligned ? ad <= 5 : ad <= 3);
+    setState(() {
+      _heading = v;
+      _noSensor = false;
+      _poor = poor;
+      _aligned = aligned;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: locPrefs,
+      builder: (context, _) {
+        final c = locPrefs.c;
+        _ensureCalc(c);
+        final q = _q;
+        final km = distanceToKaaba(_calcLat!, _calcLng!);
+        final h = _heading;
+        final decl = _decl;
+        final diff = h == null ? null : (((q - h + 540) % 360) - 180);
+        final aligned = _aligned && decl != null && diff != null && diff.abs() <= 5;
+        final color = aligned ? const Color(0xFF2E9E50) : _gold;
+
+        String status;
+        if (h == null && _noSensor) {
+          status =
+              'ئەم مۆبایلە سێنسەری کۆمپاسی نییە یان کار ناکات. ئاڕاستەی قیبلە بە ڕێژەی باکووری ڕاستەقینە: ${q.round()}°';
+        } else if (h == null) {
+          status = 'چاوەڕێی سێنسەری کۆمپاس...';
+        } else if (_poor) {
+          status =
+              'کۆمپاسەکە ورد نییە. مۆبایلەکە بە شێوەی ٨ لە هەوادا بجوڵێنە و لە ئاسن و مەگنەت دووری بخەرەوە، پاشان دووبارە تاقی بکەرەوە.';
+        } else if (aligned) {
+          status = 'ڕووت لە قیبلەیە ✓';
+        } else {
+          final side = diff! > 0 ? 'بۆ ڕاست' : 'بۆ چەپ';
+          status =
+              'مۆبایلەکە $side بسوڕێنە تا نیشانەی مزگەوت دەگاتە سەرەوە (${diff.abs().round()}° ماوە)';
+          if (decl == null) {
+            status =
+                'ئاگاداری: ئەم شوێنە لە دەرەوەی ناوچەی کوردستانە و لادانی مەگنەتی نەزانراوە، بۆیە کۆمپاسەکە ڕەنگە چەند پلەیەک هەڵە بێت.\n$status';
+          }
+        }
+        final dec = decl == null
+            ? '؟'
+            : '${decl >= 0 ? '+' : ''}${decl.toStringAsFixed(1)}°';
+
+        // Where the phone is: GPS if available, otherwise the chosen city.
+        final String locTitle;
+        final String locSub;
+        if (_hasGps) {
+          locTitle = 'شوێنی ئێستای تۆ (GPS)';
+          locSub = 'ورديی نزیکەی ${(_gpsAcc ?? 0).round()} مەتر';
+        } else {
+          locTitle = c.ku;
+          switch (_gps) {
+            case _GpsState.denied:
+              locSub =
+                  'مۆڵەتی شوێن نەدراوە، شاری هەڵبژێردراو بەکاردێت. کرتە بکە بۆ دووبارە داواکردن';
+            case _GpsState.deniedForever:
+              locSub =
+                  'مۆڵەتی شوێن داخراوە، شاری هەڵبژێردراو بەکاردێت. کرتە بکە بۆ کردنەوەی ڕێکخستنەکان';
+            case _GpsState.off:
+              locSub =
+                  'GPS کوژاوەتەوە، شاری هەڵبژێردراو بەکاردێت. کرتە بکە بۆ کردنەوەی ڕێکخستنەکان';
+            case _GpsState.error:
+              locSub =
+                  'GPS کار ناکات، شاری هەڵبژێردراو بەکاردێت. کرتە بکە بۆ دووبارە تاقیکردنەوە';
+            default:
+              locSub = 'چاوەڕێی GPS... هەتا ئەو کاتە شاری هەڵبژێردراو بەکاردێت';
+          }
+        }
+
+        return Scaffold(
+          appBar: AppBar(
+            title: const Text('قیبلەنما', style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+          body: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 820),
+              child: ListView(
+                padding: const EdgeInsets.fromLTRB(12, 12, 12, 28),
+                children: [
+                  Material(
+                    color: _cardColor(context),
+                    clipBehavior: Clip.antiAlias,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      side: BorderSide(
+                          color: _hasGps
+                              ? const Color(0xFF2E9E50)
+                              : _lineColor(context)),
+                    ),
+                    child: ListTile(
+                      onTap: _hasGps ? null : _onLocationTap,
+                      leading: Icon(
+                          _hasGps ? Icons.my_location : Icons.location_on,
+                          color: _hasGps ? const Color(0xFF2E9E50) : _gold),
+                      title: Text(locTitle,
+                          style: TextStyle(fontSize: 17, color: _inkColor(context))),
+                      subtitle: Text(locSub, style: const TextStyle(fontSize: 12.5)),
+                      // the city is still the fallback (and drives prayer times)
+                      trailing: IconButton(
+                        tooltip: 'گۆڕینی شار',
+                        icon: const Icon(Icons.location_city),
+                        onPressed: () => _pickCity(context),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  Center(
+                    // keeps the whole dial visible on narrow screens
+                    child: FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: SizedBox(
+                        width: 320,
+                        height: 320,
+                        child: Stack(
+                          alignment: Alignment.center,
+                          children: [
+                            // The dial turns against the heading, so N always
+                            // points to TRUE north and the mosque marker sits
+                            // on the Qibla bearing.
+                            Transform.rotate(
+                              angle: -(h ?? 0) * math.pi / 180,
+                              child: SizedBox(
+                                width: 320,
+                                height: 320,
+                                child: Stack(
+                                  alignment: Alignment.center,
+                                  children: [
+                                    CustomPaint(
+                                      size: const Size(320, 320),
+                                      painter: _DialPainter(
+                                        _lineColor(context),
+                                        _mutedColor(context),
+                                        _gold,
+                                      ),
+                                    ),
+                                    Transform.rotate(
+                                      angle: q * math.pi / 180,
+                                      child: SizedBox(
+                                        width: 320,
+                                        height: 320,
+                                        child: Align(
+                                          alignment: Alignment.topCenter,
+                                          child: Padding(
+                                            padding: const EdgeInsets.only(top: 2),
+                                            child: Container(
+                                              width: 40,
+                                              height: 40,
+                                              decoration: BoxDecoration(
+                                                color: color,
+                                                shape: BoxShape.circle,
+                                              ),
+                                              child: const Icon(Icons.mosque,
+                                                  color: Colors.white, size: 22),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                            // Fixed needle = top of the phone. Only drawn when
+                            // a real heading exists: without the sensor it
+                            // would point at a made-up direction.
+                            if (h != null)
+                              Icon(Icons.navigation, size: 72, color: color),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Text(
+                    status,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: aligned ? 20 : 15,
+                      fontWeight: FontWeight.bold,
+                      height: 1.6,
+                      color: aligned
+                          ? const Color(0xFF2E9E50)
+                          : (_poor || decl == null
+                              ? const Color(0xFFC0392B)
+                              : _inkColor(context)),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Row(
+                    children: [
+                      Expanded(child: _InfoBox('ئاڕاستەی قیبلە', '${q.round()}°')),
+                      const SizedBox(width: 10),
+                      Expanded(child: _InfoBox('دووری تا مەککە', '${km.round()} کم')),
+                      const SizedBox(width: 10),
+                      Expanded(child: _InfoBox('لادانی مەگنەتی', dec)),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  Text(
+                    'ئاڕاستەی قیبلە لە شوێنی ڕاستەقینەی مۆبایلەکەتەوە (GPS) هەژمار دەکرێت و لە باکووری ڕاستەقینەوە دەپێورێت، و لادانی مەگنەتی (کۆمپاسی مۆبایل باکووری مەگنەتی نیشان دەدات) چاک دەکرێتەوە. شوێنەکەت هیچ شوێنێک ناپارێزرێت و نانێردرێت. بۆ ئەنجامی باشتر مۆبایلەکە تەخت بگرە و لە ئاسن و ئامێری مەگنەتی دووری بخەرەوە. ئەگەر کۆمپاسەکە ڕاست نەبوو، مۆبایلەکە بە شێوەی ٨ لە هەوادا بجوڵێنە.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 12.5, height: 1.7, color: _mutedColor(context)),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _InfoBox extends StatelessWidget {
+  final String label;
+  final String value;
+  const _InfoBox(this.label, this.value);
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 10),
+      decoration: BoxDecoration(
+        color: _cardColor(context),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: _lineColor(context)),
+      ),
+      child: Column(
+        children: [
+          Text(label, style: TextStyle(fontSize: 12.5, color: _mutedColor(context))),
+          const SizedBox(height: 4),
+          Text(
+            value,
+            textDirection: TextDirection.ltr,
+            style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: _gold),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DialPainter extends CustomPainter {
+  final Color line;
+  final Color ink;
+  final Color gold;
+  const _DialPainter(this.line, this.ink, this.gold);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final c = Offset(size.width / 2, size.height / 2);
+    const r = 112.0;
+    canvas.drawCircle(
+      c,
+      r,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2
+        ..color = line,
+    );
+    final tick = Paint()
+      ..strokeWidth = 1.5
+      ..color = line;
+    for (var i = 0; i < 72; i++) {
+      final a = i * 5 * math.pi / 180;
+      final len = i % 18 == 0 ? 16.0 : (i % 6 == 0 ? 11.0 : 6.0);
+      final p1 = Offset(c.dx + (r - len) * math.sin(a), c.dy - (r - len) * math.cos(a));
+      final p2 = Offset(c.dx + r * math.sin(a), c.dy - r * math.cos(a));
+      canvas.drawLine(p1, p2, tick);
+    }
+    void letter(String t, double deg, Color col, double fs) {
+      final tp = TextPainter(
+        text: TextSpan(
+          text: t,
+          style: TextStyle(color: col, fontSize: fs, fontWeight: FontWeight.bold),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      final a = deg * math.pi / 180;
+      tp.paint(
+        canvas,
+        Offset(
+          c.dx + 86 * math.sin(a) - tp.width / 2,
+          c.dy - 86 * math.cos(a) - tp.height / 2,
+        ),
+      );
+    }
+
+    letter('N', 0, gold, 20);
+    letter('E', 90, ink, 15);
+    letter('S', 180, ink, 15);
+    letter('W', 270, ink, 15);
+  }
+
+  @override
+  bool shouldRepaint(covariant _DialPainter old) =>
+      old.line != line || old.ink != ink || old.gold != gold;
+}
+
+// ============================================================
+//  4) Azkar (morning / evening) with counters
+// ============================================================
+class _Dhikr {
+  final String id;
+  final int count;
+  final String ku;
+  final String? ar; // own text
+  final int surah; // 0 = use [ar]; otherwise the text comes from quran.json
+  final int from;
+  final int to; // 0 = until the end of the surah
+  const _Dhikr(this.id, this.count, this.ku,
+      {this.ar, this.surah = 0, this.from = 1, this.to = 0});
+}
+
+const String _azMulkM =
+    'أَصْبَحْنَا وَأَصْبَحَ الْمُلْكُ لِلَّهِ، وَالْحَمْدُ لِلَّهِ، لَا إِلَٰهَ إِلَّا اللَّهُ وَحْدَهُ لَا شَرِيكَ لَهُ، لَهُ الْمُلْكُ وَلَهُ الْحَمْدُ وَهُوَ عَلَىٰ كُلِّ شَيْءٍ قَدِيرٌ. رَبِّ أَسْأَلُكَ خَيْرَ مَا فِي هَٰذَا الْيَوْمِ وَخَيْرَ مَا بَعْدَهُ، وَأَعُوذُ بِكَ مِنْ شَرِّ مَا فِي هَٰذَا الْيَوْمِ وَشَرِّ مَا بَعْدَهُ. رَبِّ أَعُوذُ بِكَ مِنَ الْكَسَلِ وَسُوءِ الْكِبَرِ. رَبِّ أَعُوذُ بِكَ مِنْ عَذَابٍ فِي النَّارِ وَعَذَابٍ فِي الْقَبْرِ';
+const String _azMulkE =
+    'أَمْسَيْنَا وَأَمْسَى الْمُلْكُ لِلَّهِ، وَالْحَمْدُ لِلَّهِ، لَا إِلَٰهَ إِلَّا اللَّهُ وَحْدَهُ لَا شَرِيكَ لَهُ، لَهُ الْمُلْكُ وَلَهُ الْحَمْدُ وَهُوَ عَلَىٰ كُلِّ شَيْءٍ قَدِيرٌ. رَبِّ أَسْأَلُكَ خَيْرَ مَا فِي هَٰذِهِ اللَّيْلَةِ وَخَيْرَ مَا بَعْدَهَا، وَأَعُوذُ بِكَ مِنْ شَرِّ مَا فِي هَٰذِهِ اللَّيْلَةِ وَشَرِّ مَا بَعْدَهَا. رَبِّ أَعُوذُ بِكَ مِنَ الْكَسَلِ وَسُوءِ الْكِبَرِ. رَبِّ أَعُوذُ بِكَ مِنْ عَذَابٍ فِي النَّارِ وَعَذَابٍ فِي الْقَبْرِ';
+const String _azBikaM =
+    'اللَّهُمَّ بِكَ أَصْبَحْنَا، وَبِكَ أَمْسَيْنَا، وَبِكَ نَحْيَا، وَبِكَ نَمُوتُ، وَإِلَيْكَ النُّشُورُ';
+const String _azBikaE =
+    'اللَّهُمَّ بِكَ أَمْسَيْنَا، وَبِكَ أَصْبَحْنَا، وَبِكَ نَحْيَا، وَبِكَ نَمُوتُ، وَإِلَيْكَ الْمَصِيرُ';
+const String _azIstighfar =
+    'اللَّهُمَّ أَنْتَ رَبِّي لَا إِلَٰهَ إِلَّا أَنْتَ، خَلَقْتَنِي وَأَنَا عَبْدُكَ، وَأَنَا عَلَىٰ عَهْدِكَ وَوَعْدِكَ مَا اسْتَطَعْتُ، أَعُوذُ بِكَ مِنْ شَرِّ مَا صَنَعْتُ، أَبُوءُ لَكَ بِنِعْمَتِكَ عَلَيَّ، وَأَبُوءُ بِذَنْبِي فَاغْفِرْ لِي فَإِنَّهُ لَا يَغْفِرُ الذُّنُوبَ إِلَّا أَنْتَ';
+const String _azBismillah =
+    'بِسْمِ اللَّهِ الَّذِي لَا يَضُرُّ مَعَ اسْمِهِ شَيْءٌ فِي الْأَرْضِ وَلَا فِي السَّمَاءِ وَهُوَ السَّمِيعُ الْعَلِيمُ';
+const String _azRadiytu =
+    'رَضِيتُ بِاللَّهِ رَبًّا، وَبِالْإِسْلَامِ دِينًا، وَبِمُحَمَّدٍ نَبِيًّا';
+const String _azHasbi =
+    'حَسْبِيَ اللَّهُ لَا إِلَٰهَ إِلَّا هُوَ عَلَيْهِ تَوَكَّلْتُ وَهُوَ رَبُّ الْعَرْشِ الْعَظِيمِ';
+const String _azTasbih = 'سُبْحَانَ اللَّهِ وَبِحَمْدِهِ';
+const String _azTahlil =
+    'لَا إِلَٰهَ إِلَّا اللَّهُ وَحْدَهُ لَا شَرِيكَ لَهُ، لَهُ الْمُلْكُ وَلَهُ الْحَمْدُ وَهُوَ عَلَىٰ كُلِّ شَيْءٍ قَدِيرٌ';
+const String _azSalawat = 'اللَّهُمَّ صَلِّ وَسَلِّمْ عَلَىٰ نَبِيِّنَا مُحَمَّدٍ';
+const String _azIstighfar100 = 'أَسْتَغْفِرُ اللَّهَ وَأَتُوبُ إِلَيْهِ';
+const String _azKalimat = 'أَعُوذُ بِكَلِمَاتِ اللَّهِ التَّامَّاتِ مِنْ شَرِّ مَا خَلَقَ';
+const String _azHayy =
+    'يَا حَيُّ يَا قَيُّومُ بِرَحْمَتِكَ أَسْتَغِيثُ، أَصْلِحْ لِي شَأْنِي كُلَّهُ، وَلَا تَكِلْنِي إِلَىٰ نَفْسِي طَرْفَةَ عَيْنٍ';
+
+const String _kuBismillah =
+    'بە ناوی ئەو خوایەی کە لەگەڵ ناوی ئەودا هیچ شتێک زیان ناگەیەنێت، نە لە زەوی و نە لە ئاسمان، و ئەو بیسەر و زانایە.';
+const String _kuRadiytu =
+    'ڕازیم بە خوا وەک پەروەردگار، بە ئیسلام وەک ئایین، و بە موحەممەد (د.خ) وەک پێغەمبەر.';
+const String _kuHasbi =
+    'خوا بەسە بۆم، جگە لەو هیچ پەرستراوێک نییە، پشتم بەو بەستووە و ئەو پەروەردگاری عەرشی مەزنە.';
+
+const List<_Dhikr> _azMorning = [
+  _Dhikr('kursi', 1, 'ئایەتولکورسی (بەقەرە، ئایەتی ٢٥٥)', surah: 2, from: 255, to: 255),
+  _Dhikr('ikhlas', 3, 'سورەتی ئیخلاس', surah: 112),
+  _Dhikr('falaq', 3, 'سورەتی فەلەق', surah: 113),
+  _Dhikr('nas', 3, 'سورەتی ناس', surah: 114),
+  _Dhikr('mulk', 1,
+      'بەیانیمان کرد و هەموو پاشایەتییەک هی خوایە. خوایە، چاکەی ئەم ڕۆژە و دوای ئەویشت لێ دەخوازم و پەنا دەگرم بە تۆ لە خراپەی ئەم ڕۆژە و دوای ئەویش.',
+      ar: _azMulkM),
+  _Dhikr('bika', 1,
+      'خوایە، بە تۆ بەیانیمان کرد و بە تۆ ئێوارەمان کرد، بە تۆ دەژین و بە تۆ دەمرین و بۆ لای تۆیە زیندووبوونەوە.',
+      ar: _azBikaM),
+  _Dhikr('istighfar', 1,
+      'خوایە، تۆ پەروەردگاری منی و جگە لە تۆ هیچ پەرستراوێک نییە. منت دروستکردووە و من بەندەی تۆم و تا توانام لەسەر پەیمانی تۆم. پەنات پێ دەگرم لە خراپەی ئەوەی کردوومە. دان بە نیعمەتی تۆدا دەنێم و دان بە گوناهی خۆمدا دەنێم، کەواتە ببورە، چونکە جگە لە تۆ کەس گوناه نابورێت.',
+      ar: _azIstighfar),
+  _Dhikr('bismillah', 3, _kuBismillah, ar: _azBismillah),
+  _Dhikr('radiytu', 3, _kuRadiytu, ar: _azRadiytu),
+  _Dhikr('hayy', 1,
+      'ئەی زیندووی هەمیشەیی، ئەی پایەدار، بە ڕەحمەتی تۆ هاوار دەکەم. هەموو کارەکانم ڕێکبخە و بۆ چاوتروکانێکیش من مەسپێرە بە خۆم.',
+      ar: _azHayy),
+  _Dhikr('hasbi', 7, _kuHasbi, ar: _azHasbi),
+  _Dhikr('tahlil', 10,
+      'هیچ پەرستراوێک نییە جگە لە خوای تاک و تەنیا، هاوبەشی نییە. پاشایەتی هی ئەو و ستایش هی ئەوە و ئەو بەسەر هەموو شتێکدا تواناداره.',
+      ar: _azTahlil),
+  _Dhikr('tasbih', 100, 'پاکی بۆ خوا و سوپاسی هەر بۆ ئەو.', ar: _azTasbih),
+  _Dhikr('istighfar100', 100, 'داوای لێبوردن لە خوا دەکەم و تۆبە دەکەم بۆی.',
+      ar: _azIstighfar100),
+  _Dhikr('salawat', 10, 'خوایە، ڕەحمەت و سڵاو بنێرە بۆ پێغەمبەرمان موحەممەد.',
+      ar: _azSalawat),
+];
+
+const List<_Dhikr> _azEvening = [
+  _Dhikr('kursi', 1, 'ئایەتولکورسی (بەقەرە، ئایەتی ٢٥٥)', surah: 2, from: 255, to: 255),
+  _Dhikr('ikhlas', 3, 'سورەتی ئیخلاس', surah: 112),
+  _Dhikr('falaq', 3, 'سورەتی فەلەق', surah: 113),
+  _Dhikr('nas', 3, 'سورەتی ناس', surah: 114),
+  _Dhikr('mulk', 1,
+      'ئێوارەمان کرد و هەموو پاشایەتییەک هی خوایە. خوایە، چاکەی ئەم شەوە و دوای ئەویشت لێ دەخوازم و پەنا دەگرم بە تۆ لە خراپەی ئەم شەوە و دوای ئەویش.',
+      ar: _azMulkE),
+  _Dhikr('bika', 1,
+      'خوایە، بە تۆ ئێوارەمان کرد و بە تۆ بەیانیمان کرد، بە تۆ دەژین و بە تۆ دەمرین و بۆ لای تۆیە گەڕانەوە.',
+      ar: _azBikaE),
+  _Dhikr('istighfar', 1,
+      'خوایە، تۆ پەروەردگاری منی و جگە لە تۆ هیچ پەرستراوێک نییە. منت دروستکردووە و من بەندەی تۆم و تا توانام لەسەر پەیمانی تۆم. پەنات پێ دەگرم لە خراپەی ئەوەی کردوومە. دان بە نیعمەتی تۆدا دەنێم و دان بە گوناهی خۆمدا دەنێم، کەواتە ببورە، چونکە جگە لە تۆ کەس گوناه نابورێت.',
+      ar: _azIstighfar),
+  _Dhikr('bismillah', 3, _kuBismillah, ar: _azBismillah),
+  _Dhikr('radiytu', 3, _kuRadiytu, ar: _azRadiytu),
+  _Dhikr('kalimat', 3, 'پەنا دەگرم بە وشە تەواوەکانی خوا لە خراپەی ئەوەی دروستی کردووە.',
+      ar: _azKalimat),
+  _Dhikr('hayy', 1,
+      'ئەی زیندووی هەمیشەیی، ئەی پایەدار، بە ڕەحمەتی تۆ هاوار دەکەم. هەموو کارەکانم ڕێکبخە و بۆ چاوتروکانێکیش من مەسپێرە بە خۆم.',
+      ar: _azHayy),
+  _Dhikr('hasbi', 7, _kuHasbi, ar: _azHasbi),
+  _Dhikr('tahlil', 10,
+      'هیچ پەرستراوێک نییە جگە لە خوای تاک و تەنیا، هاوبەشی نییە. پاشایەتی هی ئەو و ستایش هی ئەوە و ئەو بەسەر هەموو شتێکدا تواناداره.',
+      ar: _azTahlil),
+  _Dhikr('tasbih', 100, 'پاکی بۆ خوا و سوپاسی هەر بۆ ئەو.', ar: _azTasbih),
+  _Dhikr('istighfar100', 100, 'داوای لێبوردن لە خوا دەکەم و تۆبە دەکەم بۆی.',
+      ar: _azIstighfar100),
+  _Dhikr('salawat', 10, 'خوایە، ڕەحمەت و سڵاو بنێرە بۆ پێغەمبەرمان موحەممەد.',
+      ar: _azSalawat),
+];
+
+/// Quran-based azkar take their text from quran.json (loaded once).
+final Map<String, String> _azQuran = <String, String>{};
+final ValueNotifier<int> _azQuranTick = ValueNotifier<int>(0);
+
+/// Counters of today; they start from zero again every new day.
+class AzkarStore extends ChangeNotifier {
+  String _day = '';
+  Map<String, int> done = <String, int>{};
+  bool _loaded = false;
+
+  static String _today() {
+    final n = DateTime.now();
+    return '${n.year}-${_two(n.month)}-${_two(n.day)}';
+  }
+
+  Future<void> ensureLoaded() async {
+    if (_loaded) return;
+    _loaded = true;
+    try {
+      final p = await SharedPreferences.getInstance();
+      final day = p.getString('azDay') ?? '';
+      if (day == _today()) {
+        final s = p.getString('azDone');
+        if (s != null) {
+          final m = jsonDecode(s) as Map<String, dynamic>;
+          done = m.map((k, v) => MapEntry(k, (v as num).toInt()));
+        }
+      }
+      _day = _today();
+      notifyListeners();
+    } catch (_) {
+      _day = _today();
+    }
+  }
+
+  int taps(String key) => done[key] ?? 0;
+
+  void tap(String key, int max) {
+    if (_day != _today()) {
+      _day = _today();
+      done = <String, int>{};
+    }
+    final v = taps(key);
+    if (v >= max) return;
+    done[key] = v + 1;
+    notifyListeners();
+    _save();
+  }
+
+  void reset(String key) {
+    done.remove(key);
+    notifyListeners();
+    _save();
+  }
+
+  void resetSet(String prefix) {
+    done.removeWhere((k, _) => k.startsWith('$prefix:'));
+    notifyListeners();
+    _save();
+  }
+
+  Future<void> _save() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setString('azDay', _day);
+      await p.setString('azDone', jsonEncode(done));
+    } catch (_) {}
+  }
+}
+
+final AzkarStore azkarStore = AzkarStore();
+
+/// On/off switches of the automatic azkar audio (one per set).
+class AzkarPrefs extends ChangeNotifier {
+  bool morning = false;
+  bool evening = false;
+
+  bool on(String set) => set == 'm' ? morning : evening;
+
+  Future<void> load() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      morning = p.getBool('azAutoM') ?? false;
+      evening = p.getBool('azAutoE') ?? false;
+    } catch (_) {}
+  }
+
+  Future<void> setOn(String set, bool v) async {
+    if (set == 'm') {
+      morning = v;
+    } else {
+      evening = v;
+    }
+    notifyListeners();
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setBool(set == 'm' ? 'azAutoM' : 'azAutoE', v);
+    } catch (_) {}
+  }
+}
+
+final AzkarPrefs azkarPrefs = AzkarPrefs();
+
+/// Starts the azkar audio by itself at azkar time:
+///   morning = 15 minutes after sunrise, evening = 45 minutes after Asr
+/// (the times of the prayer card, with the user's minute adjustments).
+/// - app running: a timer starts the audio at that moment;
+/// - app closed: a notification arrives at that moment and tapping it starts
+///   the audio (Android does not let a closed app start playing by itself).
+class AzkarAuto {
+  static const int morningDelayMin = 15; // after sunrise
+  static const int eveningDelayMin = 45; // after Asr
+  static const int _nBase = 7500; // notification ids 7500 .. 7500 + _nDays * 2
+  static const int _nDays = 14;
+  static Timer? _debounce;
+  static Timer? _timer;
+  static DateTime _lastStart = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// When the azkar of [set] ('m' / 'e') start on the day of [date].
+  static DateTime? timeOn(String set, DateTime date) {
+    final day =
+        PrayerCalc.compute(locPrefs.c, date, hanafi: locPrefs.hanafi).list;
+    final t = set == 'm' ? day[1] : day[3]; // sunrise / Asr
+    if (t == null) return null;
+    return t.add(Duration(minutes: set == 'm' ? morningDelayMin : eveningDelayMin));
+  }
+
+  /// The next start of [set] (today or one of the next days), or null.
+  static DateTime? nextTime(String set) {
+    final now = DateTime.now();
+    for (var d = 0; d < 3; d++) {
+      final t = timeOn(set, DateTime(now.year, now.month, now.day + d));
+      if (t != null && t.isAfter(now)) return t;
+    }
+    return null;
+  }
+
+  static void scheduleSoon() {
+    _debounce?.cancel();
+    _debounce = Timer(const Duration(seconds: 1), () {
+      _arm();
+      _notify();
+    });
+  }
+
+  /// In-app timer for the soonest switched-on set.
+  static void _arm() {
+    _timer?.cancel();
+    _timer = null;
+    String? best;
+    DateTime? bestT;
+    for (final set in const ['m', 'e']) {
+      if (!azkarPrefs.on(set)) continue;
+      final t = nextTime(set);
+      if (t != null && (bestT == null || t.isBefore(bestT))) {
+        best = set;
+        bestT = t;
+      }
+    }
+    if (best == null || bestT == null) return;
+    final set = best;
+    _timer = Timer(bestT.difference(DateTime.now()), () {
+      if (azkarPrefs.on(set)) start(set);
+      scheduleSoon(); // arm the next one
+    });
+  }
+
+  /// Notifications for the next days, so a closed app still reminds.
+  static Future<void> _notify() async {
+    if (!AdhanScheduler._ready) return;
+    try {
+      final plugin = AdhanScheduler._plugin;
+      for (var i = 0; i < _nDays * 2; i++) {
+        await plugin.cancel(_nBase + i);
+      }
+      if (!azkarPrefs.morning && !azkarPrefs.evening) return;
+      final exact =
+          await AdhanScheduler._android?.canScheduleExactNotifications() ??
+              false;
+      final now = DateTime.now();
+      for (var d = 0; d < _nDays; d++) {
+        final date = DateTime(now.year, now.month, now.day + d);
+        for (var k = 0; k < 2; k++) {
+          final set = k == 0 ? 'm' : 'e';
+          if (!azkarPrefs.on(set)) continue;
+          final t = timeOn(set, date);
+          if (t == null || !t.isAfter(now)) continue;
+          await plugin.zonedSchedule(
+            _nBase + d * 2 + k,
+            set == 'm' ? 'کاتی زیکری بەیانیان' : 'کاتی زیکری ئێواران',
+            'دایبگرە بۆ خوێندنەوەی زیکرەکان بە دەنگ',
+            tzl.TZDateTime.from(t, tzl.UTC),
+            const fln.NotificationDetails(
+              android: fln.AndroidNotificationDetails(
+                'azkar_v1',
+                'زیکرەکان',
+                channelDescription: 'کاتی زیکری بەیانیان و ئێواران',
+                importance: fln.Importance.high,
+                priority: fln.Priority.high,
+                category: fln.AndroidNotificationCategory.reminder,
+              ),
+            ),
+            androidScheduleMode: exact
+                ? fln.AndroidScheduleMode.exactAllowWhileIdle
+                : fln.AndroidScheduleMode.inexactAllowWhileIdle,
+            uiLocalNotificationDateInterpretation:
+                fln.UILocalNotificationDateInterpretation.absoluteTime,
+            payload: 'azkar:$set',
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint('Azkar schedule failed: $e');
+    }
+  }
+
+  static void onNotification(String? payload) {
+    if (payload == null || !payload.startsWith('azkar:')) return;
+    final set = payload.substring(6);
+    if (set == 'm' || set == 'e') start(set);
+  }
+
+  /// Starts the audio (ignored when it is already playing this set).
+  static void start(String set) {
+    final now = DateTime.now();
+    if (now.difference(_lastStart).inSeconds < 30) return;
+    if (audio.azkar && audio.azkarSet == set) return;
+    _lastStart = now;
+    audio.playAzkar(set);
+  }
+}
+
+class AzkarPage extends StatefulWidget {
+  const AzkarPage({super.key});
+
+  @override
+  State<AzkarPage> createState() => _AzkarPageState();
+}
+
+class _AzkarPageState extends State<AzkarPage> {
+  @override
+  void initState() {
+    super.initState();
+    azkarStore.ensureLoaded();
+    _loadQuran();
+  }
+
+  Future<void> _loadQuran() async {
+    for (final d in [..._azMorning, ..._azEvening]) {
+      if (d.surah == 0 || _azQuran.containsKey(d.id)) continue;
+      try {
+        final list = await loadSurah(d.surah);
+        final parts = <String>[];
+        for (final a in list) {
+          if (a.n >= d.from && (d.to == 0 || a.n <= d.to)) parts.add(a.ar);
+        }
+        _azQuran[d.id] = parts.join(' ');
+        _azQuranTick.value++;
+      } catch (_) {}
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return DefaultTabController(
+      length: 2,
+      initialIndex: DateTime.now().hour < 15 ? 0 : 1,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('زیکرەکان', style: TextStyle(fontWeight: FontWeight.bold)),
+          actions: [
+            Builder(
+              builder: (ctx) => IconButton(
+                tooltip: 'سفرکردنەوەی ژمێرەرەکانی ئەم بەشە',
+                icon: const Icon(Icons.restart_alt),
+                onPressed: () {
+                  final i = DefaultTabController.of(ctx).index;
+                  azkarStore.resetSet(i == 0 ? 'm' : 'e');
+                },
+              ),
+            ),
+          ],
+          bottom: const TabBar(
+            labelColor: Colors.white,
+            unselectedLabelColor: Color(0xB3FFFFFF),
+            indicatorColor: _gold,
+            tabs: [Tab(text: 'بەیانیان'), Tab(text: 'ئێواران')],
+          ),
+        ),
+        body: const TabBarView(
+          children: [
+            _AzkarList(setKey: 'm', items: _azMorning),
+            _AzkarList(setKey: 'e', items: _azEvening),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _AzkarList extends StatelessWidget {
+  final String setKey;
+  final List<_Dhikr> items;
+  const _AzkarList({required this.setKey, required this.items});
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: Listenable.merge(
+          [azkarStore, settings, _azQuranTick, azkarPrefs, audio]),
+      builder: (context, _) => _body(context),
+    );
+  }
+
+  Widget _body(BuildContext context) {
+    var done = 0;
+    for (final d in items) {
+      if (azkarStore.taps('$setKey:${d.id}') >= d.count) done++;
+    }
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 820),
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(12, 12, 12, 28),
+          children: [
+            _AzkarAutoCard(setKey: setKey),
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: _cardColor(context),
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: _lineColor(context)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '$done / ${items.length} زیکر تەواو بوون',
+                    style: TextStyle(
+                      fontSize: 14.5,
+                      fontWeight: FontWeight.bold,
+                      color: _inkColor(context),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: LinearProgressIndicator(
+                      value: items.isEmpty ? 0 : done / items.length,
+                      minHeight: 8,
+                      color: _gold,
+                      backgroundColor: _lineColor(context),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'بۆ ژماردن لەسەر کارتەکە دابگرە. بۆ سفرکردنەوەی یەک زیکر، بەردەوام دایبگرە.',
+                    style: TextStyle(fontSize: 12, color: _mutedColor(context)),
+                  ),
+                ],
+              ),
+            ),
+            for (final d in items) _DhikrCard(setKey: setKey, d: d),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _AzkarAutoCard extends StatelessWidget {
+  final String setKey;
+  const _AzkarAutoCard({required this.setKey});
+
+  @override
+  Widget build(BuildContext context) {
+    final on = azkarPrefs.on(setKey);
+    final next = on ? AzkarAuto.nextTime(setKey) : null;
+    final active = audio.azkar && audio.azkarSet == setKey;
+    final rule = setKey == 'm'
+        ? '${AzkarAuto.morningDelayMin} خولەک دوای خۆرهەڵاتن'
+        : '${AzkarAuto.eveningDelayMin} خولەک دوای نوێژی عەسر';
+    return Container(
+      padding: const EdgeInsets.fromLTRB(14, 8, 8, 8),
+      decoration: BoxDecoration(
+        color: _cardColor(context),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: on ? _gold : _lineColor(context)),
+      ),
+      child: Row(
+        children: [
+          Switch(
+            value: on,
+            onChanged: (v) async {
+              await azkarPrefs.setOn(setKey, v);
+              if (v) await AdhanScheduler.ensurePermissions();
+            },
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'خوێندنەوەی خۆکار بە دەنگ',
+                  style: TextStyle(
+                    fontSize: 14.5,
+                    fontWeight: FontWeight.bold,
+                    color: _inkColor(context),
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  on && next != null
+                      ? '$rule \u2022 داهاتوو: ${_hm(next)}'
+                      : rule,
+                  style: TextStyle(fontSize: 12, color: _mutedColor(context)),
+                ),
+              ],
+            ),
+          ),
+          IconButton(
+            tooltip: active ? 'وەستاندن' : 'ئێستا بیخوێنەرەوە',
+            icon: Icon(active ? Icons.stop_circle : Icons.play_circle,
+                color: _gold, size: 32),
+            onPressed: () =>
+                active ? audio.stop() : audio.playAzkar(setKey),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DhikrCard extends StatelessWidget {
+  final String setKey;
+  final _Dhikr d;
+  const _DhikrCard({required this.setKey, required this.d});
+
+  @override
+  Widget build(BuildContext context) {
+    final key = '$setKey:${d.id}';
+    final taps = azkarStore.taps(key);
+    final finished = taps >= d.count;
+    final left = (d.count - taps).clamp(0, d.count).toInt();
+    final text = d.surah == 0 ? (d.ar ?? '') : (_azQuran[d.id] ?? '');
+    final size = settings.arabicSize.clamp(20, 34).toDouble();
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Material(
+        color: _cardColor(context),
+        clipBehavior: Clip.antiAlias,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(18),
+          side: BorderSide(
+            color: finished ? _green : _lineColor(context),
+            width: finished ? 1.8 : 1,
+          ),
+        ),
+        child: InkWell(
+          onTap: finished ? null : () => azkarStore.tap(key, d.count),
+          onLongPress: () => azkarStore.reset(key),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                if (text.isNotEmpty)
+                  Text(
+                    text,
+                    textAlign: TextAlign.center,
+                    textDirection: TextDirection.rtl,
+                    style: TextStyle(
+                      fontSize: size,
+                      height: 1.9,
+                      color: _inkColor(context),
+                      fontFamilyFallback: _arFonts,
+                    ),
+                  )
+                else
+                  const SizedBox(
+                    height: 32,
+                    child: Center(
+                      child: SizedBox(
+                        width: 22,
+                        height: 22,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                    ),
+                  ),
+                const SizedBox(height: 10),
+                Text(
+                  d.ku,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 13, height: 1.7, color: _mutedColor(context)),
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: finished ? _green : _gold.withAlpha(45),
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            finished ? Icons.check_circle : Icons.touch_app,
+                            size: 18,
+                            color: finished ? Colors.white : _gold,
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            finished ? 'تەواو بوو' : 'ماوە: $left',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              color: finished ? Colors.white : _gold,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const Spacer(),
+                    Text(
+                      '$taps / ${d.count}',
+                      textDirection: TextDirection.ltr,
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                        color: _inkColor(context),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ============================================================
+//  5) Prayer times
+// ============================================================
+// ============================================================
+//  Adhan notifications (Android) - uses PrayerCalc, like the card
+// ============================================================
+
+/// Per prayer (fajr, dhuhr, asr, maghrib, isha):
+/// 0 = off, 1 = silent notification, 2 = notification + phone sound,
+/// 3 = Adhan sound (res/raw/adhan.mp3).
+/// Muezzins. [0] = the Android raw resource (android/app/src/main/res/raw/<name>.mp3,
+/// lower-case letters, digits and _ only), [1] = the name shown in settings.
+/// A muezzin whose mp3 is not in res/raw plays silently, so add the file before releasing.
+const List<List<String>> kMuezzins = [
+  ['adhan_qatami', 'ناصر القطامی'],
+  ['adhan_alafasy', 'مشاری العفاسی'],
+  ['adhan_zahrani', 'منصور الزهرانی'],
+  ['adhan_nafees', 'أحمد النفيس'],
+  ['adhan_islam', 'ئیسلام صبحی'],
+  ['adhan_raad', 'ڕەعد محمد کوردی'],
+  ['adhan_ramazan', 'مامۆستا ڕەمەزان شکور'],
+  ['adhan_fattah', 'عبدالرحمن فتاح'],
+  ['adhan_omar', 'عمر عبدالله'],
+  ['adhan_barzanji', 'مامۆستا عبدالحمید بەرزنجی'],
+  ['adhan_yaqub', 'یعقوب محمد'],
+  ['adhan_wadee', 'ودیع الیمنی'],
+];
+
+String _muezzinName(String raw) {
+  for (final m in kMuezzins) {
+    if (m[0] == raw) return m[1];
+  }
+  return kMuezzins.first[1];
+}
+
+String _muezzinChannel(String raw) => 'adhan_sound_${raw}_v1';
+
+class AdhanPrefs extends ChangeNotifier {
+  final List<int> mode = [0, 0, 0, 0, 0];
+  String muezzin = kMuezzins.first[0];
+
+  Future<void> setMuezzin(String raw) async {
+    muezzin = raw;
+    notifyListeners();
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setString('adhanMuezzin', raw);
+    } catch (_) {}
+  }
+
+  Future<void> load() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      final mz = p.getString('adhanMuezzin') ?? kMuezzins.first[0];
+      muezzin = kMuezzins.any((m) => m[0] == mz) ? mz : kMuezzins.first[0];
+      for (var i = 0; i < 5; i++) {
+        mode[i] = (p.getInt('adhanMode$i') ?? 0).clamp(0, 3).toInt();
+      }
+    } catch (_) {}
+  }
+
+  Future<void> setMode(int slot, int v) async {
+    mode[slot] = v;
+    notifyListeners();
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setInt('adhanMode$slot', v);
+    } catch (_) {}
+  }
+}
+
+final AdhanPrefs adhanPrefs = AdhanPrefs();
+
+IconData _adhanIcon(int mode) {
+  switch (mode) {
+    case 1:
+      return Icons.notifications_none;
+    case 2:
+      return Icons.notifications_active;
+    case 3:
+      return Icons.volume_up;
+    default:
+      return Icons.notifications_off_outlined;
+  }
+}
+
+Future<void> _pickAdhanMode(BuildContext context, int slot) async {
+  const labels = [
+    'کوژاوە',
+    'ئاگادارکردنەوەی بێدەنگ',
+    'ئاگادارکردنەوە + دەنگی مۆبایل',
+    'دەنگی بانگ',
+  ];
+  final name = kPrayerShort[const [0, 2, 3, 4, 5][slot]];
+  final v = await showModalBottomSheet<int>(
+    context: context,
+    showDragHandle: true,
+    builder: (ctx) => SafeArea(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Text('بانگی $name',
+                style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          ),
+          for (var m = 0; m < 4; m++)
+            ListTile(
+              leading: Icon(_adhanIcon(m), color: _gold),
+              title: Text(labels[m]),
+              trailing: adhanPrefs.mode[slot] == m
+                  ? const Icon(Icons.check, color: _green)
+                  : null,
+              onTap: () => Navigator.of(ctx).pop(m),
+            ),
+        ],
+      ),
+    ),
+  );
+  if (v == null) return;
+  await adhanPrefs.setMode(slot, v);
+  if (v != 0) await AdhanScheduler.ensurePermissions();
+}
+
+class _AdhanLifecycle with WidgetsBindingObserver {
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // date / time zone / settings may have changed while the app was away
+    if (state == AppLifecycleState.resumed) {
+      AdhanScheduler.scheduleSoon();
+      AzkarAuto.scheduleSoon();
+    }
+  }
+}
+
+class _AdhanPermButton extends StatelessWidget {
+  const _AdhanPermButton();
+
+  @override
+  Widget build(BuildContext c) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: [
+          FilledButton.tonal(
+            onPressed: () => AdhanScheduler.ensurePermissions(),
+            child: const Text('ڕێگەپێدان'),
+          ),
+          FilledButton.tonal(
+            onPressed: () async {
+              await AdhanScheduler.testIn1Min();
+              if (c.mounted) {
+                ScaffoldMessenger.of(c).showSnackBar(const SnackBar(
+                    content: Text(
+                        'دوای ١ خولەک بانگ دێت. ئەپەکە دابخە و چاوەڕێبە.')));
+              }
+            },
+            child: const Text('تاقیکردنەوە دوای ١ خولەک'),
+          ),
+          FilledButton.tonal(
+            onPressed: () async {
+              final r = await AdhanScheduler.diagnose();
+              if (!c.mounted) return;
+              showDialog<void>(
+                context: c,
+                builder: (_) => AlertDialog(
+                  title: const Text('پشکنینی بانگ'),
+                  content: SingleChildScrollView(
+                    child: Directionality(
+                        textDirection: TextDirection.rtl, child: SelectableText(r)),
+                  ),
+                ),
+              );
+            },
+            child: const Text('پشکنین'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class AdhanScheduler {
+  static final fln.FlutterLocalNotificationsPlugin _plugin =
+      fln.FlutterLocalNotificationsPlugin();
+  static bool _ready = false;
+  static bool _busy = false;
+  static bool _again = false;
+  static Timer? _debounce;
+  static String lastError = '';
+
+  static const int _base = 7000; // notification ids 7000 .. 7000 + _days * 5
+  static const int _days = 14; // rolling window, rebuilt on every app start
+  static const List<int> _idx = [0, 2, 3, 4, 5]; // PrayerDay.list positions
+  static const List<String> _chIds = [
+    'adhan_silent_v1',
+    'adhan_default_v1',
+    'adhan_sound_v1',
+  ];
+
+  static fln.AndroidFlutterLocalNotificationsPlugin? get _android =>
+      _plugin.resolvePlatformSpecificImplementation<
+          fln.AndroidFlutterLocalNotificationsPlugin>();
+
+  static Future<void> init() async {
+    if (_ready || !Platform.isAndroid) return;
+    try {
+      tzdata.initializeTimeZones();
+      await _plugin.initialize(
+        const fln.InitializationSettings(
+          android: fln.AndroidInitializationSettings('@mipmap/ic_launcher'),
+        ),
+        // tapping the azkar notification starts the azkar audio
+        onDidReceiveNotificationResponse: (fln.NotificationResponse r) =>
+            AzkarAuto.onNotification(r.payload),
+      );
+      final a = _android;
+      if (a != null) {
+        await a.createNotificationChannel(const fln.AndroidNotificationChannel(
+          'azkar_v1',
+          'زیکرەکان',
+          description: 'کاتی زیکری بەیانیان و ئێواران',
+          importance: fln.Importance.high,
+        ));
+        await a.createNotificationChannel(const fln.AndroidNotificationChannel(
+          'adhan_silent_v1',
+          'بانگ (بێدەنگ)',
+          description: 'کاتی نوێژ، بێ دەنگ',
+          importance: fln.Importance.high,
+          playSound: false,
+          enableVibration: false,
+        ));
+        await a.createNotificationChannel(const fln.AndroidNotificationChannel(
+          'adhan_default_v1',
+          'بانگ (دەنگی مۆبایل)',
+          description: 'کاتی نوێژ، بە دەنگی ئاسایی مۆبایل',
+          importance: fln.Importance.high,
+        ));
+        // one channel per muezzin: an Android channel's sound cannot be changed later
+        for (final m in kMuezzins) {
+          await a.createNotificationChannel(fln.AndroidNotificationChannel(
+            _muezzinChannel(m[0]),
+            'بانگ • ${m[1]}',
+            description: 'کاتی نوێژ، بە دەنگی بانگ',
+            importance: fln.Importance.max,
+            sound: fln.RawResourceAndroidNotificationSound(m[0]),
+            audioAttributesUsage: fln.AudioAttributesUsage.alarm,
+          ));
+        }
+      }
+      _ready = true;
+      // the app was started by tapping the azkar notification
+      try {
+        final d = await _plugin.getNotificationAppLaunchDetails();
+        if (d?.didNotificationLaunchApp == true) {
+          final payload = d!.notificationResponse?.payload;
+          Future<void>.delayed(
+              const Duration(seconds: 2), () => AzkarAuto.onNotification(payload));
+        }
+      } catch (_) {}
+    } catch (e) {
+      lastError = 'init: $e';
+      debugPrint('Adhan init failed: $e');
+    }
+  }
+
+  static fln.NotificationDetails _soundDetails(String raw) =>
+      fln.NotificationDetails(
+        android: fln.AndroidNotificationDetails(
+          _muezzinChannel(raw),
+          'بانگ',
+          channelDescription: 'کاتی نوێژ',
+          importance: fln.Importance.max,
+          priority: fln.Priority.high,
+          sound: fln.RawResourceAndroidNotificationSound(raw),
+          category: fln.AndroidNotificationCategory.alarm,
+          audioAttributesUsage: fln.AudioAttributesUsage.alarm,
+        ),
+      );
+
+  /// Shows a notification right now with the chosen muezzin.
+  static Future<void> testNow({String? raw}) async {
+    if (!_ready) await init();
+    try {
+      final r = raw ?? adhanPrefs.muezzin;
+      await _plugin.show(6990, 'تاقیکردنەوەی بانگ', _muezzinName(r),
+          _soundDetails(r));
+    } catch (e) {
+      lastError = 'test: $e';
+    }
+  }
+
+  /// Schedules a real adhan notification 60 s from now through the SAME path
+  /// as the daily prayers (alarm + channel + sound). Close the app and wait.
+  static Future<void> testIn1Min() async {
+    if (!_ready) await init();
+    final raw = adhanPrefs.muezzin;
+    final t = DateTime.now().add(const Duration(seconds: 60));
+    final exact = await _android?.canScheduleExactNotifications() ?? false;
+    try {
+      await _plugin.zonedSchedule(
+        6991,
+        'تاقیکردنەوەی بانگ (١ خولەک)',
+        _muezzinName(raw),
+        tzl.TZDateTime.from(t, tzl.UTC),
+        _soundDetails(raw),
+        androidScheduleMode: exact
+            ? fln.AndroidScheduleMode.exactAllowWhileIdle
+            : fln.AndroidScheduleMode.inexactAllowWhileIdle,
+        uiLocalNotificationDateInterpretation:
+            fln.UILocalNotificationDateInterpretation.absoluteTime,
+      );
+    } catch (e) {
+      lastError = 'test1min: $e';
+    }
+  }
+
+  /// A plain-text report of everything that decides whether the adhan fires.
+  static Future<String> diagnose() async {
+    final b = StringBuffer();
+    try {
+      if (!_ready) await init();
+      final a = _android;
+      b.writeln('init: ${_ready ? "OK" : "FAILED"}');
+      final en = await a?.areNotificationsEnabled();
+      b.writeln('ئاگادارکردنەوە ڕێگەپێدراوە: ${en == true ? "بەڵێ" : "نەخێر !!"}');
+      final ex = await a?.canScheduleExactNotifications();
+      b.writeln('ئەلارمی ورد (exact): ${ex == true ? "بەڵێ" : "نەخێر !!"}');
+      b.writeln('مۆدی ٥ بانگەکە: ${adhanPrefs.mode.join(",")}');
+      b.writeln('بانگچی: ${adhanPrefs.muezzin}');
+      final pend = await _plugin.pendingNotificationRequests();
+      final mine =
+          pend.where((r) => r.id >= _base && r.id < _base + _days * 5).length;
+      b.writeln('ئاگادارکردنەوەی دانراو: $mine');
+      final list = pend
+          .where((r) => r.id >= _base && r.id < _base + _days * 5)
+          .toList()
+        ..sort((x, y) => x.id.compareTo(y.id));
+      for (final r in list.take(3)) {
+        b.writeln('  #${r.id}: ${r.title} | ${r.body}');
+      }
+      final now = DateTime.now();
+      b.writeln('کاتی ئێستا: ${_hm(now)}  (${now.timeZoneName})');
+      final chs = await a?.getNotificationChannels();
+      if (chs != null) {
+        for (final ch in chs) {
+          if (ch.id == _muezzinChannel(adhanPrefs.muezzin) ||
+              _chIds.contains(ch.id)) {
+            b.writeln('channel ${ch.id}: importance=${ch.importance.value}'
+                '${ch.importance == fln.Importance.none ? "  (داخراوە !!)" : ""}');
+          }
+        }
+      }
+    } catch (e) {
+      b.writeln('diagnose error: $e');
+    }
+    b.writeln('کۆتا هەڵە: ${lastError.isEmpty ? "-" : lastError}');
+    return b.toString();
+  }
+
+  /// Only the notification permission (no settings screen is opened).
+  static Future<void> ensureNotificationPermission() async {
+    try {
+      if (!_ready) await init();
+      final a = _android;
+      if (a == null) return;
+      if (!(await a.areNotificationsEnabled() ?? true)) {
+        await a.requestNotificationsPermission();
+      }
+    } catch (e) {
+      lastError = 'perm: $e';
+    }
+  }
+
+  /// Notification permission (Android 13+) and exact alarms (Android 12+).
+  static Future<bool> ensurePermissions() async {
+    if (!_ready) await init();
+    final a = _android;
+    if (!_ready || a == null) return false;
+    var ok = true;
+    try {
+      ok = await a.requestNotificationsPermission() ?? true;
+      if (!(await a.canScheduleExactNotifications() ?? false)) {
+        await a.requestExactAlarmsPermission();
+      }
+    } catch (e) {
+      debugPrint('Adhan permissions failed: $e');
+    }
+    scheduleSoon();
+    return ok;
+  }
+
+  /// Rebuilds all alarms a second from now (many changes arrive together).
+  static void scheduleSoon() {
+    _debounce?.cancel();
+    _debounce = Timer(const Duration(seconds: 1), () {
+      _run();
+    });
+  }
+
+  static Future<void> _run() async {
+    if (!_ready) return;
+    if (_busy) {
+      _again = true;
+      return;
+    }
+    _busy = true;
+    try {
+      do {
+        _again = false;
+        await _reschedule();
+      } while (_again);
+    } catch (e) {
+      lastError = 'schedule: $e';
+      debugPrint('Adhan schedule failed: $e');
+    } finally {
+      _busy = false;
+    }
+  }
+
+  static Future<void> _reschedule() async {
+    final exact = await _android?.canScheduleExactNotifications() ?? false;
+    final sm = exact
+        ? fln.AndroidScheduleMode.exactAllowWhileIdle
+        : fln.AndroidScheduleMode.inexactAllowWhileIdle;
+    if (!exact) lastError = 'exact alarms NOT allowed (adhan can be late/missed)';
+    for (var i = 0; i < _days * 5; i++) {
+      await _plugin.cancel(_base + i);
+    }
+    final c = locPrefs.c;
+    final hanafi = locPrefs.hanafi;
+    final now = DateTime.now();
+    for (var d = 0; d < _days; d++) {
+      final date = DateTime(now.year, now.month, now.day + d);
+      List<DateTime?> day;
+      try {
+        day = PrayerCalc.compute(c, date, hanafi: hanafi).list;
+      } catch (e) {
+        lastError = 'compute: $e';
+        continue;
+      }
+      for (var k = 0; k < 5; k++) {
+        final m = adhanPrefs.mode[k];
+        final t = day[_idx[k]];
+        if (m == 0 || t == null || !t.isAfter(now)) continue;
+        final name = kPrayerShort[_idx[k]];
+        Future<void> go(fln.AndroidScheduleMode mode) => _plugin.zonedSchedule(
+          _base + d * 5 + k,
+          'کاتی نوێژی $name',
+          '${c.ku} \u2022 ${_hm(t)}',
+          tzl.TZDateTime.from(t, tzl.UTC), // an exact instant, zone-proof
+          fln.NotificationDetails(
+            android: fln.AndroidNotificationDetails(
+              m == 3 ? _muezzinChannel(adhanPrefs.muezzin) : _chIds[m - 1],
+              'بانگ',
+              channelDescription: 'کاتی نوێژ',
+              importance: m == 3 ? fln.Importance.max : fln.Importance.high,
+              priority: fln.Priority.high,
+              playSound: m != 1,
+              sound: m == 3
+                  ? fln.RawResourceAndroidNotificationSound(adhanPrefs.muezzin)
+                  : null,
+              enableVibration: m != 1,
+              category: m == 3
+                  ? fln.AndroidNotificationCategory.alarm
+                  : fln.AndroidNotificationCategory.reminder,
+              audioAttributesUsage: m == 3
+                  ? fln.AudioAttributesUsage.alarm
+                  : fln.AudioAttributesUsage.notification,
+            ),
+          ),
+          androidScheduleMode: mode,
+          uiLocalNotificationDateInterpretation:
+              fln.UILocalNotificationDateInterpretation.absoluteTime,
+        );
+        try {
+          await go(sm);
+        } catch (e) {
+          // exact alarms refused -> still schedule (inexact) instead of losing everything
+          try {
+            await go(fln.AndroidScheduleMode.inexactAllowWhileIdle);
+          } catch (e2) {
+            lastError = 'schedule: $e2';
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Bottom sheet: move each prayer time earlier / later by whole minutes.
+Future<void> _editPrayerOffsets(BuildContext context) {
+  String lbl(int v) => v == 0 ? '0' : (v > 0 ? '+$v' : '$v');
+  return showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    showDragHandle: true,
+    builder: (ctx) => ListenableBuilder(
+      listenable: locPrefs,
+      builder: (ctx, _) => SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('ڕێکخستنی خولەکەکان',
+                  style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      color: _inkColor(ctx))),
+              const SizedBox(height: 6),
+              Text(
+                'هەر کاتێک بە خولەک پێش یان دوا بخە (لە -٣٠ تا +٣٠) بۆ ئەوەی لەگەڵ ڕۆژمێری مزگەوتی ناوچەکەت یەک بگرێتەوە. بانگی ئاگادارکەرەوەکانیش هەمان گۆڕانکاری وەردەگرن.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                    fontSize: 12.5, height: 1.7, color: _mutedColor(ctx)),
+              ),
+              const SizedBox(height: 8),
+              for (var i = 0; i < 6; i++)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 2),
+                  child: Row(
+                    children: [
+                      Icon(kPrayerIcons[i], color: _gold, size: 22),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(kPrayerShort[i],
+                            style: TextStyle(
+                                fontSize: 16, color: _inkColor(ctx))),
+                      ),
+                      Directionality(
+                        textDirection: TextDirection.ltr,
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            IconButton(
+                              onPressed: locPrefs.offset[i] <= -30
+                                  ? null
+                                  : () => locPrefs.setOffset(
+                                      i, locPrefs.offset[i] - 1),
+                              icon: const Icon(Icons.remove_circle_outline),
+                            ),
+                            SizedBox(
+                              width: 48,
+                              child: Text(
+                                lbl(locPrefs.offset[i]),
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.bold,
+                                  color: locPrefs.offset[i] == 0
+                                      ? _inkColor(ctx)
+                                      : _gold,
+                                ),
+                              ),
+                            ),
+                            IconButton(
+                              onPressed: locPrefs.offset[i] >= 30
+                                  ? null
+                                  : () => locPrefs.setOffset(
+                                      i, locPrefs.offset[i] + 1),
+                              icon: const Icon(Icons.add_circle_outline),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              const SizedBox(height: 6),
+              TextButton.icon(
+                onPressed: locPrefs.hasOffsets ? locPrefs.resetOffsets : null,
+                icon: const Icon(Icons.restart_alt),
+                label: const Text('گەڕاندنەوە بۆ بنەڕەت'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+// ============================================================
+//  Prayer Times screen - dark emerald / gold Islamic design.
+//  UI only: every number comes from PrayerCalc / locPrefs / adhanPrefs
+//  exactly as before (same calculations, same city / Adhan / offset
+//  actions, same 1-second countdown). Nothing here is a fixed time.
+// ============================================================
+const Color _prEmerald = Color(0xFF0A3A2C);
+const Color _prEmeraldMid = Color(0xFF0F5640);
+const Color _prCream = Color(0xFFFBF6E8);
+const Color _prCreamDeep = Color(0xFFF3EBD6);
+const Color _prGold = Color(0xFFC9972B);
+const Color _prGoldDark = Color(0xFF9A6B0F);
+const Color _prGoldLight = Color(0xFFF3D98A);
+const Color _prInk = Color(0xFF0B3B2D);
+const Color _prMuted = Color(0xFF5F6F65);
+
+/// One consistent icon family for the six rows (dawn, sunrise, noon, afternoon,
+/// sunset, night).
+const List<IconData> _prIcons = [
+  Icons.wb_twilight_rounded,
+  Icons.wb_sunny_rounded,
+  Icons.light_mode_rounded,
+  Icons.wb_sunny_outlined,
+  Icons.nights_stay_rounded,
+  Icons.nightlight_round,
+];
+
+/// Emerald page background that melts into cream, with a faint gold star
+/// lattice at the top and gold corner ornaments at the bottom.
+class _PrayBackdrop extends StatelessWidget {
+  const _PrayBackdrop();
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        const DecoratedBox(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [
+                _prEmerald,
+                _prEmeraldMid,
+                Color(0xFFE6E2CC),
+                _prCream,
+                _prCreamDeep,
+              ],
+              stops: [0.0, 0.22, 0.46, 0.62, 1.0],
+            ),
+          ),
+        ),
+        const RepaintBoundary(
+          child: CustomPaint(painter: _PrayPatternPainter()),
+        ),
+        const IgnorePointer(
+          child: Align(
+            alignment: Alignment.bottomLeft,
+            child: SizedBox(
+              width: 92,
+              height: 92,
+              child: CustomPaint(painter: _PrayCornerPainter()),
+            ),
+          ),
+        ),
+        IgnorePointer(
+          child: Align(
+            alignment: Alignment.bottomRight,
+            child: Transform.scale(
+              scaleX: -1,
+              child: const SizedBox(
+                width: 92,
+                height: 92,
+                child: CustomPaint(painter: _PrayCornerPainter()),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Eight-pointed star lattice (two overlapping squares), fading out downwards.
+class _PrayPatternPainter extends CustomPainter {
+  const _PrayPatternPainter();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const step = 46.0;
+    final fadeH = size.height * 0.5;
+    final p = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 0.8;
+    for (var row = 0; row * step < fadeH; row++) {
+      final cy = row * step + step / 2;
+      final a = (1 - cy / fadeH).clamp(0.0, 1.0) * 0.17;
+      p.color = const Color(0xFFE8C45A).withAlpha((a * 255).round());
+      for (var col = 0; col * step < size.width + step; col++) {
+        final cx = col * step + (row.isOdd ? step / 2 : 0.0);
+        const r = step * 0.46;
+        for (final off in const [0.0, math.pi / 4]) {
+          final path = Path();
+          for (var k = 0; k < 4; k++) {
+            final ang = off + k * math.pi / 2 + math.pi / 4;
+            final x = cx + r * math.cos(ang);
+            final y = cy + r * math.sin(ang);
+            if (k == 0) {
+              path.moveTo(x, y);
+            } else {
+              path.lineTo(x, y);
+            }
+          }
+          path.close();
+          canvas.drawPath(path, p);
+        }
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+/// Gold concentric rings in a bottom corner (the widget is mirrored for the
+/// other side).
+class _PrayCornerPainter extends CustomPainter {
+  const _PrayCornerPainter();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final c = Offset(0, size.height);
+    final p = Paint()..style = PaintingStyle.stroke;
+    for (var i = 0; i < 5; i++) {
+      p.strokeWidth = i.isEven ? 1.6 : 0.9;
+      p.color = _prGold.withAlpha(150 - i * 22);
+      canvas.drawCircle(c, 18.0 + i * 15, p);
+    }
+    final star = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.2
+      ..color = _prGold.withAlpha(170);
+    for (final off in const [0.0, math.pi / 4]) {
+      final path = Path();
+      for (var k = 0; k < 4; k++) {
+        final ang = off + k * math.pi / 2;
+        final pt = c + Offset(math.cos(ang), math.sin(ang)) * 30;
+        if (k == 0) {
+          path.moveTo(pt.dx, pt.dy);
+        } else {
+          path.lineTo(pt.dx, pt.dy);
+        }
+      }
+      path.close();
+      canvas.drawPath(path, star);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+/// Hanging golden lantern with a warm glow.
+class _PrayLanternPainter extends CustomPainter {
+  const _PrayLanternPainter();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final w = size.width, h = size.height, cx = w / 2;
+    final glowC = Offset(cx, h * 0.52);
+    canvas.drawCircle(
+      glowC,
+      w * 1.0,
+      Paint()
+        ..shader = const RadialGradient(
+          colors: [Color(0x66FFD76A), Color(0x00FFD76A)],
+        ).createShader(Rect.fromCircle(center: glowC, radius: w * 1.0)),
+    );
+    final line = Paint()
+      ..color = _prGoldLight.withAlpha(210)
+      ..strokeWidth = 1.4;
+    canvas.drawLine(Offset(cx, 0), Offset(cx, h * 0.16), line);
+    final goldFill = Paint()
+      ..shader = const LinearGradient(
+        colors: [Color(0xFFF6DB84), Color(0xFFC9972B), Color(0xFFF6DB84)],
+      ).createShader(Rect.fromLTWH(0, 0, w, h));
+    final cap = Path()
+      ..moveTo(cx - w * 0.10, h * 0.16)
+      ..lineTo(cx + w * 0.10, h * 0.16)
+      ..lineTo(cx + w * 0.28, h * 0.27)
+      ..lineTo(cx - w * 0.28, h * 0.27)
+      ..close();
+    canvas.drawPath(cap, goldFill);
+    final body = RRect.fromRectAndRadius(
+      Rect.fromLTWH(w * 0.10, h * 0.27, w * 0.80, h * 0.50),
+      Radius.circular(w * 0.22),
+    );
+    canvas.drawRRect(
+      body,
+      Paint()
+        ..shader = const LinearGradient(
+          colors: [Color(0xFFFFE9A8), Color(0xFFFFC94A), Color(0xFFFFE9A8)],
+        ).createShader(body.outerRect),
+    );
+    final frame = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.6
+      ..color = _prGold;
+    canvas.drawRRect(body, frame);
+    canvas.drawLine(Offset(cx - w * 0.17, h * 0.29),
+        Offset(cx - w * 0.17, h * 0.75), frame..strokeWidth = 1.0);
+    canvas.drawLine(Offset(cx + w * 0.17, h * 0.29),
+        Offset(cx + w * 0.17, h * 0.75), frame);
+    final cone = Path()
+      ..moveTo(w * 0.18, h * 0.77)
+      ..lineTo(w * 0.82, h * 0.77)
+      ..lineTo(cx, h * 0.93)
+      ..close();
+    canvas.drawPath(cone, goldFill);
+    canvas.drawCircle(Offset(cx, h * 0.955), w * 0.07, goldFill);
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+/// Cream ogee-arch panel with a double gold outline (holds the countdown).
+class _PrayArchPainter extends CustomPainter {
+  const _PrayArchPainter();
+
+  static Path _arch(Rect r) {
+    final w = r.width, h = r.height;
+    double x(double f) => r.left + w * f;
+    double y(double f) => r.top + h * f;
+    return Path()
+      ..moveTo(x(0), y(1))
+      ..lineTo(x(0), y(0.50))
+      ..quadraticBezierTo(x(0), y(0.34), x(0.14), y(0.31))
+      ..cubicTo(x(0.30), y(0.28), x(0.42), y(0.16), x(0.5), y(0))
+      ..cubicTo(x(0.58), y(0.16), x(0.70), y(0.28), x(0.86), y(0.31))
+      ..quadraticBezierTo(x(1), y(0.34), x(1), y(0.50))
+      ..lineTo(x(1), y(1))
+      ..close();
+  }
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final outer = Offset.zero & size;
+    final path = _arch(outer.deflate(2));
+    canvas.drawShadow(path, const Color(0xFF000000), 8, false);
+    canvas.drawPath(
+      path,
+      Paint()
+        ..shader = const LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [Color(0xFFFFFBEF), _prCream, _prCreamDeep],
+        ).createShader(outer),
+    );
+    final gold = Paint()
+      ..style = PaintingStyle.stroke
+      ..shader = const LinearGradient(
+        begin: Alignment.topLeft,
+        end: Alignment.bottomRight,
+        colors: [_prGoldLight, _prGold, _prGoldLight],
+      ).createShader(outer);
+    canvas.drawPath(path, gold..strokeWidth = 2.6);
+    canvas.drawPath(_arch(outer.deflate(7)), gold..strokeWidth = 0.9);
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+/// Eight-pointed rosette behind every prayer icon.
+class _PrayStarPainter extends CustomPainter {
+  const _PrayStarPainter();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final c = size.center(Offset.zero);
+    final big = size.width / 2 - 0.5;
+    final small = big * 0.84;
+    final path = Path();
+    for (var k = 0; k < 16; k++) {
+      final ang = k * math.pi / 8;
+      final r = k.isEven ? big : small;
+      final pt = c + Offset(math.cos(ang), math.sin(ang)) * r;
+      if (k == 0) {
+        path.moveTo(pt.dx, pt.dy);
+      } else {
+        path.lineTo(pt.dx, pt.dy);
+      }
+    }
+    path.close();
+    canvas.drawPath(
+      path,
+      Paint()
+        ..shader = const LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [Color(0xFFFFF6DA), Color(0xFFF6E3A6)],
+        ).createShader(Offset.zero & size),
+    );
+    canvas.drawPath(
+      path,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 0.9
+        ..color = _prGold.withAlpha(140),
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+
+class PrayerTimesPage extends StatefulWidget {
+  const PrayerTimesPage({super.key});
+
+  @override
+  State<PrayerTimesPage> createState() => _PrayerTimesPageState();
+}
+
+class _PrayerTimesPageState extends State<PrayerTimesPage> {
+  Timer? _t;
+
+  @override
+  void initState() {
+    super.initState();
+    locPrefs.ensureLoaded();
+    _t = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _t?.cancel();
+    super.dispose();
+  }
+
+  // ---------- small building blocks ----------
+
+  /// Cream card with a thin gold line and a soft shadow. [next] = golden
+  /// highlight for the upcoming prayer.
+  BoxDecoration _cardDeco(double s, {bool next = false, double radius = 20}) {
+    return BoxDecoration(
+      borderRadius: BorderRadius.circular(radius * s),
+      gradient: LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: next
+            ? const [Color(0xFFFFF3CE), Color(0xFFF7DE92)]
+            : const [Color(0xFFFFFDF6), _prCream],
+      ),
+      border: Border.all(
+        color: next ? _prGold : _prGold.withAlpha(95),
+        width: next ? 1.8 : 1.0,
+      ),
+      boxShadow: [
+        BoxShadow(
+          color: next ? _prGold.withAlpha(90) : const Color(0x26000000),
+          blurRadius: next ? 12 : 8,
+          offset: const Offset(0, 3),
+        ),
+      ],
+    );
+  }
+
+  Widget _chip(double s, String text, {required bool upcoming}) {
+    final border = upcoming ? _prGold : const Color(0xFF2E9E62);
+    return Container(
+      margin: EdgeInsetsDirectional.only(start: 8 * s),
+      padding: EdgeInsets.symmetric(horizontal: 9 * s, vertical: 2.5 * s),
+      decoration: BoxDecoration(
+        color: upcoming ? const Color(0xFFFFF9E6) : const Color(0xFFDDF1E5),
+        borderRadius: BorderRadius.circular(14 * s),
+        border: Border.all(color: border, width: 1.2),
+      ),
+      child: Text(
+        text,
+        style: TextStyle(
+          fontSize: 11.5 * s,
+          fontWeight: FontWeight.bold,
+          color: upcoming ? _prGoldDark : const Color(0xFF1B6E43),
+        ),
+      ),
+    );
+  }
+
+  Widget _lantern(double s) => Expanded(
+        flex: 13,
+        child: Align(
+          alignment: Alignment.topCenter,
+          child: SizedBox(
+            width: 34 * s,
+            height: 92 * s,
+            child: const CustomPaint(painter: _PrayLanternPainter()),
+          ),
+        ),
+      );
+
+  Widget _goldLine(double s) => Expanded(
+        child: Container(
+          height: 1.2,
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              colors: [_prGold.withAlpha(0), _prGold, _prGold.withAlpha(0)],
+            ),
+          ),
+        ),
+      );
+
+  /// Lanterns + cream arch panel: next prayer, countdown and progress.
+  Widget _hero(double s, NextPrayer next, DateTime now, double progress,
+      int prevIndex, DateTime? prevTime) {
+    final h = 190.0 * s;
+    return SizedBox(
+      height: h,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _lantern(s),
+          Expanded(
+            flex: 74,
+            child: SizedBox(
+              height: h,
+              child: CustomPaint(
+              painter: const _PrayArchPainter(),
+              child: Padding(
+                padding: EdgeInsets.fromLTRB(12 * s, h * 0.27, 12 * s, 10 * s),
+                child: LayoutBuilder(
+                  builder: (context, cons) => FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.topCenter,
+                    child: SizedBox(
+                      width: cons.maxWidth,
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text('نوێژی داهاتوو',
+                              style: TextStyle(
+                                  fontSize: 11.5 * s, color: _prMuted)),
+                          Row(
+                            children: [
+                              _goldLine(s),
+                              SizedBox(width: 8 * s),
+                              Text(
+                                kPrayerShort[next.index],
+                                style: TextStyle(
+                                  fontSize: 21 * s,
+                                  fontWeight: FontWeight.bold,
+                                  color: _prGoldDark,
+                                ),
+                              ),
+                              SizedBox(width: 8 * s),
+                              _goldLine(s),
+                            ],
+                          ),
+                          Text(
+                            _hms(next.time.difference(now)),
+                            textDirection: TextDirection.ltr,
+                            style: TextStyle(
+                              fontSize: 46 * s,
+                              height: 1.15,
+                              fontWeight: FontWeight.bold,
+                              color: _prInk,
+                              fontFeatures: const [FontFeature.tabularFigures()],
+                            ),
+                          ),
+                          SizedBox(height: 4 * s),
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(8),
+                            child: LinearProgressIndicator(
+                              value: progress,
+                              minHeight: 6 * s,
+                              backgroundColor: _prGold.withAlpha(60),
+                              valueColor:
+                                  const AlwaysStoppedAnimation<Color>(_prGold),
+                            ),
+                          ),
+                          SizedBox(height: 4 * s),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Text(
+                                '${kPrayerShort[prevIndex]}  ${_hm(prevTime)}',
+                                style: TextStyle(
+                                    fontSize: 12 * s, color: _prMuted),
+                              ),
+                              Text(
+                                '${kPrayerShort[next.index]}  ${_hm(next.time)}',
+                                style: TextStyle(
+                                    fontSize: 12 * s, color: _prMuted),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            ),
+          ),
+          _lantern(s),
+        ],
+      ),
+    );
+  }
+
+  /// The five fard prayers in one row; the upcoming one on a golden tile.
+  Widget _summary(double s, List<DateTime?> day, NextPrayer next) {
+    const idx = [0, 2, 3, 4, 5];
+    final cells = <Widget>[];
+    for (var n = 0; n < idx.length; n++) {
+      final i = idx[n];
+      final on = i == next.index;
+      if (n > 0) {
+        cells.add(Container(
+            width: 1, height: 36 * s, color: _prGold.withAlpha(70)));
+      }
+      cells.add(
+        Expanded(
+          child: Container(
+            padding: EdgeInsets.symmetric(vertical: 8 * s, horizontal: 2 * s),
+            decoration: on
+                ? BoxDecoration(
+                    borderRadius: BorderRadius.circular(16 * s),
+                    gradient: const LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [Color(0xFFFFF1C4), Color(0xFFF5D98A)],
+                    ),
+                  )
+                : null,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(_prIcons[i],
+                    size: 24 * s, color: on ? _prGoldDark : _prInk),
+                SizedBox(height: 3 * s),
+                FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Text(
+                    kPrayerShort[i],
+                    style: TextStyle(
+                        fontSize: 13 * s,
+                        fontWeight: FontWeight.w600,
+                        color: _prInk),
+                  ),
+                ),
+                SizedBox(height: 2 * s),
+                FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Text(
+                    _hm(day[i]),
+                    textDirection: TextDirection.ltr,
+                    style: TextStyle(
+                      fontSize: 17 * s,
+                      fontWeight: FontWeight.bold,
+                      color: on ? _prGoldDark : _prInk,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+    return Container(
+      padding: EdgeInsets.symmetric(vertical: 6 * s, horizontal: 6 * s),
+      decoration: _cardDeco(s, radius: 24),
+      child: Row(children: cells),
+    );
+  }
+
+  Widget _cityCard(double s, PrayCity c) {
+    return Container(
+      decoration: _cardDeco(s, radius: 18),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(18 * s),
+          onTap: () => _pickCity(context),
+          child: Padding(
+            padding: EdgeInsets.symmetric(horizontal: 14 * s, vertical: 8 * s),
+            child: Row(
+              children: [
+                Container(
+                  width: 36 * s,
+                  height: 36 * s,
+                  decoration: const BoxDecoration(
+                    shape: BoxShape.circle,
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [_prEmeraldMid, _prEmerald],
+                    ),
+                  ),
+                  child: Icon(Icons.location_on_rounded,
+                      size: 20 * s, color: _prGoldLight),
+                ),
+                SizedBox(width: 12 * s),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text('شار',
+                          style:
+                              TextStyle(fontSize: 11.5 * s, color: _prMuted)),
+                      Text(
+                        c.ku,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                            fontSize: 17 * s,
+                            fontWeight: FontWeight.bold,
+                            color: _prInk),
+                      ),
+                    ],
+                  ),
+                ),
+                Icon(Icons.expand_more_rounded, size: 26 * s, color: _prInk),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _prayRow(double s, int i, DateTime? time, bool isNext, bool isCur) {
+    final slot = i == 0 ? 0 : i - 1; // adhanPrefs slot, same as before
+    final mode = i == 1 ? 0 : adhanPrefs.mode[slot];
+    return Padding(
+      padding: EdgeInsets.symmetric(vertical: 3.5 * s),
+      child: Container(
+        padding: EdgeInsets.symmetric(horizontal: 12 * s, vertical: 7 * s),
+        decoration: _cardDeco(s, next: isNext, radius: 24),
+        child: Row(
+          children: [
+            SizedBox(
+              width: 42 * s,
+              height: 42 * s,
+              child: CustomPaint(
+                painter: const _PrayStarPainter(),
+                child: Center(
+                  child: Icon(_prIcons[i],
+                      size: 23 * s, color: isNext ? _prGoldDark : _prGold),
+                ),
+              ),
+            ),
+            SizedBox(width: 10 * s),
+            Expanded(
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
+                alignment: AlignmentDirectional.centerStart,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      kPrayerNames[i],
+                      style: TextStyle(
+                        fontSize: 17 * s,
+                        fontWeight: isNext ? FontWeight.bold : FontWeight.w600,
+                        color: _prInk,
+                      ),
+                    ),
+                    if (isNext)
+                      _chip(s, 'بانگی داهاتوو', upcoming: true)
+                    else if (isCur)
+                      _chip(s, 'ئێستا', upcoming: false),
+                  ],
+                ),
+              ),
+            ),
+            SizedBox(width: 6 * s),
+            Text(
+              _hm(time),
+              textDirection: TextDirection.ltr,
+              style: TextStyle(
+                fontSize: 23 * s,
+                fontWeight: FontWeight.bold,
+                color: _prInk,
+              ),
+            ),
+            SizedBox(width: 8 * s),
+            if (i != 1)
+              InkResponse(
+                onTap: () => _pickAdhanMode(context, slot),
+                child: Container(
+                  width: 46 * s,
+                  height: 38 * s,
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(19 * s),
+                    gradient: const LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [_prEmeraldMid, _prEmerald],
+                    ),
+                  ),
+                  child: Icon(
+                    _adhanIcon(mode),
+                    size: 22 * s,
+                    color: mode == 0
+                        ? _prGoldLight.withAlpha(120)
+                        : _prGoldLight,
+                  ),
+                ),
+              )
+            else
+              SizedBox(width: 46 * s),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Dark emerald pill: monthly timetable (calendar + title) and the minute
+  /// adjustment sheet (gear).
+  Widget _monthlyBar(double s) {
+    Widget divider() => Container(
+        width: 1, height: 28 * s, color: _prGold.withAlpha(150));
+    return Container(
+      height: 58 * s,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(32 * s),
+        gradient: const LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [Color(0xFF0E4D3A), _prEmerald],
+        ),
+        border: Border.all(color: _prGold, width: 1.3),
+        boxShadow: const [
+          BoxShadow(
+              color: Color(0x40000000), blurRadius: 10, offset: Offset(0, 4)),
+        ],
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(32 * s),
+        child: Material(
+          color: Colors.transparent,
+          child: Row(
+            children: [
+              Expanded(
+                child: InkWell(
+                  onTap: () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                        builder: (_) => const PrayerMonthPage()),
+                  ),
+                  child: SizedBox(
+                    height: double.infinity,
+                    child: Row(
+                      children: [
+                        SizedBox(width: 20 * s),
+                        Icon(Icons.calendar_month_rounded,
+                            size: 27 * s, color: _prGoldLight),
+                        SizedBox(width: 14 * s),
+                        divider(),
+                        Expanded(
+                          child: Center(
+                            child: Text(
+                              'کاتەکانی مانگانە',
+                              style: TextStyle(
+                                fontSize: 17 * s,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.white,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              divider(),
+              Tooltip(
+                message: 'ڕێکخستنی خولەکەکان',
+                child: InkWell(
+                  onTap: () => _editPrayerOffsets(context),
+                  child: SizedBox(
+                    width: 64 * s,
+                    height: double.infinity,
+                    child: Center(
+                      child: Stack(
+                        clipBehavior: Clip.none,
+                        children: [
+                          Icon(Icons.settings_rounded,
+                              size: 27 * s, color: _prGoldLight),
+                          if (locPrefs.hasOffsets)
+                            Positioned(
+                              top: -1,
+                              right: -1,
+                              child: Container(
+                                width: 9 * s,
+                                height: 9 * s,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: const Color(0xFF4CD08A),
+                                  border: Border.all(
+                                      color: _prEmerald, width: 1.2),
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: Listenable.merge([locPrefs, adhanPrefs]),
+      builder: (context, _) {
+        final now = DateTime.now();
+        final c = locPrefs.c;
+        final day = PrayerCalc.compute(c, now, hanafi: locPrefs.hanafi).list;
+        final next = PrayerCalc.next(c, now, hanafi: locPrefs.hanafi);
+        // Previous prayer point, for the progress bar (prayer -> next prayer).
+        final int prevIndex;
+        if (next.index == 0) {
+          prevIndex = 5;
+        } else if (next.index == 2) {
+          final sr = day[1];
+          prevIndex = (sr != null && !now.isBefore(sr)) ? 1 : 0;
+        } else {
+          prevIndex = next.index - 1;
+        }
+        final DateTime? prevTime = next.index == 0
+            ? PrayerCalc.compute(
+                c,
+                DateTime(next.time.year, next.time.month, next.time.day - 1),
+                hanafi: locPrefs.hanafi,
+              ).isha
+            : day[prevIndex];
+        var progress = 0.0;
+        if (prevTime != null) {
+          final total = next.time.difference(prevTime).inSeconds;
+          if (total > 0) {
+            progress = (now.difference(prevTime).inSeconds / total)
+                .clamp(0.0, 1.0)
+                .toDouble();
+          }
+        }
+        var cur = -1; // the prayer whose time is running now
+        if (next.index == 0) {
+          cur = 5;
+        } else {
+          for (var k = 0; k < 6; k++) {
+            final t = day[k];
+            if (t != null && !t.isAfter(now)) cur = k;
+          }
+          if (cur == 1) cur = -1; // after sunrise: no prayer time is running
+        }
+
+        // Responsive scale: 1.0 on a ~390 dp phone, smaller / larger on other
+        // widths. Content never gets wider than 560 dp (tablets). On a short
+        // screen the scale is also reduced so the hero, summary, city card and
+        // all six prayer cards (down to Isha) and the monthly bar are visible without scrolling.
+        const appBarH = 48.0;
+        const fitH = 895.0; // height of those blocks (incl. monthly bar) at scale 1.0
+        final mq = MediaQuery.of(context);
+        final cw = math.min(mq.size.width, 560.0);
+        final listTop = mq.padding.top + appBarH + 2;
+        final widthS = cw / 390;
+        final heightS =
+            (mq.size.height - listTop - mq.padding.bottom - 6) / fitH;
+        final s = math.min(widthS, heightS).clamp(0.7, 1.25).toDouble();
+
+        return Scaffold(
+          extendBodyBehindAppBar: true,
+          backgroundColor: _prCream,
+          appBar: AppBar(
+            backgroundColor: Colors.transparent,
+            elevation: 0,
+            scrolledUnderElevation: 0,
+            toolbarHeight: appBarH,
+            foregroundColor: Colors.white,
+            systemOverlayStyle: SystemUiOverlayStyle.light,
+          ),
+          body: Stack(
+            fit: StackFit.expand,
+            children: [
+              const _PrayBackdrop(),
+              Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 560),
+                  child: ListView(
+                    padding:
+                        EdgeInsets.fromLTRB(14 * s, listTop, 14 * s, 10 * s),
+                    children: [
+                      _hero(s, next, now, progress, prevIndex, prevTime),
+                      SizedBox(height: 10 * s),
+                      _summary(s, day, next),
+                      SizedBox(height: 10 * s),
+                      _cityCard(s, c),
+                      SizedBox(height: 6 * s),
+                      for (var i = 0; i < 6; i++)
+                        _prayRow(s, i, day[i], i == next.index, i == cur),
+                      SizedBox(height: 10 * s),
+                      _monthlyBar(s),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+// ============================================================
+//  Monthly prayer timetable (same engine / same data as the card)
+// ============================================================
+const List<String> _kMonthsKu = [
+  'کانوونی دووەم', 'شوبات', 'ئازار', 'نیسان', 'ئایار', 'حوزەیران',
+  'تەمموز', 'ئاب', 'ئەیلوول', 'تشرینی یەکەم', 'تشرینی دووەم', 'کانوونی یەکەم',
+];
+
+class PrayerMonthPage extends StatefulWidget {
+  const PrayerMonthPage({super.key});
+
+  @override
+  State<PrayerMonthPage> createState() => _PrayerMonthPageState();
+}
+
+class _PrayerMonthPageState extends State<PrayerMonthPage> {
+  late DateTime _m;
+
+  @override
+  void initState() {
+    super.initState();
+    final n = DateTime.now();
+    _m = DateTime(n.year, n.month, 1);
+  }
+
+  void _go(int d) => setState(() => _m = DateTime(_m.year, _m.month + d, 1));
+
+  @override
+  Widget build(BuildContext context) {
+    final c = locPrefs.c;
+    final hanafi = locPrefs.hanafi;
+    final today = DateTime.now();
+    final days = DateTime(_m.year, _m.month + 1, 0).day;
+    TextStyle cell(bool bold, Color col) => TextStyle(
+          fontSize: 12.5,
+          fontWeight: bold ? FontWeight.bold : FontWeight.normal,
+          color: col,
+        );
+
+    final rows = <Widget>[];
+    for (var i = 1; i <= days; i++) {
+      final d = DateTime(_m.year, _m.month, i);
+      final t = PrayerCalc.compute(c, d, hanafi: hanafi).list;
+      final isToday =
+          d.year == today.year && d.month == today.month && d.day == today.day;
+      final official = PrayerCalc.isOfficial(c, d);
+      rows.add(Container(
+        margin: const EdgeInsets.symmetric(vertical: 2),
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 9),
+        decoration: BoxDecoration(
+          color: official ? _gold.withAlpha(30) : _cardColor(context),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(
+            color: isToday ? _gold : _lineColor(context),
+            width: isToday ? 2 : 1,
+          ),
+        ),
+        child: Row(
+          children: [
+            SizedBox(
+              width: 28,
+              child: Text('$i',
+                  textAlign: TextAlign.center,
+                  style: cell(true, _inkColor(context))),
+            ),
+            for (final x in t)
+              Expanded(
+                child: Text(
+                  _hm(x),
+                  textAlign: TextAlign.center,
+                  textDirection: TextDirection.ltr,
+                  style: cell(false, _inkColor(context)),
+                ),
+              ),
+          ],
+        ),
+      ));
+    }
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('کاتەکانی مانگانە',
+            style: TextStyle(fontWeight: FontWeight.bold)),
+      ),
+      body: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 820),
+          child: Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
+                child: Directionality(
+                  textDirection: TextDirection.ltr,
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      IconButton(
+                        onPressed: () => _go(-1),
+                        icon: const Icon(Icons.chevron_left),
+                      ),
+                      Column(
+                        children: [
+                          Text(
+                            '${_kMonthsKu[_m.month - 1]} ${_m.year}',
+                            style: TextStyle(
+                              fontSize: 17,
+                              fontWeight: FontWeight.bold,
+                              color: _inkColor(context),
+                            ),
+                          ),
+                          Text(c.ku,
+                              style: TextStyle(
+                                  fontSize: 13, color: _mutedColor(context))),
+                        ],
+                      ),
+                      IconButton(
+                        onPressed: () => _go(1),
+                        icon: const Icon(Icons.chevron_right),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                child: Row(
+                  children: [
+                    const SizedBox(width: 34),
+                    for (final n in kPrayerShort)
+                      Expanded(
+                        child: FittedBox(
+                          fit: BoxFit.scaleDown,
+                          child: Text(n,
+                              style: TextStyle(
+                                  fontSize: 11.5,
+                                  fontWeight: FontWeight.bold,
+                                  color: _gold)),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              Expanded(
+                child: ListView(
+                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 24),
+                  children: [
+                    ...rows,
+                    const SizedBox(height: 10),
+                    Text(
+                      c.awqaf
+                          ? 'ڕۆژە ڕەنگکراوەکان لە خشتەی ڕەسمی ئەوقافەوە وەرگیراون؛ ڕۆژەکانی تر هەژمار دەکرێن و لەوانەیە چەند خولەکێک جیاواز بن.'
+                          : 'هەموو کاتەکان بە ژمێریاری ئەستێرەناسی هەژمار دەکرێن و لەوانەیە چەند خولەکێک لەگەڵ ڕۆژمێری فەرمی جیاواز بن.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                          fontSize: 12, height: 1.7, color: _mutedColor(context)),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+
+// ============================================================
+//  مامۆستای مزگەوت - Tajweed Teacher layer
+//  Severity (red = major / yellow = minor), points, and the Kurdish
+//  "why + how to fix" feedback. It never changes WHAT the engine detects;
+//  it only classifies and explains. Rule sources: the book
+//  «زانستی تەجوید» (Sirwan Hamed) and kTajweedLessons above.
+//  Duration judging (judgeDuration) is ready for when the audio layer can
+//  measure madd / ghunna in milliseconds; speech-to-text alone cannot.
+// ============================================================
+// ---------------------------------------------------------------
+//  1. Basic types
+// ---------------------------------------------------------------
+
+/// جلی = major (red). خفی = minor (yellow).
+enum ErrSeverity { jali, khafi }
+
+enum ErrDir { unknown, tooShort, tooLong }
+
+/// Accepts TajweedDir.name from the coach.
+ErrDir _parseErrDir(String s) {
+  switch (s) {
+    case 'tooShort':
+      return ErrDir.tooShort;
+    case 'tooLong':
+      return ErrDir.tooLong;
+    default:
+      return ErrDir.unknown;
+  }
+}
+
+/// The four modules of the curriculum.
+enum TeacherModule { makharij, sifat, nunMim, madd }
+
+extension TeacherModuleX on TeacherModule {
+  int get number => index + 1;
+
+  String get titleAr => const <String>[
+        'مخارج الحروف',
+        'صفات الحروف',
+        'أحكام النون الساكنة والتنوين والميم الساكنة',
+        'المدود وأحكامها',
+      ][index];
+
+  String get titleKu => const <String>[
+        'مەخرەجی پیتەکان',
+        'سیفاتی پیتەکان',
+        'حوکمەکانی نوونی ساکن، تەنوین و میمی ساکن',
+        'مەدەکان و حوکمەکانیان',
+      ][index];
+
+  /// Lesson ids of kTajweedLessons (main.dart) that belong to the module.
+  List<int> get lessonIds => const <List<int>>[
+        <int>[17, 18, 19],
+        <int>[20, 21, 22],
+        <int>[2, 3, 4, 5, 6, 8, 9],
+        <int>[15, 16],
+      ][index];
+}
+
+const int kColorRed = 0xFFD32F2F; // major error
+const int kColorYellow = 0xFFF9A825; // minor error
+const int kJaliPenalty = 15; // every major error
+const int kStartScore = 100;
+
+// ---------------------------------------------------------------
+//  2. The rule table (key = TajweedKind.name of main.dart)
+// ---------------------------------------------------------------
+
+class TeacherRule {
+  final TeacherModule module;
+  final int lessonId; // kTajweedLessons id
+  final String labelKu;
+  final String labelAr;
+
+  /// Expected length in harakat (0 = the rule has no length).
+  final int minHarakat;
+  final int maxHarakat;
+
+  /// Points taken for a minor error (a major error always takes kJaliPenalty).
+  final int penalty;
+
+  /// true = a slip in this rule is always a major error.
+  final bool alwaysJali;
+  final String why; // why the rule exists
+  final String fix; // how to fix it (general)
+  final String shortFix; // when it was too short
+  final String longFix; // when it was too long
+
+  const TeacherRule({
+    required this.module,
+    required this.lessonId,
+    required this.labelKu,
+    required this.labelAr,
+    this.minHarakat = 0,
+    this.maxHarakat = 0,
+    this.penalty = 3,
+    this.alwaysJali = false,
+    required this.why,
+    required this.fix,
+    this.shortFix = '',
+    this.longFix = '',
+  });
+
+  bool get hasLength => maxHarakat > 0;
+}
+
+const Map<String, TeacherRule> kTeacherRules = <String, TeacherRule>{
+  // ------------------------------ Module 4: madd
+  'maddAsli': TeacherRule(
+    module: TeacherModule.madd,
+    lessonId: 15,
+    labelKu: 'مەددی سروشتی',
+    labelAr: 'المد الطبيعي',
+    minHarakat: 2,
+    maxHarakat: 2,
+    penalty: 3,
+    why: 'پیتی مەد (ا، و، ی) دەبێت دوو حەرەکە بخایەنێت، نە کەمتر نە زیاتر.',
+    fix: 'بە ئارامی بژمێرە «یەک، دوو» و لەسەر دووەم دەنگەکە ببڕە.',
+    shortFix: 'مەدەکە کورت بوو؛ دەنگی پیتی مەد بخایەنە تا دوو حەرەکە تەواو بێت.',
+    longFix: 'مەدەکە لە دوو حەرەکە زیاتر ڕۆیشت؛ لێرە تەنها دوو حەرەکە پێویستە.',
+  ),
+  'maddMuttasil': TeacherRule(
+    module: TeacherModule.madd,
+    lessonId: 16,
+    labelKu: 'مەددی متصل',
+    labelAr: 'المد المتصل',
+    minHarakat: 4,
+    maxHarakat: 5,
+    penalty: 5,
+    why: 'مەد و هەمزە لە یەک وشەدان؛ ئەم مەدە واجبە و دەبێت ٤ یان ٥ حەرەکە بکێشرێت.',
+    fix: 'لە سەرەتای مەدەکە دەست بە ژماردن بکە و بگەیە ٤ یان ٥ پێش ئەوەی بگەیتە هەمزەکە.',
+    shortFix: 'مەددی متصل کورت بوو؛ ئەمە واجبە، با بگەیەنین بە ٤ یان ٥ حەرەکە.',
+    longFix: 'مەدەکە لە ٥ حەرەکە زیاتر چوو؛ ٤ یان ٥ بەسە و لەسەر یەک ڕێژە بەردەوام بە.',
+  ),
+  'maddMunfasil': TeacherRule(
+    module: TeacherModule.madd,
+    lessonId: 16,
+    labelKu: 'مەددی منفصل',
+    labelAr: 'المد المنفصل',
+    minHarakat: 4,
+    maxHarakat: 5,
+    penalty: 3,
+    why: 'مەد لە کۆتایی وشەیەک و هەمزە لە سەرەتای وشەی دواتر؛ ٤ یان ٥ حەرەکە.',
+    fix: 'مەدەکە هەمان درێژی مەددی متصل بدە و لە هەموو خوێندنەوەکەدا وەک یەک بیپارێزە.',
+    shortFix: 'مەدی منفصل کورت بوو؛ بیگەیەنە ٤ یان ٥ حەرەکە.',
+    longFix: 'مەدەکە زۆر درێژ بوو؛ لە ٥ حەرەکە تێپەڕ مەکە.',
+  ),
+  'maddBadal': TeacherRule(
+    module: TeacherModule.madd,
+    lessonId: 16,
+    labelKu: 'مەددی بەدەل',
+    labelAr: 'مد البدل',
+    minHarakat: 2,
+    maxHarakat: 2,
+    penalty: 3,
+    why: 'هەمزە پێش پیتی مەد دێت (وەک ءَامَنُوا)؛ ئەمە دوو حەرەکەیە.',
+    fix: 'هەمزەکە ڕوون بخوێنەوە و پیتی مەد تەنها دوو حەرەکە بخایەنە.',
+    shortFix: 'پیتی مەد لێرە کورت بوو؛ دوو حەرەکەی تەواوی بدەرێ.',
+    longFix: 'لێرە تەنها دوو حەرەکە دەبێت، درێژتر مەیکێشە.',
+  ),
+  'maddLazim': TeacherRule(
+    module: TeacherModule.madd,
+    lessonId: 16,
+    labelKu: 'مەددی لازم',
+    labelAr: 'المد اللازم',
+    minHarakat: 6,
+    maxHarakat: 6,
+    penalty: 5,
+    why: 'دوای پیتی مەد ساکنێکی ڕەسەن یان شەدە دێت؛ ئەمە واجبە و شەش حەرەکەیە.',
+    fix: 'شەش حەرەکە بژمێرە و لە هەموو شوێنێکی ئاوادا هەمان درێژی بپارێزە.',
+    shortFix: 'مەددی لازم لە شەش حەرەکە کەمتر بوو؛ دەنگەکە تا شەش بخایەنە.',
+    longFix: 'مەدەکە لە شەش حەرەکە زیاتر چوو؛ شەش حەرەکە بەسە.',
+  ),
+  'maddArid': TeacherRule(
+    module: TeacherModule.madd,
+    lessonId: 16,
+    labelKu: 'مەددی عارض',
+    labelAr: 'المد العارض للسكون',
+    minHarakat: 2,
+    maxHarakat: 6,
+    penalty: 2,
+    why: 'کاتێک لەسەر کۆتایی وشە دەوەستیت مەدەکە دەتوانێت ٢، ٤ یان ٦ حەرەکە بێت.',
+    fix: 'یەکێک لەو سێ ڕێژەیە هەڵبژێرە و لە هەموو وەستانەکاندا هەمانی بەکاربهێنە.',
+    shortFix: 'لە کاتی وەستان مەدەکە لە دوو حەرەکە کەمتر بوو.',
+    longFix: 'مەدەکە لە شەش حەرەکە زیاتر چوو.',
+  ),
+  'maddLin': TeacherRule(
+    module: TeacherModule.madd,
+    lessonId: 16,
+    labelKu: 'مەددی لین',
+    labelAr: 'مد اللين',
+    minHarakat: 2,
+    maxHarakat: 6,
+    penalty: 2,
+    why: 'واو یان یای ساکن دوای فەتحە، لە کاتی وەستاندا: ٢، ٤ یان ٦ حەرەکە.',
+    fix: 'بە نەرمی و بێ توندی بیخوێنەوە و ڕێژەی هەڵبژێردراو بپارێزە.',
+    shortFix: 'مەددی لین زۆر کورت بوو.',
+    longFix: 'مەددی لین زۆر درێژ بوو.',
+  ),
+  'maddOther': TeacherRule(
+    module: TeacherModule.madd,
+    lessonId: 15,
+    labelKu: 'مەد',
+    labelAr: 'المد',
+    minHarakat: 2,
+    maxHarakat: 6,
+    penalty: 2,
+    why: 'درێژی ئەم مەدە لەگەڵ حوکمەکەی ناگونجێت.',
+    fix: 'دووبارە گوێ لە مامۆستا بگرە و لەگەڵی بیخوێنەوە.',
+    shortFix: 'مەدەکە کورتە.',
+    longFix: 'مەدەکە درێژە.',
+  ),
+
+  // ------------------------------ Module 3: noon / tanween / meem
+  'izhar': TeacherRule(
+    module: TeacherModule.nunMim,
+    lessonId: 3,
+    labelKu: 'ئیزهار',
+    labelAr: 'الإظهار',
+    penalty: 3,
+    why: 'دوای پیتی قورگ، نوون یان تەنوین دەبێت ڕوون و بێ غوننە بخوێنرێتەوە.',
+    fix: 'نوونەکە لە مەخرەجی خۆیەوە ڕوون بڵێ، بێ ئەوەی لە لووتەوە بیکێشیت و بێ ئەوەی بچێتە ناو پیتی دواتر.',
+  ),
+  'idgham': TeacherRule(
+    module: TeacherModule.nunMim,
+    lessonId: 2,
+    labelKu: 'ئیدغام',
+    labelAr: 'الإدغام',
+    penalty: 4,
+    why: 'لە پیتەکانی «يرملون»، نوون یان تەنوین دەچێتە ناو پیتی دواتر و دەبنە یەک پیتی شەددار.',
+    fix: 'لە «ینمو» غوننە بکە (دوو حەرەکە)، لە «ل» و «ر» غوننە مەکە.',
+    shortFix: 'غوننەی ئیدغامەکە کورت بوو؛ دوو حەرەکە بیخایەنە.',
+    longFix: 'ئەگەر پیتەکە «ل» یان «ر»ە غوننە نابێت؛ ئەگەر «ی ن م و»ە غوننە تەنها دوو حەرەکەیە.',
+  ),
+  'iqlab': TeacherRule(
+    module: TeacherModule.nunMim,
+    lessonId: 4,
+    labelKu: 'ئیقلاب',
+    labelAr: 'الإقلاب',
+    minHarakat: 2,
+    maxHarakat: 2,
+    penalty: 4,
+    why: 'دوای پیتی «ب»، نوون یان تەنوین دەگۆڕێت بە میمێکی شاراوە بە غوننە.',
+    fix: 'لێوەکانت بە نەرمی لەسەر یەک دابنێ، میمەکە بە غوننەوە دوو حەرەکە بخایەنە و ئینجا «ب» بڵێ.',
+    shortFix: 'غوننەی ئیقلاب کورت بوو؛ دوو حەرەکە بیخایەنە.',
+  ),
+  'ikhfa': TeacherRule(
+    module: TeacherModule.nunMim,
+    lessonId: 5,
+    labelKu: 'ئیخفا',
+    labelAr: 'الإخفاء',
+    minHarakat: 2,
+    maxHarakat: 2,
+    penalty: 4,
+    why: 'نوونەکە نە ڕوون دەخوێنرێتەوە نە دەچێتە ناو پیتەکە، بەڵکو بە غوننەوە دەشاردرێتەوە.',
+    fix: 'زمانت لە شوێنی نوون جیا بکەوە و لە پیتی دواتر نزیکی بکەرەوە، دواتر دوو حەرەکە غوننە بکە.',
+    shortFix: 'غوننەی ئیخفا کورت بوو؛ دوو حەرەکە بیخایەنە.',
+    longFix: 'ئیخفا لێرە لە غوننەی دوو حەرەکە درێژتر نابێت.',
+  ),
+  'tanween': TeacherRule(
+    module: TeacherModule.nunMim,
+    lessonId: 3,
+    labelKu: 'تەنوین',
+    labelAr: 'التنوين',
+    penalty: 3,
+    why: 'تەنوین نوونێکی ساکنە لە کۆتایی وشە و حوکمی نوونی ساکنی هەیە.',
+    fix: 'سەیری پیتی دوای تەنوین بکە: قورگ = ئیزهار، يرملون = ئیدغام، ب = ئیقلاب، ئەوانی تر = ئیخفا.',
+  ),
+
+  // ------------------------------ Module 2: sifat
+  'ghunna': TeacherRule(
+    module: TeacherModule.sifat,
+    lessonId: 22,
+    labelKu: 'غوننە',
+    labelAr: 'الغنة',
+    minHarakat: 2,
+    maxHarakat: 2,
+    penalty: 4,
+    why: 'لە نوون و میمی شەددار غوننە (دەنگی لووتی) دەبێت دوو حەرەکە بخایەنێت.',
+    fix: 'دەنگەکە لە لووتەوە بەرز بکەرەوە و بە قەد دوو حەرەکە ڕایبگرە.',
+    shortFix: 'غوننەکە کورت بوو؛ با کەمێک درێژتر بیکەین بۆ دوو حەرەکە.',
+    longFix: 'غوننەکە لە دوو حەرەکە زیاتر چوو.',
+  ),
+  'qalqala': TeacherRule(
+    module: TeacherModule.sifat,
+    lessonId: 22,
+    labelKu: 'قەڵقەلە',
+    labelAr: 'القلقلة',
+    penalty: 2,
+    why: 'پیتەکانی «قطب جد» کاتێک ساکن دەبن، دەنگێکی لەرەیی (ڕەنگدانەوە) دەدەن.',
+    fix: 'ساکنەکە بە توندی دابخە و دواتر بە کەمێک ڕەنگدانەوە دەنگەکەی بەرەڵا بکە.',
+    shortFix: 'قەڵقەلەکە نەبیسترا؛ لەرینەوەی بچووک بخەرە دوای ساکنەکە.',
+    longFix: 'قەڵقەلەکە زۆر بوو؛ تەنها لەرینەوەیەکی سووک بەسە.',
+  ),
+  'shadda': TeacherRule(
+    module: TeacherModule.sifat,
+    lessonId: 22,
+    labelKu: 'شەدە',
+    labelAr: 'التشديد',
+    penalty: 5,
+    why: 'پیتی شەددار دوو پیتە: یەکەمیان ساکن و دووەمیان بزوێن.',
+    fix: 'پیتەکە بە هێز دووجار بڵێ: لەسەر یەکەم بوەستە و لەسەر دووەم بجووڵێ.',
+    shortFix: 'شەدەکە کەم بوو؛ پیتەکە دووجار بدەرێ.',
+  ),
+  'tafkhim': TeacherRule(
+    module: TeacherModule.sifat,
+    lessonId: 21,
+    labelKu: 'قورس و تەنک',
+    labelAr: 'التفخيم والترقيق',
+    penalty: 3,
+    why: 'پیتەکانی «خص ضغط قظ» هەمیشە قورس دەخوێنرێن و پیتە تەنکەکان تەنک.',
+    fix: 'بۆ پیتی قورس پشتی زمانت بەرز بکەرەوە بۆ سەرەوە و دەنگەکە پڕ و گەورە بکە.',
+    shortFix: 'ئەم پیتە قورسە بەڵام تەنک خوێندرایەوە.',
+    longFix: 'ئەم پیتە تەنکە بەڵام قورس خوێندرایەوە.',
+  ),
+  'raa': TeacherRule(
+    module: TeacherModule.sifat,
+    lessonId: 7,
+    labelKu: 'حوکمی ڕاء',
+    labelAr: 'أحكام الراء',
+    penalty: 3,
+    why: 'ڕاء بەپێی حەرەکەی خۆی و ئەوەی دەوروبەری قورس یان تەنک دەبێت.',
+    fix: 'سەیری حەرەکەی ڕاء بکە: فەتحە/زەمە زۆرجار قورس و کەسرە تەنک (چەند حاڵەتی تایبەتیش هەیە، وانەی ٧ ببینەوە).',
+  ),
+  'lamJalala': TeacherRule(
+    module: TeacherModule.sifat,
+    lessonId: 12,
+    labelKu: 'لامی «الله»',
+    labelAr: 'لام الجلالة',
+    penalty: 3,
+    why: 'لامی «الله» دوای فەتحە یان زەمە قورسە و دوای کەسرە تەنکە.',
+    fix: 'سەیری ئەو پیتە بکە کە پێش «الله» دێت و لەسەر ئەو بنەمایە لامەکە بگۆڕە.',
+  ),
+  'lamTarif': TeacherRule(
+    module: TeacherModule.sifat,
+    lessonId: 11,
+    labelKu: 'لامی تەعریف',
+    labelAr: 'لام التعريف',
+    penalty: 3,
+    why: 'لامی «ال» لەگەڵ پیتی شەمسی ئیدغام دەکرێت و لەگەڵ پیتی قەمەری ڕوون دەخوێنرێتەوە.',
+    fix: 'ئەگەر پیتی دوای لام شەمسییە لام مەخوێنەوە و پیتەکە شەددار بکە.',
+  ),
+
+  // ------------------------------ Writing / stopping rules
+  'waqf': TeacherRule(
+    module: TeacherModule.makharij,
+    lessonId: 23,
+    labelKu: 'وەستان',
+    labelAr: 'الوقف',
+    penalty: 2,
+    why: 'لە وەستاندا حەرەکە لادەبرێت و کۆتایی وشە ساکن دەخوێنرێتەوە.',
+    fix: 'لە کۆتایی ئایەت یان شوێنی گونجاودا بوەستە و ساکنی بکە.',
+  ),
+  'hamzaWasl': TeacherRule(
+    module: TeacherModule.makharij,
+    lessonId: 13,
+    labelKu: 'هەمزەی وەسڵ',
+    labelAr: 'همزة الوصل',
+    penalty: 2,
+    why: 'هەمزەی وەسڵ تەنها لە سەرەتای خوێندنەوە دەخوێنرێت و لە ناوەڕاستدا دەکەوێت.',
+    fix: 'ئەگەر لە ناوەڕاستی ئایەت پێش ئەو وشەیە هاتی، بێ هەمزە بیخوێنەوە.',
+  ),
+
+  // ------------------------------ Letter / vowel mistakes (lahn jali)
+  'other': TeacherRule(
+    module: TeacherModule.makharij,
+    lessonId: 24,
+    labelKu: 'هەڵەی خوێندنەوە',
+    labelAr: 'اللحن',
+    alwaysJali: true,
+    why: 'وشەکە وەک خۆی نەخوێندرایەوە؛ ڕەنگە پیتێک یان حەرەکەیەک گۆڕدرابێت و ئەمە دەتوانێت واتا بگۆڕێت.',
+    fix: 'گوێ لە خوێندنەوەی ڕاست بگرە و وشەکە دووبارە بکەرەوە.',
+  ),
+};
+
+// ---------------------------------------------------------------
+//  3. Teacher feedback
+// ---------------------------------------------------------------
+
+class TeacherFeedback {
+  final ErrSeverity severity;
+  final TeacherModule module;
+  final String title; // short label, e.g. «مەددی متصل (کورتە)»
+  final String message; // the full teacher message (Kurdish)
+  final String tip; // one short sentence for the coach panel
+  final int lessonId;
+  final int penalty;
+  final bool mustRepeat; // true for every major error
+
+  const TeacherFeedback({
+    required this.severity,
+    required this.module,
+    required this.title,
+    required this.message,
+    required this.tip,
+    required this.lessonId,
+    required this.penalty,
+    required this.mustRepeat,
+  });
+
+  /// Color the UI paints the word / the card with.
+  int get colorValue =>
+      severity == ErrSeverity.jali ? kColorRed : kColorYellow;
+}
+
+const List<String> _kMinorOpeners = <String>[
+  'ماشاءاللە، خوێندنەوەت خۆشە، تەنها وردەکارییەکی بچووک ماوە.',
+  'زۆر باشە، بەردەوام بە؛ با ئەم شوێنە کەمێک جوانتر بکەین.',
+  'بارەکاللا لێت، دەنگت ڕێکە و تەنها یەک تێبینیم هەیە.',
+];
+
+const List<String> _kMajorOpeners = <String>[
+  'خوێندنەوەت خۆشە، بەڵام لێرەدا با پێکەوە ڕاستی بکەینەوە.',
+  'دڵت پێ خۆش بێت، هەموومان فێر دەبین؛ ئەم وشەیە با دووبارە بیخوێنینەوە.',
+  'ماندوو مەبە، تەنها ئەم شوێنە ماوە؛ با بە ئارامی دووبارەی بکەینەوە.',
+];
+
+class TajweedTeacher {
+  TajweedTeacher._();
+
+  /// [kind] = TajweedKind.name, [dir] = TajweedDir.name (from TajweedVerdict).
+  /// [attempt] rotates the opening sentence, so the teacher does not repeat
+  /// himself. [escalate] makes a normally minor slip a major one.
+  static TeacherFeedback feedback({
+    required String kind,
+    String dir = 'unknown',
+    String word = '',
+    int attempt = 0,
+    bool escalate = false,
+    bool forceMinor = false, // the cause is uncertain: never call it major
+  }) {
+    final r = kTeacherRules[kind] ?? kTeacherRules['other']!;
+    final d = _parseErrDir(dir);
+    final jali = escalate || (r.alwaysJali && !forceMinor);
+    final severity = jali ? ErrSeverity.jali : ErrSeverity.khafi;
+
+    final fixText = d == ErrDir.tooShort && r.shortFix.isNotEmpty
+        ? r.shortFix
+        : (d == ErrDir.tooLong && r.longFix.isNotEmpty ? r.longFix : r.fix);
+
+    final dirTag = d == ErrDir.tooShort
+        ? ' (کورتە)'
+        : (d == ErrDir.tooLong ? ' (زۆر درێژە)' : '');
+
+    final openers = jali ? _kMajorOpeners : _kMinorOpeners;
+    final sb = StringBuffer()
+      ..write(openers[attempt.abs() % openers.length])
+      ..write('\n');
+    if (word.isNotEmpty) sb.write('وشە: «$word»\n');
+    sb
+      ..write(r.why)
+      ..write('\n')
+      ..write(fixText);
+    if (jali) sb.write('\nتکایە جارێکی تر بیخوێنەوە.');
+    sb.write('\n(وانەی ${r.lessonId})');
+
+    return TeacherFeedback(
+      severity: severity,
+      module: r.module,
+      title: '${r.labelKu}$dirTag',
+      message: sb.toString(),
+      tip: fixText,
+      lessonId: r.lessonId,
+      penalty: jali ? kJaliPenalty : r.penalty,
+      mustRepeat: jali,
+    );
+  }
+
+  // -------------------------------------------------------------
+  //  Duration judge: for madd and ghunnah, from measured milliseconds.
+  //  (Needs audio timing; speech-to-text alone cannot give it.)
+  // -------------------------------------------------------------
+
+  static const double _shortTol = 0.6; // harakat below the minimum
+  static const double _longTol = 0.9; // harakat above the maximum
+
+  /// [measuredMs] = how long the reader held the sound, [harakahMs] = the
+  /// reader's own harakah (see HarakahCalibrator).
+  static HarakatVerdict judgeDuration({
+    required String kind,
+    required double measuredMs,
+    required double harakahMs,
+  }) {
+    final r = kTeacherRules[kind];
+    if (r == null || !r.hasLength || harakahMs <= 0) {
+      return const HarakatVerdict(true, ErrDir.unknown, 0, false);
+    }
+    final h = measuredMs / harakahMs;
+    if (h < r.minHarakat - _shortTol) {
+      // A natural madd shorter than one harakah is no madd any more: the
+      // long vowel became a short one = altered vowel = major error.
+      final vanished =
+          (kind == 'maddAsli' || kind == 'maddBadal') && h < 1.0;
+      return HarakatVerdict(false, ErrDir.tooShort, h, vanished);
+    }
+    if (h > r.maxHarakat + _longTol) {
+      return HarakatVerdict(false, ErrDir.tooLong, h, false);
+    }
+    return HarakatVerdict(true, ErrDir.unknown, h, false);
+  }
+
+  /// Judge and build the message in one step. null = the reading is fine.
+  static TeacherFeedback? judgeAndAdvise({
+    required String kind,
+    required double measuredMs,
+    required double harakahMs,
+    String word = '',
+    int attempt = 0,
+  }) {
+    final v = judgeDuration(
+        kind: kind, measuredMs: measuredMs, harakahMs: harakahMs);
+    if (v.ok) return null;
+    return feedback(
+      kind: kind,
+      dir: v.dir == ErrDir.tooShort ? 'tooShort' : 'tooLong',
+      word: word,
+      attempt: attempt,
+      escalate: v.escalateToJali,
+    );
+  }
+
+  // -------------------------------------------------------------
+  //  Module 1: articulation points (letter substitution = lahn jali)
+  // -------------------------------------------------------------
+
+  /// The reader said [heard] where the text has [expected].
+  static TeacherFeedback substitution({
+    required String expected,
+    required String heard,
+    String word = '',
+    int attempt = 0,
+  }) {
+    final e = _kMakhraj[expected];
+    final h = _kMakhraj[heard];
+    final sb = StringBuffer()
+      ..write(_kMajorOpeners[attempt.abs() % _kMajorOpeners.length])
+      ..write('\n');
+    if (word.isNotEmpty) sb.write('وشە: «$word»\n');
+    sb.write('«$heard» خوێندرایەوە، بەڵام دەبێت «$expected» بێت.');
+    if (e != null) {
+      sb
+        ..write('\n«$expected»: ')
+        ..write(e.place)
+        ..write(' • ')
+        ..write(e.trait);
+      if (h != null) {
+        sb
+          ..write('\n«$heard» جیاوازە: ')
+          ..write(h.place)
+          ..write(' • ')
+          ..write(h.trait);
+      }
+      sb
+        ..write('\nپێشنیار: ')
+        ..write(e.tip);
+    } else {
+      sb.write('\nلەگەڵ مامۆستا مەخرەجی ئەم پیتە دووبارە بکەرەوە.');
+    }
+    sb.write('\nتکایە جارێکی تر بیخوێنەوە.');
+    final lesson = e?.lessonId ?? 18;
+    return TeacherFeedback(
+      severity: ErrSeverity.jali,
+      module: TeacherModule.makharij,
+      title: '«$heard» بەجیاتی «$expected»',
+      message: sb.toString(),
+      tip: e?.tip ?? 'لەگەڵ مامۆستا مەخرەجی ئەم پیتە دووبارە بکەرەوە.',
+      lessonId: lesson,
+      penalty: kJaliPenalty,
+      mustRepeat: true,
+    );
+  }
+
+  /// The reader changed a vowel (fatha / damma / kasra), lahn jali.
+  static TeacherFeedback vowelChange({
+    required String word,
+    required String expectedVowel, // e.g. 'فەتحە'
+    required String heardVowel, // e.g. 'کەسرە'
+    int attempt = 0,
+  }) {
+    final msg = '${_kMajorOpeners[attempt.abs() % _kMajorOpeners.length]}\n'
+        'وشە: «$word»\n'
+        'حەرەکەکە $heardVowel خوێندرایەوە، بەڵام دەبێت $expectedVowel بێت. '
+        'گۆڕینی حەرەکە واتای وشەکە دەگۆڕێت.\n'
+        'تکایە جارێکی تر بیخوێنەوە.\n(وانەی 24)';
+    return TeacherFeedback(
+      severity: ErrSeverity.jali,
+      module: TeacherModule.makharij,
+      title: 'گۆڕینی حەرەکە',
+      message: msg,
+      tip: 'گۆڕینی حەرەکە واتا دەگۆڕێت؛ حەرەکەی ڕاست بخوێنەوە.',
+      lessonId: 24,
+      penalty: kJaliPenalty,
+      mustRepeat: true,
+    );
+  }
+}
+
+class HarakatVerdict {
+  final bool ok;
+  final ErrDir dir;
+  final double harakat; // measured length in harakat
+  final bool escalateToJali;
+  const HarakatVerdict(this.ok, this.dir, this.harakat, this.escalateToJali);
+}
+
+// ---------------------------------------------------------------
+//  4. Harakah calibration: one harakah is different for every reader
+// ---------------------------------------------------------------
+
+/// Learns the reader's own tempo from his natural madds (2 harakat each),
+/// so a slow reader is not punished for a long madd and a fast one is not
+/// punished for a short one. Default 400 ms until enough samples exist.
+class HarakahCalibrator {
+  static const double defaultMs = 400;
+  static const double minMs = 180;
+  static const double maxMs = 700;
+
+  final List<double> _samples = <double>[];
+
+  void observe(String kind, double ms) {
+    if (kind != 'maddAsli') return;
+    if (ms < 200 || ms > 1600) return; // not a believable natural madd
+    _samples.add(ms);
+    if (_samples.length > 40) _samples.removeAt(0);
+  }
+
+  double get harakahMs {
+    if (_samples.length < 5) return defaultMs;
+    final s = List<double>.from(_samples)..sort();
+    final median = s.length.isOdd
+        ? s[s.length ~/ 2]
+        : (s[s.length ~/ 2 - 1] + s[s.length ~/ 2]) / 2;
+    return (median / 2).clamp(minMs, maxMs).toDouble();
+  }
+}
+
+// ---------------------------------------------------------------
+//  5. Scoring of one recitation (an ayah, a page, a session)
+// ---------------------------------------------------------------
+
+class RecitationScorer {
+  final List<TeacherFeedback> items = <TeacherFeedback>[];
+
+  void add(TeacherFeedback f) => items.add(f);
+  void clear() => items.clear();
+
+  int get majorCount =>
+      items.where((f) => f.severity == ErrSeverity.jali).length;
+  int get minorCount =>
+      items.where((f) => f.severity == ErrSeverity.khafi).length;
+
+  int get score {
+    var s = kStartScore;
+    for (final f in items) {
+      s -= f.penalty;
+    }
+    return s < 0 ? 0 : s;
+  }
+
+  /// Any major error means: repeat before moving on.
+  bool get mustRepeat => items.any((f) => f.mustRepeat);
+
+  /// Points lost per module (shows the reader what to study).
+  Map<TeacherModule, int> get lossByModule {
+    final m = <TeacherModule, int>{};
+    for (final f in items) {
+      m[f.module] = (m[f.module] ?? 0) + f.penalty;
+    }
+    return m;
+  }
+
+  /// The module that cost most points, null when the reading was clean.
+  TeacherModule? get weakestModule {
+    TeacherModule? best;
+    var bestLoss = 0;
+    lossByModule.forEach((k, v) {
+      if (v > bestLoss) {
+        bestLoss = v;
+        best = k;
+      }
+    });
+    return best;
+  }
+
+  String get summaryKu {
+    if (items.isEmpty) {
+      return 'ماشاءاللە! خوێندنەوەکەت بێ هەڵە بوو. خوا بەرەکەتی بخاتە سەر.';
+    }
+    final sb = StringBuffer('نمرە: $score / $kStartScore');
+    if (majorCount > 0) {
+      sb.write('\n$majorCount هەڵەی سوور؛ پێویستە دووبارە بکرێتەوە.');
+    }
+    if (minorCount > 0) {
+      sb.write('\n$minorCount تێبینیی زەرد؛ بۆ جوانتر کردنی تەجوید.');
+    }
+    final w = weakestModule;
+    if (w != null) {
+      sb.write('\nپێشنیار: وانەکانی «${w.titleKu}» دووبارە بکەرەوە.');
+    }
+    return sb.toString();
+  }
+}
+
+// ---------------------------------------------------------------
+//  6. Articulation table: confusable letters (module 1)
+//     Source: book part 3 (جێدەنگی پیتەکان) + lessons 17-19.
+// ---------------------------------------------------------------
+
+class _Mk {
+  final String place;
+  final String trait;
+  final String tip;
+  final int lessonId;
+  const _Mk(this.place, this.trait, this.tip, this.lessonId);
+}
+
+const String _kTipThaa =
+    'نووکی زمانت بە نەرمی لەسەر لێوی دەمی ددانە سەرەوەکان دابنێ و با بە هێمنی بڕوات.';
+
+const Map<String, _Mk> _kMakhraj = <String, _Mk>{
+  // tongue tip + upper incisors: ث ذ ظ
+  'ث': _Mk('نووکی زمان و کەناری ددانە سەرەوەکان', 'چپە (هەمس)، تەنک', _kTipThaa, 18),
+  'ذ': _Mk('نووکی زمان و کەناری ددانە سەرەوەکان', 'ئاشکرا (جەهر)، تەنک',
+      'هەمان شوێنی «ث»، بەڵام دەنگ دەربخە و دەنگی زەنگداری هەبێت.', 18),
+  'ظ': _Mk('نووکی زمان و کەناری ددانە سەرەوەکان', 'ئاشکرا، قورس',
+      'هەمان شوێنی «ذ»، بەڵام پشتی زمانت بەرز بکەرەوە بۆ ئەوەی پڕ و قورس بێت.', 18),
+  // sibilants: س ص ز
+  'س': _Mk('نێوان نووکی زمان و ددانە خوارەوەکان', 'فیکە، چپە، تەنک',
+      'دەنگی فیکە بێ پشتی زمانی بەرز؛ دەم بە سووکی بکەرەوە.', 18),
+  'ص': _Mk('نێوان نووکی زمان و ددانە خوارەوەکان', 'فیکە، چپە، قورس',
+      'هەمان فیکەی «س»، بەڵام پشتی زمان بەرز بکە و دەنگەکە پڕ بکە.', 18),
+  'ز': _Mk('نێوان نووکی زمان و ددانە خوارەوەکان', 'فیکە، ئاشکرا، تەنک',
+      'هەمان شوێنی «س»، بەڵام دەنگ لەگەڵی دەربخە.', 18),
+  // back of the tongue: ق ك
+  'ق': _Mk('کۆتایی زمان لەگەڵ سەقفی دەمی نەرم (دوورترین)', 'قورس، قەڵقەلە',
+      'پشتی زمان بە قووڵی بخەرە سەقف و بە هێز بەرەڵای بکە، قەڵقەلە دەکات.', 18),
+  'ك': _Mk('کۆتایی زمان کەمێک بەرەو پێش لە «ق»', 'تەنک، بێ قەڵقەلە',
+      'کەمێک بەرەو پێش بێنە و بێ قورسی و بێ قەڵقەلە بیڵێ.', 18),
+  // throat letters
+  'ء': _Mk('کۆتایی قورگ', 'توند', 'لە قووڵایی قورگەوە بە دەنگێکی کورتی ڕوون.', 19),
+  'ه': _Mk('کۆتایی قورگ', 'چپە، نەرم', 'هەناسەیەکی سووک لە قووڵایی قورگ.', 19),
+  'ع': _Mk('ناوەڕاستی قورگ', 'ئاشکرا، نێوانی (نە توند نە نەرم)',
+      'قورگت بە نەرمی بگوشە و دەنگێکی ڕوون لە ناوەڕاستی قورگ دەربەرە.', 19),
+  'ح': _Mk('ناوەڕاستی قورگ', 'چپە، نەرم',
+      'هەمان شوێنی «ع»، بەڵام بێ دەنگی ئاشکرا، وەک هەناسەیەکی گەرم.', 19),
+  'غ': _Mk('نزیکترین بەشی قورگ بە دەم', 'قورس، نەرم',
+      'قورگ بە سووکی بگوشە و دەنگێکی قورسی خشاو بدە.', 19),
+  'خ': _Mk('نزیکترین بەشی قورگ بە دەم', 'قورس، چپە',
+      'هەمان شوێنی «غ»، بەڵام بێ دەنگ و بە خشانێکی قورس.', 19),
+  // lips
+  'ب': _Mk('هەردوو لێو', 'توند، ئاشکرا',
+      'لێوەکان لەسەر یەک بگرە و بە توندی لێکیان بکەرەوە.', 17),
+  'م': _Mk('هەردوو لێو', 'غوننە، ئاشکرا',
+      'لێوەکان داخە و دەنگەکە لە لووتەوە بڕوات.', 17),
+  'و': _Mk('هەردوو لێو (کردنەوەی خڕ)', 'نەرم', 'لێوەکان خڕ بکە بێ ئەوەی بیانلکێنیت.', 17),
+  'ف': _Mk('ناوەڕاستی لێوی خوارەوە و کەناری ددانە سەرەوەکان', 'چپە، نەرم',
+      'لێوی خوارەوە بە نەرمی لە ددانە سەرەوەکان بدە و با بڕوات.', 17),
+};
