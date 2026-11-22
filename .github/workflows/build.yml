@@ -69,6 +69,15 @@ jobs:
           fi
           # patch_android.py also copies azkar.mp3 into app/assets/audio
           python3 patch_android.py app
+          # app icon (the Quran picture): launcher icons for every screen density
+          if [ -f app_icon.zip ]; then
+            unzip -oq app_icon.zip -d app/android/app/src/main/res
+            echo "app icon files: $(ls app/android/app/src/main/res/mipmap-*/ic_launcher*.png | wc -l) (should be 10)"
+            grep -o 'android:icon="[^"]*"' app/android/app/src/main/AndroidManifest.xml || echo "::warning::android:icon not found in the manifest"
+          else
+            echo "::error::app_icon.zip is NOT in the repository next to main.dart - upload it there (as a zip, do not unzip it)"
+            exit 1
+          fi
           # location permission for the Qibla compass (GPS); added only if patch_android.py did not already add it
           MANIFEST=app/android/app/src/main/AndroidManifest.xml
           for P in ACCESS_FINE_LOCATION ACCESS_COARSE_LOCATION; do
