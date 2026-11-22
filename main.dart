@@ -4,6 +4,8 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'dart:async';
+import 'dart:ui' show DartPluginRegistrant;
+import 'package:android_alarm_manager_plus/android_alarm_manager_plus.dart';
 import 'dart:io' show File, Directory, HttpClient, Platform;
 
 import 'package:just_audio/just_audio.dart';
@@ -54,6 +56,7 @@ Future<void> main() async {
   try {
     // Adhan notifications: same PrayerCalc data as the prayer card.
     await AdhanScheduler.init();
+    await _registerAdhanRefresh(); // keeps the alarms refilled while the app stays closed
     locPrefs.addListener(AdhanScheduler.scheduleSoon);
     adhanPrefs.addListener(AdhanScheduler.scheduleSoon);
     locPrefs.addListener(AzkarAuto.scheduleSoon);
@@ -15390,7 +15393,7 @@ class AzkarAuto {
   static const int morningDelayMin = 15; // after sunrise
   static const int eveningDelayMin = 45; // after Asr
   static const int _nBase = 7500; // notification ids 7500 .. 7500 + _nDays * 2
-  static const int _nDays = 14;
+  static const int _nDays = 30; // azkar: 30 x 2 = 60 alarms
   static Timer? _debounce;
   static Timer? _timer;
   static DateTime _lastStart = DateTime.fromMillisecondsSinceEpoch(0);
@@ -15449,10 +15452,19 @@ class AzkarAuto {
     if (!AdhanScheduler._ready) return;
     try {
       final plugin = AdhanScheduler._plugin;
-      for (var i = 0; i < _nDays * 2; i++) {
-        await plugin.cancel(_nBase + i);
+      final keep = <int>{};
+      Future<void> dropStale() async {
+        final pend = await plugin.pendingNotificationRequests();
+        for (final r in pend) {
+          if (r.id >= _nBase && r.id < _nBase + _nDays * 2 && !keep.contains(r.id)) {
+            await plugin.cancel(r.id);
+          }
+        }
       }
-      if (!azkarPrefs.morning && !azkarPrefs.evening) return;
+      if (!azkarPrefs.morning && !azkarPrefs.evening) {
+        await dropStale();
+        return;
+      }
       final exact =
           await AdhanScheduler._android?.canScheduleExactNotifications() ??
               false;
@@ -15486,8 +15498,10 @@ class AzkarAuto {
                 fln.UILocalNotificationDateInterpretation.absoluteTime,
             payload: 'azkar:$set',
           );
+          keep.add(_nBase + d * 2 + k);
         }
       }
+      await dropStale();
     } catch (e) {
       debugPrint('Azkar schedule failed: $e');
     }
@@ -16007,6 +16021,44 @@ class _AdhanPermButton extends StatelessWidget {
   }
 }
 
+const int _kAdhanRefreshId = 7777001;
+
+/// Runs by itself every 12 hours through Android's alarm manager, also when the app
+/// is closed (and again after a phone restart): it refills the 60-day window of adhan
+/// and azkar alarms. So the adhan keeps coming for months even if the app is never opened.
+@pragma('vm:entry-point')
+Future<void> adhanBackgroundRefresh() async {
+  try {
+    try { DartPluginRegistrant.ensureInitialized(); } catch (_) {}
+    await PrayerData.load();
+    try { await locPrefs.ensureLoaded(); } catch (_) {}
+    try { await adhanPrefs.load(); } catch (_) {}
+    try { await azkarPrefs.load(); } catch (_) {}
+    await AdhanScheduler.init(background: true);
+    if (!AdhanScheduler._ready) return;
+    await AdhanScheduler._reschedule();
+    await AzkarAuto._notify();
+  } catch (e) {
+    debugPrint('adhan background refresh failed: $e');
+  }
+}
+
+Future<void> _registerAdhanRefresh() async {
+  if (!Platform.isAndroid) return;
+  try {
+    await AndroidAlarmManager.initialize();
+    await AndroidAlarmManager.periodic(
+      const Duration(hours: 12),
+      _kAdhanRefreshId,
+      adhanBackgroundRefresh,
+      wakeup: true,
+      rescheduleOnReboot: true,
+    );
+  } catch (e) {
+    debugPrint('adhan refresh alarm failed: $e');
+  }
+}
+
 class AdhanScheduler {
   static final fln.FlutterLocalNotificationsPlugin _plugin =
       fln.FlutterLocalNotificationsPlugin();
@@ -16017,7 +16069,7 @@ class AdhanScheduler {
   static String lastError = '';
 
   static const int _base = 7000; // notification ids 7000 .. 7000 + _days * 5
-  static const int _days = 14; // rolling window, rebuilt on every app start
+  static const int _days = 60; // rolling window (60 x 5 = 300 alarms; Android allows 500 per app)
   static const List<int> _idx = [0, 2, 3, 4, 5]; // PrayerDay.list positions
   static const List<String> _chIds = [
     'adhan_silent_v1',
@@ -16029,7 +16081,7 @@ class AdhanScheduler {
       _plugin.resolvePlatformSpecificImplementation<
           fln.AndroidFlutterLocalNotificationsPlugin>();
 
-  static Future<void> init() async {
+  static Future<void> init({bool background = false}) async {
     if (_ready || !Platform.isAndroid) return;
     try {
       tzdata.initializeTimeZones();
@@ -16076,6 +16128,7 @@ class AdhanScheduler {
         }
       }
       _ready = true;
+      if (background) return; // background refresh: no UI, nothing was tapped
       // the app was started by tapping the azkar notification
       try {
         final d = await _plugin.getNotificationAppLaunchDetails();
@@ -16251,9 +16304,10 @@ class AdhanScheduler {
         ? fln.AndroidScheduleMode.exactAllowWhileIdle
         : fln.AndroidScheduleMode.inexactAllowWhileIdle;
     if (!exact) lastError = 'exact alarms NOT allowed (adhan can be late/missed)';
-    for (var i = 0; i < _days * 5; i++) {
-      await _plugin.cancel(_base + i);
-    }
+    // Every slot is (re)scheduled under its own id, which REPLACES the old alarm, so
+    // there is never a moment without alarms even when the foreground app and the
+    // background refresh run together. Only ids that are no longer wanted are cancelled.
+    final keep = <int>{};
     final c = locPrefs.c;
     final hanafi = locPrefs.hanafi;
     final now = DateTime.now();
@@ -16302,15 +16356,27 @@ class AdhanScheduler {
         );
         try {
           await go(sm);
+          keep.add(_base + d * 5 + k);
         } catch (e) {
           // exact alarms refused -> still schedule (inexact) instead of losing everything
           try {
             await go(fln.AndroidScheduleMode.inexactAllowWhileIdle);
+            keep.add(_base + d * 5 + k);
           } catch (e2) {
             lastError = 'schedule: $e2';
           }
         }
       }
+    }
+    try {
+      final pend = await _plugin.pendingNotificationRequests();
+      for (final r in pend) {
+        if (r.id >= _base && r.id < _base + _days * 5 && !keep.contains(r.id)) {
+          await _plugin.cancel(r.id);
+        }
+      }
+    } catch (e) {
+      lastError = 'cleanup: $e';
     }
   }
 }

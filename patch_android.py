@@ -81,6 +81,23 @@ if 'ScheduledNotificationReceiver' not in s:
 '''
     s = s.replace('</application>', block + '    </application>', 1)
 
+# background refresh of the adhan alarms (android_alarm_manager_plus): runs every 12 h,
+# also while the app is closed and after a phone restart, so the 60-day alarm window never runs out
+if 'androidalarmmanager.AlarmService' not in s:
+    block = '''        <service android:name="dev.fluttercommunity.plus.androidalarmmanager.AlarmService"
+            android:permission="android.permission.BIND_JOB_SERVICE"
+            android:exported="false"/>
+        <receiver android:name="dev.fluttercommunity.plus.androidalarmmanager.AlarmBroadcastReceiver"
+            android:exported="false"/>
+        <receiver android:name="dev.fluttercommunity.plus.androidalarmmanager.RebootBroadcastReceiver"
+            android:enabled="false" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+            </intent-filter>
+        </receiver>
+'''
+    s = s.replace('</application>', block + '    </application>', 1)
+
 mf.write_text(s, encoding='utf-8')
 print('AndroidManifest.xml patched')
 
@@ -102,7 +119,8 @@ print('res/raw/keep.xml written')
     '-keepattributes *Annotation*\n'
     '-keep class com.dexterous.** { *; }\n'
     '-keep class com.google.gson.reflect.TypeToken { *; }\n'
-    '-keep class * extends com.google.gson.reflect.TypeToken\n',
+    '-keep class * extends com.google.gson.reflect.TypeToken\n'
+    '-keep class dev.fluttercommunity.plus.androidalarmmanager.** { *; }\n',
     encoding='utf-8')
 print('proguard-rules.pro written')
 
