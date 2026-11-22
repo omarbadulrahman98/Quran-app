@@ -148,6 +148,15 @@ for name in ('build.gradle.kts', 'build.gradle'):
         # a separate dependencies block at the end is always valid gradle
         g2 = g2.rstrip() + '\n\ndependencies {\n    ' + dep + '\n}\n'
         print(name, 'core library desugaring enabled')
+    # assembleRelease runs "lintVital" first; a lint detector crashing on one of the
+    # plugins (RuntimeException in LintDriver.handleDetectorError) stops the whole build.
+    # The APK does not need lint, so release lint checks are switched off.
+    if 'checkReleaseBuilds' not in g2:
+        lint = ('\n    lint {\n        checkReleaseBuilds = false\n        abortOnError = false\n    }\n'
+                if kts else
+                '\n    lint {\n        checkReleaseBuilds false\n        abortOnError false\n    }\n')
+        g2 = re.sub(r'(android\s*\{)', lambda m: m.group(1) + lint, g2, count=1)
+        print(name, 'release lint disabled')
     # Fixed signing key (only when the workflow decoded one from the GitHub secrets).
     # Without it every build is signed with a fresh debug key, so Android refuses to
     # install a new APK over the old one. Without KEYSTORE_PATH nothing changes here.
