@@ -6,7 +6,7 @@ import 'package:flutter/material.dart';
 import 'dart:async';
 import 'dart:ui' show DartPluginRegistrant;
 import 'package:android_alarm_manager_plus/android_alarm_manager_plus.dart';
-import 'dart:io' show File, Directory, HttpClient, Platform;
+import 'dart:io' show File, Directory, HttpClient, HttpHeaders, IOSink, Platform;
 
 import 'package:just_audio/just_audio.dart';
 import 'package:just_audio_background/just_audio_background.dart';
@@ -15,7 +15,8 @@ import 'dart:typed_data' show Int32List, Int64List, Uint16List, Uint8List;
 import 'dart:ui' as ui show FrameTiming;
 import 'package:flutter/foundation.dart' show compute, debugPrint;
 import 'package:flutter/services.dart'
-    show FontLoader, rootBundle, SystemUiOverlayStyle;
+    show Clipboard, ClipboardData, FontLoader, rootBundle, SystemUiOverlayStyle;
+import 'package:path_provider/path_provider.dart' show getApplicationSupportDirectory;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:speech_to_text/speech_recognition_error.dart'
     show SpeechRecognitionError;
@@ -47,6 +48,7 @@ Future<void> main() async {
     );
   } catch (_) {}
   await settings.load();
+  await offline.init(); // finds the surahs saved for offline listening
   audio.trimCache(); // old downloaded audio never piles up
   await PrayerData.load(); // assets/prayer_times.json -> extra cities / days
   // every step has its own try: one failing load must never stop the adhan
@@ -996,7 +998,12 @@ class _SurahHeader extends StatelessWidget {
             style: const TextStyle(fontSize: 12.5, color: Color(0xCCFFFFFF)),
           ),
           const SizedBox(height: 12),
-          _PlayAllButton(s.n),
+          Wrap(
+            alignment: WrapAlignment.center,
+            spacing: 10,
+            runSpacing: 8,
+            children: [_PlayAllButton(s.n), _OfflineButton(s.n)],
+          ),
         ],
       ),
     );
@@ -1336,6 +1343,465 @@ class _CachedFile {
   const _CachedFile(this.file, this.size, this.time);
 }
 
+// ============================================================
+//  Offline recitations: whole surahs saved inside the app, so the reciter
+//  plays with NO internet. Files live in the app's own folder (never in the
+//  cache, so the phone does not clean them). Saved per reciter.
+// ============================================================
+final OfflineAudio offline = OfflineAudio();
+
+class OfflineAudio extends ChangeNotifier {
+  Directory? _root;
+  final HttpClient _dl = HttpClient()
+    ..connectionTimeout = const Duration(seconds: 10);
+  final Set<String> _have = <String>{}; // 'slug:surah' of the finished surahs
+
+  int busySurah = 0; // the surah being saved right now (0 = none)
+  double progress = 0; // 0..1 for that surah
+  double overall = 0; // 0..1 for the "save every surah" run
+  bool all = false; // "save every surah" is running
+  int allDone = 0; // surahs finished in that run
+  bool _cancel = false;
+  String? note; // last problem, shown to the user
+
+  static String slug(String rec) {
+    final t = rec.replaceAll(RegExp(r'[^A-Za-z0-9]+'), '_');
+    return t.length > 70 ? t.substring(t.length - 70) : t;
+  }
+
+  static String _n3(int n) => n.toString().padLeft(3, '0');
+
+  Future<void> init() async {
+    try {
+      final base = await getApplicationSupportDirectory();
+      final r = Directory('${base.path}/offline');
+      _root = r;
+      if (r.existsSync()) {
+        for (final d in r.listSync()) {
+          if (d is! Directory) continue;
+          final segs = d.uri.pathSegments.where((x) => x.isNotEmpty).toList();
+          if (segs.isEmpty) continue;
+          final sl = segs.last;
+          for (final f in d.listSync()) {
+            if (f is! File) continue;
+            final name = f.uri.pathSegments.last;
+            if (!name.endsWith('.done')) continue;
+            final s = int.tryParse(name.substring(0, name.length - 5));
+            if (s != null) _have.add('$sl:$s');
+          }
+        }
+      }
+    } catch (_) {}
+    notifyListeners();
+  }
+
+  bool has(String rec, int s) => _have.contains('${slug(rec)}:$s');
+
+  int countFor(String rec) {
+    final p = '${slug(rec)}:';
+    var n = 0;
+    for (final k in _have) {
+      if (k.startsWith(p)) n++;
+    }
+    return n;
+  }
+
+  String? _file(String rec, String name) {
+    final r = _root;
+    if (r == null) return null;
+    final p = '${r.path}/${slug(rec)}/$name';
+    try {
+      final f = File(p);
+      if (f.existsSync() && f.lengthSync() > 0) return p;
+    } catch (_) {}
+    return null;
+  }
+
+  /// the saved recording of a whole surah (null = not saved)
+  String? wholeFile(String rec, int s) => _file(rec, '${_n3(s)}.mp3');
+
+  /// one saved ayah (null = not saved)
+  String? ayahFile(String rec, int s, int a) =>
+      _file(rec, '${_n3(s)}${_n3(a)}.mp3');
+
+  /// ayah start times (ms) saved with a whole-surah recording
+  List<int>? savedTiming(String rec, int s) {
+    try {
+      final p = _file(rec, '${_n3(s)}.json');
+      if (p == null) return null;
+      final v = jsonDecode(File(p).readAsStringSync());
+      if (v is List) return [for (final x in v) (x as num).round()];
+    } catch (_) {}
+    return null;
+  }
+
+  Future<void> saveTiming(String rec, int s, List<int> starts) async {
+    try {
+      final d = await _dir(rec);
+      await File('${d.path}/${_n3(s)}.json').writeAsString(jsonEncode(starts));
+    } catch (_) {}
+  }
+
+  Future<Directory> _dir(String rec) async {
+    var r = _root;
+    if (r == null) {
+      final base = await getApplicationSupportDirectory();
+      r = Directory('${base.path}/offline');
+      _root = r;
+    }
+    final d = Directory('${r.path}/${slug(rec)}');
+    if (!d.existsSync()) await d.create(recursive: true);
+    return d;
+  }
+
+  /// Downloads [url] into [path]. The data goes to a '.part' file first and is
+  /// renamed only when complete, so a broken download is never played.
+  Future<bool> _fetch(String url, String path, void Function(double)? onFrac) async {
+    final part = File('$path.part');
+    IOSink? sink;
+    try {
+      final req = await _dl.getUrl(Uri.parse(url));
+      final res = await req.close();
+      if (res.statusCode != 200) {
+        await res.drain<void>();
+        return false;
+      }
+      final total = res.contentLength; // -1 when the server does not say
+      var got = 0;
+      sink = part.openWrite();
+      await for (final chunk in res.timeout(const Duration(seconds: 25))) {
+        if (_cancel) throw StateError('cancelled');
+        sink.add(chunk);
+        got += chunk.length;
+        if (onFrac != null && total > 0) onFrac(got / total);
+      }
+      await sink.flush();
+      await sink.close();
+      sink = null;
+      if (part.lengthSync() < 2000) throw StateError('too small');
+      await part.rename(path);
+      return true;
+    } catch (_) {
+      try {
+        await sink?.close();
+      } catch (_) {}
+      try {
+        if (part.existsSync()) await part.delete();
+      } catch (_) {}
+      return false;
+    }
+  }
+
+  /// FAST download of one big file: the server is asked for [parts] pieces at the same
+  /// time (HTTP byte ranges), then the pieces are glued together. A server without range
+  /// support, or a small file, falls back to the normal single download.
+  Future<bool> _fetchFast(String url, String path, void Function(double) onFrac,
+      {int parts = 6}) async {
+    var total = -1;
+    try {
+      final req = await _dl.getUrl(Uri.parse(url));
+      req.headers.set(HttpHeaders.rangeHeader, 'bytes=0-0');
+      final res = await req.close();
+      await res.drain<void>();
+      if (res.statusCode == 206) {
+        final cr = res.headers.value(HttpHeaders.contentRangeHeader);
+        final slash = cr == null ? -1 : cr.lastIndexOf('/');
+        if (cr != null && slash > 0) {
+          total = int.tryParse(cr.substring(slash + 1)) ?? -1;
+        }
+      }
+    } catch (_) {}
+    if (total < 600000) return _fetch(url, path, onFrac);
+
+    final size = (total / parts).ceil();
+    var got = 0;
+    var failed = false;
+    Future<bool> one(int i) async {
+      final start = i * size;
+      final end = math.min(total - 1, start + size - 1);
+      if (start > end) return true;
+      final f = File('$path.p$i');
+      IOSink? sink;
+      try {
+        final req = await _dl.getUrl(Uri.parse(url));
+        req.headers.set(HttpHeaders.rangeHeader, 'bytes=$start-$end');
+        final res = await req.close();
+        if (res.statusCode != 206) {
+          await res.drain<void>();
+          failed = true;
+          return false;
+        }
+        sink = f.openWrite();
+        await for (final c in res.timeout(const Duration(seconds: 25))) {
+          if (_cancel || failed) throw StateError('stop');
+          sink.add(c);
+          got += c.length;
+          onFrac(got / total);
+        }
+        await sink.flush();
+        await sink.close();
+        sink = null;
+        if (f.lengthSync() != end - start + 1) {
+          failed = true;
+          return false;
+        }
+        return true;
+      } catch (_) {
+        failed = true;
+        try {
+          await sink?.close();
+        } catch (_) {}
+        return false;
+      }
+    }
+
+    final rs = await Future.wait([for (var i = 0; i < parts; i++) one(i)]);
+    var ok = rs.every((x) => x);
+    if (ok) {
+      try {
+        final out = File('$path.part').openWrite();
+        for (var i = 0; i < parts; i++) {
+          final f = File('$path.p$i');
+          if (f.existsSync()) await out.addStream(f.openRead());
+        }
+        await out.flush();
+        await out.close();
+        await File('$path.part').rename(path);
+      } catch (_) {
+        ok = false;
+      }
+    }
+    for (var i = 0; i < parts; i++) {
+      try {
+        final f = File('$path.p$i');
+        if (f.existsSync()) f.deleteSync();
+      } catch (_) {}
+    }
+    try {
+      final f = File('$path.part');
+      if (!ok && f.existsSync()) f.deleteSync();
+    } catch (_) {}
+    if (!ok && !_cancel) return _fetch(url, path, onFrac); // one more try, plain
+    return ok;
+  }
+
+  /// Saves one surah of the CURRENT reciter. true = finished.
+  Future<bool> downloadSurah(int s) async {
+    if (busySurah != 0) return false;
+    final rec = settings.rec;
+    busySurah = s;
+    progress = 0;
+    note = null;
+    notifyListeners();
+    var ok = false;
+    try {
+      final d = await _dir(rec);
+      if (rec.startsWith('S:')) {
+        // ONE mp3 for the whole surah
+        final url = rec.substring(2).replaceAll('{S}', _n3(s));
+        final path = '${d.path}/${_n3(s)}.mp3';
+        if (File(path).existsSync() && File(path).lengthSync() > 2000) {
+          ok = true;
+        } else {
+          ok = await _fetchFast(url, path, (p) {
+            progress = p;
+            if (all) overall = (allDone + p) / 114;
+            notifyListeners();
+          });
+        }
+        if (ok) {
+          // the ayah start times too, so the ayah number follows the voice offline
+          final st = await audio.timingForSave(s);
+          if (st != null) await saveTiming(rec, s, st);
+        }
+      } else {
+        final folder = await audio.folderFor(rec);
+        if (folder == null) {
+          note = 'ئەم قاریە دەنگی بۆ دابەزاندن نییە';
+        } else {
+          final n = kSurahs[s - 1].count;
+          var done = 0;
+          var failed = false;
+          var next = 1;
+          Future<void> worker() async {
+            while (!failed && !_cancel) {
+              final a = next++;
+              if (a > n) return;
+              final path = '${d.path}/${_n3(s)}${_n3(a)}.mp3';
+              var got = File(path).existsSync() && File(path).lengthSync() > 0;
+              for (var t = 0; t < 3 && !got && !_cancel; t++) {
+                got = await _fetch(
+                    'https://everyayah.com/data/$folder/${_n3(s)}${_n3(a)}.mp3',
+                    path,
+                    null);
+              }
+              if (!got) {
+                failed = true;
+                return;
+              }
+              done++;
+              progress = done / n;
+              notifyListeners();
+            }
+          }
+
+          await Future.wait([for (var i = 0; i < 10; i++) worker()]);
+          ok = !failed && !_cancel && done >= n;
+        }
+      }
+      if (ok) {
+        await File('${d.path}/${_n3(s)}.done').writeAsString('1');
+        _have.add('${slug(rec)}:$s');
+      } else if (note == null && !_cancel) {
+        note = 'دابەزاندن تەواو نەبوو. ئینتەرنێت بپشکنە و دووبارە هەوڵ بدە';
+      }
+    } catch (_) {
+      note = 'دابەزاندن تەواو نەبوو. شوێنی بەتاڵ لە مۆبایلەکەت بپشکنە';
+    }
+    busySurah = 0;
+    progress = 0;
+    notifyListeners();
+    return ok;
+  }
+
+  Future<bool> startOne(int s) {
+    _cancel = false;
+    return downloadSurah(s);
+  }
+
+  /// every surah of the current reciter
+  Future<void> downloadAll() async {
+    if (busySurah != 0 || all) return;
+    final rec = settings.rec;
+    all = true;
+    allDone = countFor(rec);
+    overall = allDone / 114;
+    note = null;
+    _cancel = false;
+    notifyListeners();
+    try {
+      final d = await _dir(rec);
+      if (rec.startsWith('S:')) {
+        // one big file per surah: surah after surah, each one in parallel pieces
+        for (var s = 1; s <= 114 && !_cancel; s++) {
+          if (has(rec, s)) continue;
+          final ok = await downloadSurah(s);
+          if (!ok) break;
+          allDone++;
+          overall = allDone / 114;
+          notifyListeners();
+        }
+      } else {
+        final folder = await audio.folderFor(rec);
+        if (folder == null) {
+          note = 'ئەم قاریە دەنگی بۆ دابەزاندن نییە';
+        } else {
+          await _allAyahs(rec, d, folder);
+        }
+      }
+    } catch (_) {
+      note = 'دابەزاندن تەواو نەبوو. ئینتەرنێت و شوێنی بەتاڵ بپشکنە';
+    }
+    all = false;
+    busySurah = 0;
+    progress = 0;
+    _cancel = false;
+    notifyListeners();
+  }
+
+  /// One pool of workers over every missing ayah file of the whole Quran (6236 small
+  /// files), so the connection is never idle between two surahs.
+  Future<void> _allAyahs(String rec, Directory d, String folder) async {
+    final tasks = <List<int>>[];
+    final left = List<int>.filled(115, 0); // missing files per surah
+    for (var s = 1; s <= 114; s++) {
+      if (has(rec, s)) continue;
+      final n = kSurahs[s - 1].count;
+      for (var a = 1; a <= n; a++) {
+        final f = File('${d.path}/${_n3(s)}${_n3(a)}.mp3');
+        if (f.existsSync() && f.lengthSync() > 0) continue;
+        tasks.add([s, a]);
+        left[s]++;
+      }
+      if (left[s] == 0) {
+        await File('${d.path}/${_n3(s)}.done').writeAsString('1');
+        _have.add('${slug(rec)}:$s');
+      }
+    }
+    allDone = countFor(rec);
+    final total = tasks.length;
+    var next = 0;
+    var done = 0;
+    var failed = false;
+    Future<void> worker() async {
+      while (!failed && !_cancel) {
+        final i = next++;
+        if (i >= total) return;
+        final s = tasks[i][0];
+        final a = tasks[i][1];
+        final path = '${d.path}/${_n3(s)}${_n3(a)}.mp3';
+        var got = false;
+        for (var t = 0; t < 3 && !got && !_cancel; t++) {
+          got = await _fetch(
+              'https://everyayah.com/data/$folder/${_n3(s)}${_n3(a)}.mp3',
+              path,
+              null);
+        }
+        if (!got) {
+          failed = true;
+          return;
+        }
+        done++;
+        busySurah = s;
+        overall = total == 0 ? 1 : done / total;
+        left[s]--;
+        if (left[s] == 0) {
+          await File('${d.path}/${_n3(s)}.done').writeAsString('1');
+          _have.add('${slug(rec)}:$s');
+          allDone = countFor(rec);
+        }
+        notifyListeners();
+      }
+    }
+
+    await Future.wait([for (var i = 0; i < 10; i++) worker()]);
+    if (failed && !_cancel) {
+      note = 'دابەزاندن تەواو نەبوو. ئینتەرنێت بپشکنە و دووبارە هەوڵ بدە (ئەوەی دابەزێنراوە دەمێنێتەوە)';
+    }
+  }
+
+  void cancel() {
+    _cancel = true;
+    notifyListeners();
+  }
+
+  Future<void> deleteSurah(String rec, int s) async {
+    try {
+      final d = await _dir(rec);
+      final p = _n3(s);
+      for (final f in d.listSync()) {
+        if (f is! File) continue;
+        if (f.uri.pathSegments.last.startsWith(p)) {
+          try {
+            await f.delete();
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+    _have.remove('${slug(rec)}:$s');
+    notifyListeners();
+  }
+
+  Future<void> deleteAll() async {
+    try {
+      final r = _root;
+      if (r != null && r.existsSync()) await r.delete(recursive: true);
+    } catch (_) {}
+    _have.clear();
+    notifyListeners();
+  }
+}
+
 class AudioCtl extends ChangeNotifier {
   final AudioPlayer _p = AudioPlayer();
   int surah = 0;
@@ -1573,6 +2039,12 @@ class AudioCtl extends ChangeNotifier {
     }
   }
 
+  /// Used by [OfflineAudio]: ayah start times (ms) of the current reciter.
+  Future<List<int>?> timingForSave(int s) => _timingFor(s, null);
+
+  /// Used by [OfflineAudio]: the everyayah.com folder of a reciter.
+  Future<String?> folderFor(String rec) => _folder(rec);
+
   String _url(String folder, int s, int a) =>
       'https://everyayah.com/data/$folder/${s.toString().padLeft(3, '0')}${a.toString().padLeft(3, '0')}.mp3';
 
@@ -1626,9 +2098,11 @@ class AudioCtl extends ChangeNotifier {
         final url = settings.rec
             .substring(2)
             .replaceAll('{S}', s.toString().padLeft(3, '0'));
+        // saved in the app? then it plays with no internet at all
+        final local = offline.wholeFile(settings.rec, s);
         final dur = await _p.setAudioSource(ConcatenatingAudioSource(children: [
           AudioSource.uri(
-            Uri.parse(url),
+            local != null ? Uri.file(local) : Uri.parse(url),
             tag: MediaItem(
               id: '$s',
               title: kSurahs[s - 1].ar,
@@ -1646,8 +2120,13 @@ class AudioCtl extends ChangeNotifier {
             notifyListeners();
           });
         }
-        var starts = await _timingFor(s, dur);
+        var starts = local != null ? offline.savedTiming(settings.rec, s) : null;
+        final fromDisk = starts != null;
+        starts ??= await _timingFor(s, dur);
         if (gen != _gen) return;
+        if (local != null && starts != null && !fromDisk) {
+          offline.saveTiming(settings.rec, s, starts); // keep it for offline use
+        }
         final exact = starts != null;
         starts ??= a > 1 ? await _estimateStarts(s, dur) : null;
         if (gen != _gen) return;
@@ -1679,24 +2158,37 @@ class AudioCtl extends ChangeNotifier {
       _base = 1;
     }
     try {
-      final folder = await _folder(settings.rec);
-      if (folder == null) {
-        error = true; // this reciter has no audio on the server
-        notifyListeners();
-        return;
-      }
       final last = all ? kSurahs[s - 1].count : a;
-      final items = <AudioSource>[
-        for (var i = a; i <= last; i++)
-          AudioSource.uri(
-            Uri.parse(_url(folder, s, i)),
-            tag: MediaItem(
-              id: '$s:$i',
-              title: '${kSurahs[s - 1].ar} • $i',
-              artist: reciterName(),
-            ),
+      // when every ayah is saved in the app, no server is needed at all
+      var needNet = false;
+      for (var i = a; i <= last; i++) {
+        if (offline.ayahFile(settings.rec, s, i) == null) {
+          needNet = true;
+          break;
+        }
+      }
+      String? folder;
+      if (needNet) {
+        folder = await _folder(settings.rec);
+        if (folder == null) {
+          error = true; // this reciter has no audio on the server
+          notifyListeners();
+          return;
+        }
+      }
+      AudioSource src(int i) {
+        final f = offline.ayahFile(settings.rec, s, i);
+        return AudioSource.uri(
+          f != null ? Uri.file(f) : Uri.parse(_url(folder!, s, i)),
+          tag: MediaItem(
+            id: '$s:$i',
+            title: '${kSurahs[s - 1].ar} • $i',
+            artist: reciterName(),
           ),
-      ];
+        );
+      }
+
+      final items = <AudioSource>[for (var i = a; i <= last; i++) src(i)];
       await _p.setAudioSource(ConcatenatingAudioSource(children: items));
       _p.play().catchError((Object _) {
         error = true;
@@ -2185,6 +2677,233 @@ class _PlayAllButton extends StatelessWidget {
   }
 }
 
+Future<bool> _askYesNo(BuildContext c, String msg, String yes) async {
+  final r = await showDialog<bool>(
+    context: c,
+    builder: (ctx) => AlertDialog(
+      content: Text(msg, style: const TextStyle(height: 1.7)),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('نەخێر')),
+        TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true), child: Text(yes)),
+      ],
+    ),
+  );
+  return r == true;
+}
+
+/// Save / remove ONE surah of the chosen reciter for listening with no internet.
+class _OfflineButton extends StatelessWidget {
+  final int n;
+  const _OfflineButton(this.n);
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: Listenable.merge([offline, settings]),
+      builder: (context, _) {
+        final rec = settings.rec;
+        final saved = offline.has(rec, n);
+        final busy = offline.busySurah == n;
+        final blocked = offline.busySurah != 0 && !busy;
+        final pct = (offline.progress * 100).round();
+        final label = busy
+            ? (pct > 0 ? 'ڕاگرتن $pct%' : 'ڕاگرتن...')
+            : (saved ? 'بێ ئینتەرنێت ✓' : 'دابەزاندن');
+        return OutlinedButton.icon(
+          style: OutlinedButton.styleFrom(
+            foregroundColor: Colors.white,
+            side: const BorderSide(color: Color(0x99FFFFFF)),
+          ),
+          onPressed: blocked
+              ? null
+              : () async {
+                  if (busy) {
+                    offline.cancel();
+                    return;
+                  }
+                  if (saved) {
+                    final yes = await _askYesNo(
+                        context,
+                        'ئەم سورەتە لە مۆبایلەکەت بسڕدرێتەوە؟ (دەتوانیت دووبارە دایبەزێنیت)',
+                        'سڕینەوە');
+                    if (yes) await offline.deleteSurah(rec, n);
+                    return;
+                  }
+                  final ok = await offline.startOne(n);
+                  if (!ok && offline.note != null && context.mounted) {
+                    ScaffoldMessenger.of(context)
+                        .showSnackBar(SnackBar(content: Text(offline.note!)));
+                  }
+                },
+          icon: Icon(busy
+              ? Icons.close
+              : (saved ? Icons.download_done : Icons.download)),
+          label: Text(label),
+        );
+      },
+    );
+  }
+}
+
+/// Settings: save every surah of the chosen reciter, or remove them all.
+class _OfflineManager extends StatelessWidget {
+  const _OfflineManager();
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: Listenable.merge([offline, settings]),
+      builder: (context, _) {
+        final rec = settings.rec;
+        final count = offline.countFor(rec);
+        final running = offline.all;
+        final frac = running ? offline.overall : 0.0;
+        return Padding(
+          padding: const EdgeInsets.symmetric(vertical: 4),
+          child: Material(
+            color: _cardColor(context),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(14),
+              side: BorderSide(color: _lineColor(context)),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'دەنگی قاریی هەڵبژێردراو (${reciterName()}) لە مۆبایلەکەت پاشەکەوت بکە، بۆ ئەوەی بێ ئینتەرنێتیش کار بکات. هەر سورەتێک بە دوگمەی «دابەزاندن» لە سەرەوەی سورەتەکەش دەکرێت.',
+                    style: TextStyle(
+                        fontSize: 13, height: 1.7, color: _mutedColor(context)),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    '$count لە ١١٤ سورەت دابەزێنراوە',
+                    style: TextStyle(
+                        fontWeight: FontWeight.bold, color: _inkColor(context)),
+                  ),
+                  if (running) ...[
+                    const SizedBox(height: 10),
+                    LinearProgressIndicator(value: frac),
+                    const SizedBox(height: 6),
+                    Text('سورەتی ${offline.busySurah} دەدابەزێت...',
+                        style: TextStyle(
+                            fontSize: 12.5, color: _mutedColor(context))),
+                  ],
+                  if (offline.note != null && !running) ...[
+                    const SizedBox(height: 8),
+                    Text(offline.note!,
+                        style: const TextStyle(
+                            fontSize: 12.5, color: Color(0xFFB3261E))),
+                  ],
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 10,
+                    runSpacing: 8,
+                    children: [
+                      if (running)
+                        FilledButton.icon(
+                          onPressed: offline.cancel,
+                          icon: const Icon(Icons.close),
+                          label: const Text('ڕاگرتن'),
+                        )
+                      else
+                        FilledButton.icon(
+                          onPressed: offline.busySurah != 0
+                              ? null
+                              : () async {
+                                  final yes = await _askYesNo(
+                                      context,
+                                      'هەموو ١١٤ سورەت دادەبەزێنرێت. ئەمە دەکرێت چەند سەد مێگابایت تا چەند گیگابایت شوێنی مۆبایلەکەت بگرێت، و باشترە Wi-Fi بەکاربهێنیت. بەردەوام بم؟',
+                                      'دابەزاندن');
+                                  if (yes) offline.downloadAll();
+                                },
+                          icon: const Icon(Icons.download),
+                          label: const Text('هەموو سورەتەکان دابەزێنە'),
+                        ),
+                      if (!running && count > 0)
+                        OutlinedButton.icon(
+                          onPressed: () async {
+                            final yes = await _askYesNo(
+                                context,
+                                'هەموو دەنگە دابەزێنراوەکان (هەموو قاریەکان) لە مۆبایلەکەت دەسڕێنەوە؟',
+                                'سڕینەوە');
+                            if (yes) await offline.deleteAll();
+                          },
+                          icon: const Icon(Icons.delete_outline),
+                          label: const Text('سڕینەوەی هەموو دابەزێنراوەکان'),
+                        ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// Settings: copy the record of the last reading (to send for tuning), or clear it.
+class _RecLogCard extends StatelessWidget {
+  const _RecLogCard();
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Material(
+        color: _cardColor(context),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(14),
+          side: BorderSide(color: _lineColor(context)),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'ئەپەکە ڕاپۆرتێکی کورت لە دوایین خوێندنەوەی مایک هەڵدەگرێت: چی بیستراوە و کام وشە ڕاست یان هەڵە دانراوە. دوای خوێندنەوەیەک، کۆپی بکە و بۆ باشترکردنی سیستەمەکە بینێرە. هیچ شتێک خۆکارانە ناگەیەنرێت.',
+                style: TextStyle(
+                    fontSize: 13, height: 1.7, color: _mutedColor(context)),
+              ),
+              const SizedBox(height: 10),
+              Wrap(
+                spacing: 10,
+                runSpacing: 8,
+                children: [
+                  FilledButton.icon(
+                    onPressed: () async {
+                      await Clipboard.setData(ClipboardData(text: recLog.dump()));
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                            content: Text(
+                                'ڕاپۆرت کۆپی کرا (${recLog.length} دێڕ). لە گفتوگۆکە paste ی بکە')));
+                      }
+                    },
+                    icon: const Icon(Icons.copy),
+                    label: const Text('کۆپیکردنی ڕاپۆرتی خوێندنەوە'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: recLog.clear,
+                    icon: const Icon(Icons.delete_outline),
+                    label: const Text('سڕینەوە'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 // ---------- settings page ----------
 class SettingsPage extends StatefulWidget {
   const SettingsPage({super.key});
@@ -2426,6 +3145,10 @@ class _SettingsPageState extends State<SettingsPage> {
                       ],
                     ),
                   ),
+                  _head('دەنگی بێ ئینتەرنێت'),
+                  const _OfflineManager(),
+                  _head('ڕاپۆرتی خوێندنەوەی مایک'),
+                  const _RecLogCard(),
                   _mzHeader(context),
                   AnimatedSize(
                     duration: const Duration(milliseconds: 220),
@@ -4395,8 +5118,8 @@ const List<String> kCoachLevelHints = [
   kLevel1Exact
       ? 'تەجوید و حەرەکات ناپشکنرێن، بەڵام هەموو وشە و پیتەکانی هەر ئایەتێک دەبێت ١٠٠٪ وەک دەقی نووسراو بن. هەر پیتێکی گۆڕاو، زیاد یان کەم، هەر وشەیەکی بازدراو و هەر وشەیەکی زیادە کە لەو شوێنەدا نییە دەیوەستێنێت: وشەکە سوور دەبێت، مامۆستا وشە نووسراوەکە دەڵێت و دەبێت دووبارە بیخوێنیتەوە. درێژی پیتی ا و ي (مەد) ناپشکنرێت.'
       : 'خوێندنەوەی ڕەوان. هەڵەی بچووکی حەرەکات و تەجوید ناوەستێنێت، و تەنها هەڵەی ڕاستەقینەی وشە ڕاست دەکرێتەوە. ئەگەر پیتێک بگۆڕدرێت بە پیتێکی تر (وەک ه/ك، س/ص، ت/ط) وشەکە سوور دەبێت و مامۆستا ڕاستی دەکاتەوە.',
-  'حەرەکاتی سەرەکی دەپشکنێت، و وشەی هەڵە دەگیرێت. گرنگی بە تەجوید کەمە: تەنها شەدەی لەبیرچوو و مەدی متصلی زۆر کورت ڕادەگیرێت. غونە، ئیدغام، ئیخفا، قەلقەلە و مەدی لازم و جایز بەجێدەهێڵرێن. هەڵەی وشە و پیت بە تەواوی ڕادەگیرێت.',
-  'تەجوید، مەد، شەدە و دەنگ بە وردی دەپشکنێت و تا ڕاست نەبێت ناڕوات. چاوەڕێی کۆتایی وشە دەکات، بۆیە کەمێک خاوترە. ماوەی مەد، کاتی غوننە و قەڵقەلە بە وردی دەپشکنرێن، بەڵام ئەو شێوازانەی وانەکان ڕێگەیان پێداوە (وەک مەدی عارض بە ٢، ٤ یان ٦ حەرەکە) هەڵە نابن.',
+  'هەموو وشە و پیتەکانی ئایەت لەگەڵ دەقی نووسراوی قورئان بەراورد دەکات. وشەی هەڵە، پیتی گۆڕاو، زیاد یان کەم، و حەرەکەی گۆڕاو دەگیرێن. تەجوید، ماوەی مەد، غوننە و قەڵقەلە ناپشکنرێن.',
+  'بەراوردی دەقی ئایەت بە توندترین شێوە: وشەی هەڵە دەستبەجێ دیاری دەکات و پێوەرە هاوشێوەیی وشەکان بەرزترە. تەجوید و ماوەی مەد ناپشکنرێن.',
 ];
 
 final GlobalKey<ScaffoldMessengerState> appMessenger =
@@ -4429,7 +5152,7 @@ const int kAudioCycleMs = 480;
 /// The coach finds the reader's place in the WHOLE Quran (surah + ayah), not
 /// only inside the open surah. Set to false to go back to the old behaviour.
 const bool kGlobalFinder = true;
-const bool kPerfMonitor = false;
+const bool kPerfMonitor = true;
 
 /// true = a full report goes to the log (logcat) every 15 s while coaching.
 const bool kPerfLog = false;
@@ -4698,6 +5421,36 @@ class PerfMonitor {
 }
 
 final PerfMonitor perf = PerfMonitor._();
+
+/// A short record of the last coaching session: what the engine heard, which words
+/// it called right / wrong, and every flag and jump the app made. Settings has a
+/// button that copies it, so a real reading can be examined and the rules tuned
+/// from facts instead of guesses. Nothing is sent anywhere.
+class RecLog {
+  final List<String> _lines = <String>[];
+  final Stopwatch _t = Stopwatch()..start();
+
+  void add(String s) {
+    _lines.add('${(_t.elapsedMilliseconds / 1000).toStringAsFixed(1)}s $s');
+    if (_lines.length > 700) _lines.removeRange(0, 150);
+  }
+
+  void clear() => _lines.clear();
+  int get length => _lines.length;
+
+  String dump() {
+    final sb = StringBuffer('QuranKurdish recitation log\n')
+      ..writeln('level=${settings.coachLevel} speed=${settings.coachSpeed} '
+          'tajweedBlocks=$kTajweedBlocksReading cycle=${kAudioCycleMs}ms');
+    if (kPerfMonitor) sb.writeln(perf.report());
+    sb.writeAll(_lines, '\n');
+    return sb.toString();
+  }
+}
+
+final RecLog recLog = RecLog();
+
+String _logTail(String v) => v.length <= 70 ? v : '…${v.substring(v.length - 70)}';
 
 /// The status line only needs the first tag and the last words: a long
 /// transcript must not be shaped and laid out again on every update.
@@ -5870,6 +6623,15 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
           reanchorStallThreshold: 24,
         );
       case 3:
+        if (!kTajweedBlocksReading) {
+          // text only (no madd / ghunna timing); early commit stays ON: no lag
+          return rq.TrackerConfig.normal(
+            speed: speed,
+            enableEarlyMatching: true,
+            enableAutoReanchor: true,
+            reanchorStallThreshold: 30,
+          );
+        }
         return rq.TrackerConfig.strict(
           speed: speed,
           enableEarlyMatching: false,
@@ -6181,6 +6943,10 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     final t0 = perf.now();
     perf.noteWordEvent(t0);
     try {
+      final lw = _byGlobal[ev.wordId];
+      recLog.add('EV #${ev.wordId} ${lw == null ? '?' : '${lw.ayah}:${lw.wordInAyah}'} '
+          '${ev.isRed ? 'RED' : ((ev as dynamic).isNeutral == true ? 'skip' : 'ok')} '
+          'cur=${_al?.cursor} | ${_logTail(_dbgTr)}');
       _noteLive(ev); // live picture first, then the (strict) verdict logic
       _onNeuralWordImpl(ev);
     } finally {
@@ -6456,10 +7222,12 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
   /// The first confirmed word (or a word far from the expected place): the
   /// reader's position is now there.
   void _anchorAt(int g, int ai) {
+    recLog.add('ANCHOR word $g');
     final al = _al;
     if (al == null) return;
     final moved = al.cursor < g - 1 || al.cursor > g + 1;
     if (moved) _liveG = -1;
+    if (moved && _anchored && g < al.cursor) _forgetAhead(g + 1, al.cursor);
     perf.noteAnchor(first: !_anchored, byEngine: true, moved: moved);
     _anchored = true;
     _stall?.cancel();
@@ -6483,12 +7251,12 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     if (state == CoachState.starting || _switching) return;
     final now = DateTime.now();
     // while the place is unknown (new session) look more often: re-anchor fast
-    final gap = Duration(milliseconds: _anchored ? 700 : 300);
+    final gap = Duration(milliseconds: _anchored ? 350 : 250);
     if (now.difference(_lastLocateAt) < gap) {
       return;
     }
     if (_anchored &&
-        now.difference(_lastGreenAt) < const Duration(milliseconds: 2500)) {
+        now.difference(_lastGreenAt) < const Duration(milliseconds: 800)) {
       return;
     }
     _lastLocateAt = now;
@@ -6583,23 +7351,41 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     if (al == null || _skel.isEmpty) return false;
     if (_switching) return false;
     final heard = _heardSkelOf(_dbgTr);
-    // a new session looks sooner: the reader may start anywhere
-    if (heard.length < (_anchored ? 12 : 10)) return false; // too little to prove anything
-    final tail = heard.length > 28 ? heard.substring(heard.length - 28) : heard;
-    final r = _locateInSurah(tail);
-    final n = tail.length;
-    if (r == null || r[1] > n ~/ 4 || r[2] - r[1] < 3) {
+    if (heard.length < 10) return false; // too little to prove anything
+    // Longest tail first (the surest). Right after a jump the long tail still holds
+    // the OLD ayah, so shorter tails (only the new words) are tried next: the jump is
+    // followed after 2-3 words, not after a whole new ayah.
+    List<int>? r;
+    var n = 0;
+    final lens = <int>[heard.length < 28 ? heard.length : 28, 16, 10];
+    for (var li = 0; li < lens.length; li++) {
+      final len = lens[li];
+      if (len > heard.length) continue;
+      final rr = _locateInSurah(heard.substring(heard.length - len));
+      if (rr == null) continue;
+      final maxEdits = li == 0 ? len ~/ 4 : (len >= 16 ? 3 : 2);
+      final minGap = li == 0 ? 3 : 4;
+      if (rr[1] <= maxEdits && rr[2] - rr[1] >= minGap) {
+        r = rr;
+        n = len;
+        break;
+      }
+    }
+    if (r == null) {
       // unclear or not unique in this surah: look in the whole Quran
       return _tryGlobalJump(heard);
     }
     final endW = _skelWord[r[0] - 1];
     final st = r[0] - n;
     final startW = _skelWord[st < 0 ? 0 : st];
-    // the place the app expects: normal reading, the engine follows it
+    // the place the app expects: normal reading, the engine follows it. Exception:
+    // the reader skipped ahead and began a LATER ayah (not just a missing word):
+    // follow at once, never wait for the ayahs that were left out.
     if (_anchored &&
         endW >= al.cursor - 3 &&
         endW <= al.cursor + kJumpWords) {
-      return false;
+      final aheadAyah = startW > al.cursor + 1 && _starts.contains(startW);
+      if (!aheadAyah) return false;
     }
     // the very beginning of the surah: the engine (waiting at word 0) handles it
     if (!_anchored && startW <= 1) return false;
@@ -6624,7 +7410,7 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     if (!kGlobalFinder || idx == null || _switching) return false;
     final now = DateTime.now();
     // a reader who is reading on normally is never moved to another surah
-    if (_anchored && now.difference(_lastGreenAt) < const Duration(seconds: 6)) {
+    if (_anchored && now.difference(_lastGreenAt) < const Duration(seconds: 3)) {
       return false;
     }
     if (now.difference(_lastGlobalAt) < const Duration(milliseconds: 500)) {
@@ -6703,9 +7489,21 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
 
   /// The reader is at words [startW]..[endW] of the surah: mark them, put the
   /// cursor and the engine on the next word.
+  /// The reader went BACK: the words after the new place (up to where the old
+  /// cursor was) are not "read" any more, so the page shows the true position.
+  void _forgetAhead(int from, int to) {
+    final al = _al;
+    if (al == null) return;
+    for (var k = from; k <= to && k < al.st.length; k++) {
+      if (k >= 0) al.st[k] = 0;
+    }
+  }
+
   void _jumpTo(int startW, int endW) {
     final al = _al;
     if (al == null) return;
+    recLog.add('JUMP words $startW..$endW (cursor was ${al.cursor})');
+    if (_anchored && endW + 1 < al.cursor) _forgetAhead(endW + 1, al.cursor);
     perf.noteAnchor(first: !_anchored, byEngine: false, moved: true);
     _anchored = true;
     _stall?.cancel();
@@ -6932,6 +7730,7 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
       {List<dynamic>? errs, TajweedVerdict? verdict}) {
     final al = _al;
     if (al == null) return;
+    recLog.add('FLAG ayahIdx=$ai g=$g pos=$pos wrongWord=$wrongWord "$detail" | ${_logTail(_dbgTr)}');
     // the word before the wrong one is only the connecting word of the
     // correction window (it was read right): it is never turned red
     if (!_correcting && _ctxG >= 0 && g >= _ctxLo && g < _ctxG) return;
@@ -6947,7 +7746,7 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     // tajweed slip, so no tajweed lesson card is attached to it (level 3 and a
     // real tajweed verdict keep the lesson).
     final tajweedFlag = verdict != null && verdict.flag;
-    final showTajweed = tajweedFlag || settings.coachLevel >= 3;
+    final showTajweed = kTajweedBlocksReading && (tajweedFlag || settings.coachLevel >= 3);
     if (showTajweed) {
       _setGuide(ai, g, verdict, signs);
     } else {
@@ -7946,7 +8745,7 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
           : 'هەڵەی تەجوید لە وشەی «$bad»${detail.isEmpty ? '' : ' ($detail)'} - گوێبگرە: «$phrase»',
     );
     _safety?.cancel();
-    _safety = Timer(const Duration(seconds: 12), _endCorrection);
+    _safety = Timer(const Duration(seconds: 6), _endCorrection); // never a long dead wait
     // always the connected ayah recording (never isolated word clips, which
     // sound chopped: "bismi ... Allah"), only the 3-word slice
     final f = audio.playCorrection(surah, ayah.n, from: from, to: to);
@@ -16869,12 +17668,15 @@ class _PrayerTimesPageState extends State<PrayerTimesPage> {
 
   Widget _lantern(double s) => Expanded(
         flex: 13,
-        child: Align(
-          alignment: Alignment.topCenter,
-          child: SizedBox(
-            width: 34 * s,
-            height: 92 * s,
-            child: const CustomPaint(painter: _PrayLanternPainter()),
+        child: Transform.translate(
+          offset: Offset(0, -8 * s), // lantern a little higher
+          child: Align(
+            alignment: Alignment.topCenter,
+            child: SizedBox(
+              width: 34 * s,
+              height: 92 * s,
+              child: const CustomPaint(painter: _PrayLanternPainter()),
+            ),
           ),
         ),
       );
@@ -16902,7 +17704,9 @@ class _PrayerTimesPageState extends State<PrayerTimesPage> {
           _lantern(s),
           Expanded(
             flex: 74,
-            child: SizedBox(
+            child: Transform.translate(
+              offset: Offset(0, -16 * s), // <- how much higher the arch card sits (dp)
+              child: SizedBox(
               height: h,
               child: CustomPaint(
               painter: const _PrayArchPainter(),
@@ -16980,6 +17784,7 @@ class _PrayerTimesPageState extends State<PrayerTimesPage> {
                   ),
                 ),
               ),
+            ),
             ),
             ),
           ),
