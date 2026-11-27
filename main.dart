@@ -4334,6 +4334,10 @@ const bool kLetterMixGuard = true;
 /// tell which word it heard, so the engine's "ok" stood. false = old behaviour.
 const bool kChainGuard = true;
 
+/// The reader said ANOTHER REAL WORD of the Quran in place of a word (عظيم for أليم).
+/// See [_foreignWord].
+const bool kForeignWordGuard = true;
+
 /// true = easy / balanced levels flag a word when the reader said a DIFFERENT
 /// letter in it (not only look-alike pairs): the word counts exactly as heard.
 const bool kAnyLetterGuard = true;
@@ -5594,6 +5598,7 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
   StreamSubscription<String>? _nTrSub;
   String _dbgEv = ''; // last engine event / resync, shown under the status
   String _dbgTr = '';
+  int _lastEvG = -1; // word the engine reported most recently (app word number)
   Timer? _verTimer;
   // A word the engine confirmed before the transcript has caught up with it is
   // held for a moment (easy / balanced) so it can be checked against what was
@@ -5784,6 +5789,7 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     _heardSkelSrc = '';
     _heardSkel = '';
     _dbgTr = '';
+    _lastEvG = -1;
     _dbgEv = '';
     _unmuteAt = DateTime(2000);
     _stall?.cancel();
@@ -6688,6 +6694,7 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
       // what the engine hears + its last result, shown under the status line
       _dbgEv = '';
       _dbgTr = '';
+      _lastEvG = -1;
       judgeText.value = '';
       _pendEv = null;
       _pendTimer?.cancel();
@@ -6944,6 +6951,18 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     perf.noteWordEvent(t0);
     try {
       final lw = _byGlobal[ev.wordId];
+      if (lw != null) {
+        final lai = _ayahIndexOf(lw.ayah);
+        if (lai >= 0) {
+          final lc = _starts[lai + 1] - _starts[lai];
+          if (lc > 0) {
+            var lk = lw.wordInAyah - _wBase;
+            if (lk < 0) lk = 0;
+            if (lk >= lc) lk = lc - 1;
+            _lastEvG = _starts[lai] + lk;
+          }
+        }
+      }
       recLog.add('EV #${ev.wordId} ${lw == null ? '?' : '${lw.ayah}:${lw.wordInAyah}'} '
           '${ev.isRed ? 'RED' : ((ev as dynamic).isNeutral == true ? 'skip' : 'ok')} '
           'cur=${_al?.cursor} | ${_logTail(_dbgTr)}');
@@ -7198,7 +7217,7 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     _clearGuideAt(g);
     al.cursor = g + 1;
     al.rev++;
-    if (settings.coachLevel <= 2) {
+    if (settings.coachLevel <= 2 || kForeignWordGuard) {
       _verG = g; // the transcript may still be catching up with this word
       _verAt = DateTime.now();
       _verTimer?.cancel(); // look once more even if no new transcript comes
@@ -7632,6 +7651,23 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     return out;
   }
 
+  /// Letters of the words the engine already reported AFTER word [g] (same ayah).
+  /// A verdict on word [g] can come late (the app waits for the text), and by then
+  /// those words are at the END of the transcript, behind word [g]: the window that
+  /// looks for word [g] must reach back over them. Without this the window held only
+  /// the next words, and part of one of them (the ه of «هدى») was taken for the end
+  /// of «فيه»: a right reading was turned red. When the reader repeats word [g] the
+  /// last reported word is [g] itself, so nothing is added (the older copy stays out).
+  int _lateLetters(int ai, int g) {
+    if (_lastEvG <= g || ai < 0 || ai + 1 >= _starts.length) return 0;
+    final end = _starts[ai + 1];
+    var n = 0;
+    for (var x = g + 1; x <= _lastEvG && x < end; x++) {
+      n += _arNorm(_wordText(ai, x)).length;
+    }
+    return n > 30 ? 30 : n;
+  }
+
   /// [cluster position, expected vowel, heard vowel] when the transcript holds
   /// word [g] with the same letters but ONE vowel changed (fatha / damma /
   /// kasra), else null. Only vowels both sides really have are compared.
@@ -7643,7 +7679,7 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     final expNorm = _arNorm(tok);
     final heardNorm = _arNorm(_dbgTr);
     if (expNorm.length < 2 || heardNorm.length < 2) return null;
-    final span = expNorm.length + 10; // the end of the transcript (just said)
+    final span = expNorm.length + 10 + _lateLetters(ai, g); // the end of the transcript (just said)
     final from = heardNorm.length > span ? heardNorm.length - span : 0;
     final loc = _approxLocate(heardNorm.substring(from), expNorm);
     if (loc[2] > 1) return null; // too different: a wrong word, not a vowel
@@ -7675,7 +7711,7 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     // Only the END of the transcript: the word was said just now. A wide window
     // also held an earlier correct copy of the same word (علیهم twice in
     // الفاتحة) and the slip was judged "exact".
-    final span = exp.length + 10;
+    final span = exp.length + 10 + _lateLetters(ai, g);
     final from = heardNorm.length > span ? heardNorm.length - span : 0;
     final loc = _approxLocate(heardNorm.substring(from), exp);
     if (loc[2] != 1) return null; // exact (fine) or too different to judge
@@ -7841,6 +7877,55 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
   ///    the next word has started (so the word is surely finished).
   /// Uncertain cases (word still being said, noise, very short words) return
   /// null: the other checks decide.
+  /// The reader said ANOTHER REAL WORD of the Quran in place of word [g] (عظيم instead
+  /// of أليم). The ordinary chain check below only sees small slips (at most 2 edits,
+  /// words of 3+ letters), so a whole different word with a similar ending passed.
+  /// Here the heard chain is cut between the word BEFORE and the word AFTER (both must
+  /// be heard exactly, so the cut is reliable) and we ask: is what lies in between a
+  /// different word that really exists in the Quran, and clearly unlike word [g]?
+  /// Recogniser noise is rarely a whole real word, and sounds that merge words
+  /// (idgham, lam of al-, tanween nun) are allowed for.
+  String? _foreignWord(int ai, int g) {
+    final al = _al;
+    if (al == null || ai < 0 || ai + 1 >= _starts.length) return null;
+    if (g >= al.words.length) return null;
+    final a0 = _starts[ai];
+    final a1 = _starts[ai + 1];
+    if (g <= a0 || g + 1 >= a1) return null; // a word before AND after, in the ayah
+    final eSk = _connSkel(al.words[g]);
+    if (eSk.isEmpty) return null;
+    final prevSk = _connSkel(al.words[g - 1]);
+    final nextSk = _connSkel(al.words[g + 1]);
+    if (prevSk.length < 3 || nextSk.length < 2) return null;
+    final pA = prevSk.length > 4 ? prevSk.substring(prevSk.length - 4) : prevSk;
+    final nA = nextSk.length > 3 ? nextSk.substring(0, 3) : nextSk;
+    final heard = _heardSkelOf(_dbgTr);
+    final tail = heard.length > 40 ? heard.substring(heard.length - 40) : heard;
+    final vocab = _QuranIndex.vocab ?? _surahVocab(true);
+    var pe = tail.lastIndexOf(pA);
+    while (pe >= 0) {
+      final from = pe + pA.length;
+      for (var idx = from + 1; idx <= from + 12 && idx + nA.length <= tail.length; idx++) {
+        if (!tail.startsWith(nA, idx)) continue;
+        // the first place where the next word begins closes the segment
+        var seg = tail.substring(from, idx);
+        if (seg.length < 3) break;
+        // tanween: the written nun of the word before may stand in front
+        if (!vocab.contains(seg) && seg.startsWith('ن') && vocab.contains(seg.substring(1))) {
+          seg = seg.substring(1);
+        }
+        if (seg.length < 3 || !vocab.contains(seg)) break; // not a real word: noise
+        if (seg == eSk) return null; // said right
+        if (eSk.startsWith('ل') && seg == eSk.substring(1)) return null; // lam of al-
+        if (_lev(seg, eSk) < 2) return null; // one letter: the ordinary guards judge it
+        return 'وشەیەکی تر بیستراوە (نزیک لە «$seg»)، بەڵام دەبێت «${_wordText(ai, g)}» بێت';
+      }
+      if (pe == 0) break;
+      pe = tail.lastIndexOf(pA, pe - 1);
+    }
+    return null;
+  }
+
   String? _chainJudge(int ai, int g) {
     if (!kChainGuard) return null;
     if (_doubtG == g) _doubtG = -1; // judged afresh below
@@ -7850,6 +7935,10 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     }
     final ps = _prefixSlip(g);
     if (ps != null) return ps;
+    if (kForeignWordGuard) {
+      final fw = _foreignWord(ai, g);
+      if (fw != null) return fw;
+    }
     final a0 = (ai >= 0 && ai < _starts.length) ? _starts[ai] : 0;
     final a1 = (ai >= 0 && ai + 1 < _starts.length)
         ? _starts[ai + 1]
@@ -8547,12 +8636,31 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     if (g < 0 || al == null || _correcting || !kLetterMixGuard || !on) return;
     if (g >= _wayah.length ||
         DateTime.now().difference(_verAt).inMilliseconds > 4000 ||
-        al.cursor > g + 2 ||
         al.st[g] != 1) {
       _verG = -1;
       return;
     }
     final ai = _wayah[g];
+    if (al.cursor > g + 2) {
+      // The reader is already some words further on (fast reading). Only the sure
+      // "another real word" check may still speak, and it does not wait: the word
+      // before and the word after were both heard exactly.
+      if (!kForeignWordGuard || al.cursor > g + 5) {
+        _verG = -1;
+        return;
+      }
+      final fw = _foreignWord(ai, g);
+      if (fw != null) {
+        _verWhy = '';
+        _verG = -1;
+        _flagNeural(ai, g, true, fw, g - _starts[ai] + 1);
+        _badSigns.remove(g);
+        return;
+      }
+      _verTimer?.cancel();
+      _verTimer = Timer(const Duration(milliseconds: 400), _reverify);
+      return;
+    }
     // PROOF: the word is in the transcript, letter for letter. A word that was
     // read right stays green for good: a later garbled transcript must not
     // turn it red again.
