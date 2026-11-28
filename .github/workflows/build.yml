@@ -15,7 +15,16 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-          cache: gradle
+      # the Android project is created during the build, so setup-java's own
+      # "cache: gradle" finds no gradle file in the repo and fails; cache by hand
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('pubspec.yaml', 'pubspec.lock') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
