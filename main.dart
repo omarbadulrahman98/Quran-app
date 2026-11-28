@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/physics.dart' show SpringDescription;
 import 'dart:async';
 import 'dart:ui' show DartPluginRegistrant;
 import 'package:android_alarm_manager_plus/android_alarm_manager_plus.dart';
@@ -142,7 +143,7 @@ class SurahInfo {
 
 // ---------- settings (dark mode, font size, translation) ----------
 class Settings extends ChangeNotifier {
-  bool dark = false;
+  bool dark = true;
   double arabicSize = 28;
   Tr tr = Tr.puxt;
   bool mushaf = true; // true: real Mushaf pages, false: one card per ayah
@@ -152,7 +153,7 @@ class Settings extends ChangeNotifier {
   List<String> marks = [];
   int lastSurah = 0;
   int lastAyah = 0;
-  int coachLevel = 2; // 1 easy, 2 balanced (recommended), 3 strict
+  int coachLevel = 2; // 2 balanced (recommended), 3 strict (level 1 removed)
   int coachSpeed = 1; // offline engine: 0 hadr (fast), 1 tadweer, 2 tahqeeq (slow)
   // where the live recitation stopped last (surah, ayah number, word inside the ayah)
   int coachSurah = 0, coachAyah = 0, coachWord = 0;
@@ -161,7 +162,7 @@ class Settings extends ChangeNotifier {
   Future<void> load() async {
     try {
       final p = await SharedPreferences.getInstance();
-      dark = p.getBool('dark') ?? false;
+      dark = p.getBool('dark') ?? true;
       arabicSize = p.getDouble('size') ?? 28;
       mushaf = p.getBool('mushaf') ?? true;
       pageBg = p.getInt('pageBg2') ?? 2; // new key: older saved defaults are ignored
@@ -182,9 +183,9 @@ class Settings extends ChangeNotifier {
       // 3 tiers now. Older installs stored 0..6: map them onto the new tiers.
       final lv3 = p.getInt('coachLvl3');
       if (lv3 != null) {
-        coachLevel = lv3.clamp(1, 3).toInt();
+        coachLevel = lv3.clamp(2, 3).toInt();
       } else {
-        const migrate = {0: 1, 1: 2, 2: 3, 3: 3, 4: 2, 5: 3, 6: 2};
+        const migrate = {0: 2, 1: 2, 2: 3, 3: 3, 4: 2, 5: 3, 6: 2};
         coachLevel = migrate[p.getInt('coachLvl') ?? 1] ?? 2;
       }
       coachSpeed = (p.getInt('coachSpd') ?? 1).clamp(0, 2).toInt();
@@ -312,7 +313,7 @@ class Settings extends ChangeNotifier {
   }
 
   void setCoachLevel(int l) {
-    coachLevel = l.clamp(1, 3).toInt();
+    coachLevel = l.clamp(2, 3).toInt();
     notifyListeners();
   }
 
@@ -711,6 +712,7 @@ class _SurahPageState extends State<SurahPage> {
     if (p > _lastPage) return;
     final first = _pgS(p) == widget.number ? _pgA(p) : 1;
     settings.setLast(widget.number, first);
+    _QcfStore.prefetch(p); // get the next pages ready before they are needed
   }
 
   void _coachFollow() {
@@ -842,6 +844,7 @@ class _SurahPageState extends State<SurahPage> {
                   },
                   child: PageView.builder(
                   controller: _pc,
+                  physics: const _SnappyPagePhysics(),
                   allowImplicitScrolling: true,
                   itemCount: _lastPage < 604 ? total + 1 : total,
                   onPageChanged: _onPage,
@@ -5147,14 +5150,10 @@ const String kCoachReciter = 'Alafasy_128kbps'; // مشاری العفاسی
 // error detection, red word, 3-word window and the teacher's audio. They only
 // differ in how strict the phonetic matching is.
 const List<String> kCoachLevels = [
-  kLevel1Exact ? 'وشە و پیت، بێ تەجوید' : 'سووک و ئاسایی',
   'مامناوەند (پێشنیارکراو)',
   'قورس و ورد',
 ];
 const List<String> kCoachLevelHints = [
-  kLevel1Exact
-      ? 'تەجوید و حەرەکات ناپشکنرێن، بەڵام هەموو وشە و پیتەکانی هەر ئایەتێک دەبێت ١٠٠٪ وەک دەقی نووسراو بن. هەر پیتێکی گۆڕاو، زیاد یان کەم، هەر وشەیەکی بازدراو و هەر وشەیەکی زیادە کە لەو شوێنەدا نییە دەیوەستێنێت: وشەکە سوور دەبێت، مامۆستا وشە نووسراوەکە دەڵێت و دەبێت دووبارە بیخوێنیتەوە. درێژی پیتی ا و ي (مەد) ناپشکنرێت.'
-      : 'خوێندنەوەی ڕەوان. هەڵەی بچووکی حەرەکات و تەجوید ناوەستێنێت، و تەنها هەڵەی ڕاستەقینەی وشە ڕاست دەکرێتەوە. ئەگەر پیتێک بگۆڕدرێت بە پیتێکی تر (وەک ه/ك، س/ص، ت/ط) وشەکە سوور دەبێت و مامۆستا ڕاستی دەکاتەوە.',
   'هەموو وشە و پیتەکانی ئایەت لەگەڵ دەقی نووسراوی قورئان بەراورد دەکات. وشەی هەڵە، پیتی گۆڕاو، زیاد یان کەم، و حەرەکەی گۆڕاو دەگیرێن. تەجوید، ماوەی مەد، غوننە و قەڵقەلە ناپشکنرێن.',
   'بەراوردی دەقی ئایەت بە توندترین شێوە: وشەی هەڵە دەستبەجێ دیاری دەکات و پێوەرە هاوشێوەیی وشەکان بەرزترە. تەجوید و ماوەی مەد ناپشکنرێن.',
 ];
@@ -10497,7 +10496,7 @@ class _QcfStore {
   static void _put(int p, _QGlyphs g) {
     _glyphs.remove(p);
     _glyphs[p] = g;
-    while (_glyphs.length > 14) {
+    while (_glyphs.length > 18) {
       _glyphs.remove(_glyphs.keys.first);
     }
   }
@@ -10532,7 +10531,16 @@ class _QcfStore {
   static bool _running = false;
 
   static void prefetch(int center) {
-    for (final p in <int>[center + 1, center - 1, center + 2, center - 2]) {
+    // pages far from where the reader is now are no longer needed
+    _queue.removeWhere((q) => (q - center).abs() > 6);
+    for (final p in <int>[
+      center + 1,
+      center - 1,
+      center + 2,
+      center + 3,
+      center - 2,
+      center + 4
+    ]) {
       if (p < 1 || p > 604 || _queue.contains(p)) continue;
       if (_glyphs.containsKey(p) && fontReady(p)) continue;
       _queue.add(p);
@@ -10581,7 +10589,7 @@ class _QcfStore {
           }
           _put(p, _QGlyphs(tps, wd, c.hashCode));
         }
-        await Future<void>.delayed(const Duration(milliseconds: 60));
+        await Future<void>.delayed(const Duration(milliseconds: 20));
       }
     } catch (e) {
       debugPrint('qcf prefetch: $e');
@@ -10719,6 +10727,20 @@ class _QPagePainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _QPagePainter old) =>
       old.geom != geom || old.key != key;
+}
+
+/// Quick, light page turning: a stiffer spring than the default, so the page
+/// settles fast after a swipe or a fling (no floaty / slow feeling, no bounce).
+class _SnappyPagePhysics extends PageScrollPhysics {
+  const _SnappyPagePhysics({super.parent});
+
+  @override
+  _SnappyPagePhysics applyTo(ScrollPhysics? ancestor) =>
+      _SnappyPagePhysics(parent: buildParent(ancestor));
+
+  @override
+  SpringDescription get spring =>
+      const SpringDescription(mass: 0.4, stiffness: 220, damping: 21);
 }
 
 class _MushafPage extends StatefulWidget {
@@ -14987,14 +15009,14 @@ class _DashBanner extends StatelessWidget {
                 ),
               ),
             ),
-            // soft dark glow ONLY behind the Bismillah (top-start corner),
-            // so the flag on the other side stays bright and clear
+            // very soft light glow ONLY behind the Bismillah (top-start
+            // corner), so the dark calligraphy reads well on the sky
             const DecoratedBox(
               decoration: BoxDecoration(
                 gradient: RadialGradient(
                   center: AlignmentDirectional.topStart,
                   radius: 0.95,
-                  colors: [Color(0x99000000), Color(0x00000000)],
+                  colors: [Color(0x44FFFFFF), Color(0x00FFFFFF)],
                 ),
               ),
             ),
@@ -15004,21 +15026,85 @@ class _DashBanner extends StatelessWidget {
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.start,
                   crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'بِسْمِ ٱللَّهِ ٱلرَّحْمَٰنِ ٱلرَّحِيمِ',
-                      style: TextStyle(
-                        fontSize: 18,
-                        color: Colors.white,
-                        fontFamilyFallback: _arFonts,
-                        shadows: [Shadow(color: Color(0xCC000000), blurRadius: 6)],
-                      ),
-                    ),
-                  ],
+                  children: [_BismillahCalli()],
                 ),
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Calligraphic Bismillah for the home banner (Ahmed Al-Ghareeb's Bismillah
+/// font: typing an English number 1..122 gives one of the 122 designs).
+/// Put the font file at assets/fonts/bismillah.ttf and change
+/// [kBismillahDesign] to pick another design. Until the font is loaded (or if
+/// the file is missing) the ordinary text is shown, so nothing ever breaks.
+const String kBismillahDesign = '1';
+const Color _kBismillahInk = _darkBg; // the app's dark colour
+
+class _BismillahCalli extends StatefulWidget {
+  const _BismillahCalli();
+
+  @override
+  State<_BismillahCalli> createState() => _BismillahCalliState();
+}
+
+class _BismillahCalliState extends State<_BismillahCalli> {
+  static Future<bool>? _load;
+  bool _ok = false;
+
+  static Future<bool> _font() {
+    return _load ??= () async {
+      try {
+        final loader = FontLoader('BismillahCalli');
+        loader.addFont(rootBundle.load('assets/fonts/bismillah.ttf'));
+        await loader.load();
+        return true;
+      } catch (e) {
+        debugPrint('bismillah font: $e');
+        return false;
+      }
+    }();
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _font().then((ok) {
+      if (ok && mounted) setState(() => _ok = true);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_ok) {
+      return const Text(
+        'بِسْمِ ٱللَّهِ ٱلرَّحْمَٰنِ ٱلرَّحِيمِ',
+        style: TextStyle(
+          fontSize: 18,
+          color: _kBismillahInk,
+          fontFamilyFallback: _arFonts,
+        ),
+      );
+    }
+    final w = MediaQuery.of(context).size.width * 0.52;
+    return SizedBox(
+      width: w,
+      child: FittedBox(
+        fit: BoxFit.scaleDown,
+        alignment: AlignmentDirectional.centerStart,
+        child: Text(
+          kBismillahDesign,
+          textDirection: TextDirection.rtl,
+          style: const TextStyle(
+            fontFamily: 'BismillahCalli',
+            fontSize: 60,
+            height: 1.1,
+            color: _kBismillahInk,
+          ),
         ),
       ),
     );
@@ -15770,12 +15856,6 @@ class _MicLevelsPageState extends State<MicLevelsPage> {
                   ),
                   _feature(
                     context,
-                    Icons.spellcheck,
-                    'نیشاندانی وردی هەڵە',
-                    'تەنها ئەو پیت، شەدە، تەنوین، حەرەکە یان مەدەی هەڵەیە سوور دەبێت، نەک هەموو وشەکە.',
-                  ),
-                  _feature(
-                    context,
                     Icons.timer_off,
                     'کوژانەوەی خۆکار',
                     'ئەگەر ١ خولەک هیچ دەنگێک نەبیسترێت، مایکرۆفۆن خۆی دەکوژێتەوە بۆ پاراستنی باتری.',
@@ -15785,8 +15865,8 @@ class _MicLevelsPageState extends State<MicLevelsPage> {
                     _RadioTile(
                       label: kCoachLevels[i],
                       sub: kCoachLevelHints[i],
-                      on: settings.coachLevel == i + 1,
-                      onTap: () => settings.setCoachLevel(i + 1),
+                      on: settings.coachLevel == i + 2,
+                      onTap: () => settings.setCoachLevel(i + 2),
                     ),
                   _sectionHead('خێرایی خوێندنەوە'),
                   Text(
@@ -15808,11 +15888,6 @@ class _MicLevelsPageState extends State<MicLevelsPage> {
                     label: 'خاو - تحقیق (مەد 5 تا 6 دەنگ)',
                     on: settings.coachSpeed == 2,
                     onTap: () => settings.setCoachSpeed(2),
-                  ),
-                  const SizedBox(height: 10),
-                  Text(
-                    'ئاست و خێرایی خۆکارانە پاشەکەوت دەکرێن و لە دەستپێکردنی داهاتووی مامۆستادا بەکاردێن.',
-                    style: TextStyle(fontSize: 12.5, height: 1.7, color: _mutedColor(context)),
                   ),
                 ],
               ),
@@ -18046,6 +18121,12 @@ class _PrayerTimesPageState extends State<PrayerTimesPage> {
       int prevIndex, DateTime? prevTime) {
     final h = 190.0 * s;
     return SizedBox(
+      height: h - 16 * s, // arch is lifted 16dp, so the strip under it is cut
+      child: OverflowBox(
+        alignment: Alignment.topCenter,
+        minHeight: h,
+        maxHeight: h,
+        child: SizedBox(
       height: h,
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -18139,6 +18220,8 @@ class _PrayerTimesPageState extends State<PrayerTimesPage> {
           ),
           _lantern(s),
         ],
+      ),
+        ),
       ),
     );
   }
@@ -18270,9 +18353,9 @@ class _PrayerTimesPageState extends State<PrayerTimesPage> {
     final slot = i == 0 ? 0 : i - 1; // adhanPrefs slot, same as before
     final mode = i == 1 ? 0 : adhanPrefs.mode[slot];
     return Padding(
-      padding: EdgeInsets.symmetric(vertical: 3.5 * s),
+      padding: EdgeInsets.symmetric(vertical: 3 * s),
       child: Container(
-        padding: EdgeInsets.symmetric(horizontal: 12 * s, vertical: 7 * s),
+        padding: EdgeInsets.symmetric(horizontal: 14 * s, vertical: 11 * s),
         decoration: _cardDeco(s, next: isNext, radius: 24),
         child: Row(
           children: [
@@ -18504,7 +18587,7 @@ class _PrayerTimesPageState extends State<PrayerTimesPage> {
         // screen the scale is also reduced so the hero, summary, city card and
         // all six prayer cards (down to Isha) and the monthly bar are visible without scrolling.
         const appBarH = 48.0;
-        const fitH = 895.0; // height of those blocks (incl. monthly bar) at scale 1.0
+        const fitH = 905.0; // height of those blocks (incl. monthly bar) at scale 1.0
         final mq = MediaQuery.of(context);
         final cw = math.min(mq.size.width, 560.0);
         final listTop = mq.padding.top + appBarH + 2;
@@ -18536,14 +18619,14 @@ class _PrayerTimesPageState extends State<PrayerTimesPage> {
                         EdgeInsets.fromLTRB(14 * s, listTop, 14 * s, 10 * s),
                     children: [
                       _hero(s, next, now, progress, prevIndex, prevTime),
-                      SizedBox(height: 10 * s),
-                      _summary(s, day, next),
-                      SizedBox(height: 10 * s),
-                      _cityCard(s, c),
                       SizedBox(height: 6 * s),
+                      _summary(s, day, next),
+                      SizedBox(height: 6 * s),
+                      _cityCard(s, c),
+                      SizedBox(height: 4 * s),
                       for (var i = 0; i < 6; i++)
                         _prayRow(s, i, day[i], i == next.index, i == cur),
-                      SizedBox(height: 10 * s),
+                      SizedBox(height: 8 * s),
                       _monthlyBar(s),
                     ],
                   ),
