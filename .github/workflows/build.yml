@@ -60,14 +60,13 @@ jobs:
           if [ -f Elgharib-SurahName_V4_ttf.txt ] && [ ! -f app/assets/fonts/surah_name.ttf ]; then cp Elgharib-SurahName_V4_ttf.txt app/assets/fonts/surah_name.ttf; fi
           pip install fonttools brotli >/dev/null 2>&1 || true
           python3 fetch_qcf.py app
-          # calligraphic Bismillah font of the home banner (declared in pubspec.yaml)
+          # the Bismillah of the home banner is now drawn from vector data inside
+          # main.dart, so a font file is no longer needed. If an old pubspec.yaml
+          # still lists assets/fonts/bismillah.ttf, copy the file when it exists.
           if [ -f bismillah.ttf ]; then
             cp bismillah.ttf app/assets/fonts/bismillah.ttf
           elif [ -f Elgharib-Al-Basmala.ttf ]; then
             cp Elgharib-Al-Basmala.ttf app/assets/fonts/bismillah.ttf
-          else
-            echo "::error::bismillah.ttf is NOT in the repository next to main.dart - upload it there"
-            exit 1
           fi
           # adhan sounds (one notification channel per muezzin)
           mkdir -p app/android/app/src/main/res/raw
