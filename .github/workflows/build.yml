@@ -15,6 +15,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+          cache: gradle
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
@@ -50,6 +51,15 @@ jobs:
           if [ -f Elgharib-SurahName_V4_ttf.txt ] && [ ! -f app/assets/fonts/surah_name.ttf ]; then cp Elgharib-SurahName_V4_ttf.txt app/assets/fonts/surah_name.ttf; fi
           pip install fonttools brotli >/dev/null 2>&1 || true
           python3 fetch_qcf.py app
+          # calligraphic Bismillah font of the home banner (declared in pubspec.yaml)
+          if [ -f bismillah.ttf ]; then
+            cp bismillah.ttf app/assets/fonts/bismillah.ttf
+          elif [ -f Elgharib-Al-Basmala.ttf ]; then
+            cp Elgharib-Al-Basmala.ttf app/assets/fonts/bismillah.ttf
+          else
+            echo "::error::bismillah.ttf is NOT in the repository next to main.dart - upload it there"
+            exit 1
+          fi
           # adhan sounds (one notification channel per muezzin)
           mkdir -p app/android/app/src/main/res/raw
           if [ -f adhan_sounds.zip ]; then
@@ -87,6 +97,23 @@ jobs:
           done
           grep -n "permission.ACCESS_.*_LOCATION" "$MANIFEST" || echo "::warning::location permission was not added to AndroidManifest.xml"
 
+      - name: Gradle network settings (avoid HTTP 429 from Maven Central)
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/mirror.gradle <<'EOF'
+          beforeSettings { settings ->
+            settings.pluginManagement.repositories {
+              maven { url = uri("https://maven-central.storage-download.googleapis.com/maven2/") }
+            }
+          }
+          EOF
+          cat >> ~/.gradle/gradle.properties <<'EOF'
+          systemProp.org.gradle.internal.http.connectionTimeout=120000
+          systemProp.org.gradle.internal.http.socketTimeout=120000
+          systemProp.org.gradle.internal.repository.max.tentatives=6
+          systemProp.org.gradle.internal.repository.initial.backoff=2000
+          EOF
+
       - name: Build APK
         working-directory: app
         run: |
@@ -110,7 +137,17 @@ jobs:
           # the filter below only needs the leading word, so it does not depend on the bullet character.
           flutter analyze --no-pub 2>&1 | grep -E "^ *(error|warning) " | head -120 || true
           # arm64 only = a much smaller APK (all modern phones are arm64)
-          flutter build apk --release --no-shrink --target-platform android-arm64
+          # a download problem (HTTP 429 / timeout) is temporary: wait and try again
+          ok=0
+          for i in 1 2 3 4; do
+            if flutter build apk --release --no-shrink --target-platform android-arm64; then
+              ok=1
+              break
+            fi
+            echo "::warning::build attempt $i failed (probably the network) - waiting before the next try"
+            sleep $((i * 45))
+          done
+          if [ "$ok" != "1" ]; then exit 1; fi
           # print the real size of the APK in the log
           ls -lh build/app/outputs/flutter-apk/app-release.apk
 
