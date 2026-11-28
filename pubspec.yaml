@@ -43,3 +43,6 @@ flutter:
     - family: UthmanicHafs
       fonts:
         - asset: UthmanicHafs.ttf
+    - family: BismillahCalli
+      fonts:
+        - asset: assets/fonts/bismillah.ttf

@@ -72,7 +72,6 @@ Future<void> main() async {
     AdhanScheduler.scheduleSoon();
     AzkarAuto.scheduleSoon();
   } catch (_) {}
-  assert(PrayerCalc.selfTest()); // debug only: Awqaf benchmark of 29/10/2026
   runApp(const QuranApp());
   // every letter and word of every ayah of all 114 surahs goes into the coach's
   // index in the background, long before the reader taps the microphone
@@ -272,20 +271,6 @@ class Settings extends ChangeNotifier {
   void setPageBg(int i) {
     pageBg = i;
     notifyListeners();
-  }
-
-  void bigger() {
-    if (arabicSize < 56) {
-      arabicSize += 2;
-      notifyListeners();
-    }
-  }
-
-  void smaller() {
-    if (arabicSize > 16) {
-      arabicSize -= 2;
-      notifyListeners();
-    }
   }
 
   void setTr(Tr t) {
@@ -949,17 +934,6 @@ class _SurahPageState extends State<SurahPage> {
   }
 }
 
-final ButtonStyle _abBtn = TextButton.styleFrom(
-  minimumSize: const Size(36, 40),
-  padding: const EdgeInsets.symmetric(horizontal: 6),
-);
-
-const TextStyle _abStyle = TextStyle(
-  color: Colors.white,
-  fontWeight: FontWeight.bold,
-  fontSize: 16,
-);
-
 class _SurahHeader extends StatelessWidget {
   final SurahInfo s;
   const _SurahHeader(this.s);
@@ -1303,7 +1277,6 @@ const List<SurahInfo> kSurahs = [
   SurahInfo(113, "الفلق", "Al-Falaq", true, 5),
   SurahInfo(114, "الناس", "An-Nas", true, 6),
 ];
-
 
 // ============================================================
 //  Reciters + audio (audio streamed from everyayah.com)
@@ -3226,7 +3199,6 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 }
 
-
 // ============================================================
 //  Continue reading / bookmarks / search
 // ============================================================
@@ -3660,7 +3632,6 @@ class _SearchPageState extends State<SearchPage> {
   }
 }
 
-
 // ============================================================
 //  Recitation coach (1/2) - pure logic: normalise, match, align
 // ============================================================
@@ -3860,36 +3831,7 @@ bool _connContains(String heard, String expected, int level) {
   if (expected.length < 4) return false; // too short to prove anything
   if (heard.contains(expected)) return true;
   if (level >= 3) return false; // strict: exact only
-  if (expected.length >= 6 && heard.contains(expected.substring(1))) return true;
-  // easy: one wrong or missing letter in a long chain is forgiven
-  return level == 1 &&
-      !kEasyLikeBalanced &&
-      expected.length >= 8 &&
-      _bestSubstringDist(heard, expected) <= 1;
-}
-
-/// Fewest edits that turn [pat] into some part of [text].
-int _bestSubstringDist(String text, String pat) {
-  if (pat.isEmpty) return 0;
-  final n = pat.length;
-  var prev = List<int>.generate(n + 1, (i) => i);
-  var cur = List<int>.filled(n + 1, 0); // cur[0] stays 0: free start
-  var best = prev[n];
-  for (var j = 1; j <= text.length; j++) {
-    final tj = text.codeUnitAt(j - 1);
-    for (var i = 1; i <= n; i++) {
-      final c = pat.codeUnitAt(i - 1) == tj ? 0 : 1;
-      var v = prev[i - 1] + c;
-      if (prev[i] + 1 < v) v = prev[i] + 1;
-      if (cur[i - 1] + 1 < v) v = cur[i - 1] + 1;
-      cur[i] = v;
-    }
-    if (cur[n] < best) best = cur[n];
-    final t = prev;
-    prev = cur;
-    cur = t;
-  }
-  return best;
+  return expected.length >= 6 && heard.contains(expected.substring(1));
 }
 
 int _lev(String a, String b) {
@@ -4308,7 +4250,6 @@ class QuranPhonetics {
   }
 }
 
-
 class AlignEvent {
   final int g; // global word index of the mistake
   final bool skipped; // true: word(s) left out, false: wrong word
@@ -4378,16 +4319,6 @@ const Map<int, int> _pronFold = {
 /// letter in it (not only look-alike pairs): the word counts exactly as heard.
 const bool kAnyLetterGuard = true;
 
-/// true = level 1 (easy) uses the engine's normal word matching instead of the
-/// forgiving one, so a misread word is not confirmed by the engine itself.
-const bool kEasyUsesNormalMatching = true;
-
-/// true = the easy level (1) judges WORDS exactly like the balanced level (2):
-/// no forgiven letter in a long phrase, no skipped word let through, the same
-/// similarity bar. What stays easier at level 1: tajweed slips (madd, ghunna ...)
-/// and the number of attempts before the app lets a word pass.
-const bool kEasyLikeBalanced = true;
-
 /// true = «ال» heard where the text has none, or missing where it has one, is a
 /// wrong word (الشمس / شمس): it changes the meaning in the Quran.
 /// Set false if the recogniser drops the lam of a sun letter on a right reading.
@@ -4441,32 +4372,6 @@ const bool kTajweedBlocksReading = false;
 /// the transcript text (it is too short and often garbled): the engine decides.
 /// Set false to judge them like every other word.
 const bool kShortWordsFree = true;
-
-/// LEVEL 1 = THE EXACT TEXT, NO TAJWEED. Level 1 judges nothing about tajweed
-/// (no madd length, ghunna, articulation point, harakat) but EVERY word and
-/// EVERY letter must be what is written in the ayah, 100 %:
-///  - a changed letter (عليكم said as عليهم), a letter more or less, another
-///    word, a two-letter word (لا / ما / من) said wrong: the reader is stopped,
-///    the word turns red, the teacher says the written word;
-///  - a word that is NOT in the ayah at this place (an extra word the reader
-///    says on his own, like والله): the reader is stopped at once and the
-///    teacher says the word that is written there;
-///  - a word of the ayah that is skipped (up to [kSkipWords] words before the
-///    word the engine heard) stops the reader too;
-///  - a word the text never shows is NOT accepted just because the engine
-///    matched it. Only a stretched vowel that the recogniser writes as an echo
-///    (ذلك -> ذلكلك) is not held against the reader;
-///  - the rules are general: they compare EVERY letter of EVERY word of the
-///    ayah with what was heard (nothing is tied to particular words). The only
-///    letters not judged are the long-vowel letters (ا و ي) when they are just
-///    longer / shorter (madd length, Uthmani vs modern spelling); a و heard as
-///    ي (or the reverse) is another letter and is judged.
-/// Levels 2-3 keep their older rules. Set false to go back to the old level 1.
-const bool kLevel1Exact = true;
-
-/// Level 1 (exact): a gap of at most this many words between the expected word
-/// and the word the engine heard is a skipped word (a longer gap is a jump).
-const int kSkipWords = 3;
 
 /// The word without its «ال» (also after one prefix letter: وال فال بال كال لال).
 String _dropAl(String x) {
@@ -4859,11 +4764,7 @@ class RecitationAligner {
 
   bool get finished => cursor >= words.length;
   double get _thr =>
-      level == 0
-          ? 0.6
-          : (level == 1 && !kEasyLikeBalanced
-              ? 0.7
-              : (level <= 2 ? 0.8 : 0.88));
+      level == 0 ? 0.6 : (level <= 2 ? 0.8 : 0.88);
   bool get _instant => level >= 3; // flag a wrong word without waiting
   bool _same(String h, String e) {
     if (_sameWord(h, e, _thr)) return true;
@@ -5081,8 +4982,7 @@ class RecitationAligner {
         }
       }
       if (skip > 0) {
-        final flag =
-            level == 2 || (level == 1 && (kEasyLikeBalanced || skip >= 2));
+        final flag = level == 1 || level == 2;
         final at = cursor;
         for (var k = 0; k < skip; k++) {
           st[at + k] = flag ? 2 : 1;
@@ -5138,7 +5038,6 @@ class RecitationAligner {
     return null;
   }
 }
-
 
 // ============================================================
 //  Recitation coach (2/2) - microphone, correction audio, state
@@ -5487,11 +5386,6 @@ class RecLog {
 final RecLog recLog = RecLog();
 
 String _logTail(String v) => v.length <= 70 ? v : '…${v.substring(v.length - 70)}';
-
-/// The status line only needs the first tag and the last words: a long
-/// transcript must not be shaped and laid out again on every update.
-String _capHeard(String v) =>
-    v.length <= 120 ? v : '${v.substring(0, 24)}…${v.substring(v.length - 90)}';
 
 final Map<String, List<_Cluster>> _clusterCache = <String, List<_Cluster>>{};
 
@@ -6568,7 +6462,7 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     // for another word or the end of the session.
     final lvl = settings.coachLevel;
     if (lvl >= 1) {
-      final ms = lvl == 1 ? 1300 : (lvl == 2 ? 900 : 500);
+      final ms = lvl == 2 ? 900 : 500;
       _idle = Timer(Duration(milliseconds: ms), () {
         if (!on || _correcting || _al == null || _lastHeard.isEmpty) return;
         _consume(_lastHeard, _lastHeard.length, false, idle: true);
@@ -6642,24 +6536,6 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
       rq.RecitationSpeed.slow,
     ][settings.coachSpeed];
     switch (settings.coachLevel) {
-      case 1:
-        if (kEasyUsesNormalMatching) {
-          // the forgiving matcher accepted a misread word (علیکم for علیهم):
-          // easy keeps its other leniencies (tajweed, attempts) but the word
-          // itself is matched like the balanced level
-          return rq.TrackerConfig.normal(
-            speed: speed,
-            enableEarlyMatching: true,
-            enableAutoReanchor: true,
-            reanchorStallThreshold: 24,
-          );
-        }
-        return rq.TrackerConfig.easy(
-          speed: speed,
-          enableEarlyMatching: true,
-          enableAutoReanchor: true,
-          reanchorStallThreshold: 24,
-        );
       case 3:
         if (!kTajweedBlocksReading) {
           // text only (no madd / ghunna timing); early commit stays ON: no lag
@@ -6688,7 +6564,7 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
 
   /// How many corrections of the same word before the app lets it pass.
   int get _maxFails =>
-      settings.coachLevel == 1 ? 2 : (settings.coachLevel == 3 ? 5 : 3);
+      settings.coachLevel == 3 ? 5 : 3;
 
   Future<bool> _initNeural() async {
     // The offline engine never asks for the microphone itself, so after a
@@ -7160,7 +7036,7 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
           _pendTimer = Timer(const Duration(milliseconds: 250), _resolvePending);
           return;
         }
-        if (settings.coachLevel <= 2 && !_exact1) {
+        if (settings.coachLevel <= 2) {
           // the recogniser's text is late or garbled: no proof either way. A
           // word the reader may have read right is NOT turned red for that
           // (only a text that shows a DIFFERENT word does).
@@ -7230,8 +7106,6 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     }
     if ((ev as dynamic).isNeutral == true) return;
     if (_correcting) return; // stale result that arrived after the mistake
-    // level 1 (exact): every word before this one must have been said too
-    if (_exact1 && _skipCheck(g)) return;
     {
       // debug line: why did this word turn green? (kept after the correction)
       final trParts = _dbgTr.trim().isEmpty
@@ -8325,7 +8199,7 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     }
     final exp = al.words[g];
     if (exp.length < 2) return null;
-    if (kShortWordsFree && settings.coachLevel <= 2 && exp.length <= 2 && !_exact1) return null;
+    if (kShortWordsFree && settings.coachLevel <= 2 && exp.length <= 2) return null;
     final raw = <String>[];
     final toks = <String>[];
     for (final t in _dbgTr.split(RegExp(r'\s+'))) {
@@ -8441,8 +8315,6 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     // (levels 1-2: a long-vowel letter the recogniser spells differently, like
     // ذالك for ذلك, is the same word read right: only level 3 is that exact)
     if (st == se) {
-      // level 1 (exact): a و heard as ي (or the reverse) is another letter
-      if (_exact1 && _matresSub(t, exp)) return bad;
       return (kExactSpelling && settings.coachLevel >= 3) ? bad : null;
     }
     // 2. letters only, no long vowels, is a real word of the Quran
@@ -8458,7 +8330,6 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     // (levels 1-2: the recogniser often cuts the END of a word, ويقم for
     // ويقيمون: that is not a misread)
     if (settings.coachLevel <= 2 &&
-        !_exact1 && // level 1 (exact): a cut-off ending is a missing letter
         st.length >= 2 &&
         st.length < se.length &&
         se.startsWith(st)) {
@@ -8538,7 +8409,7 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     final ai = _wayah[g];
     if (_isMuqatta(ai, g)) return; // letters read by name: not compared
     final lk = _lockCheck(ai, g);
-    if (lk >= 0 || (!_lockNear && !_exact1)) {
+    if (lk >= 0 || !_lockNear) {
       _scanG = -1; // fine, not heard yet, or too unlike to be a sure misread
       return;
     }
@@ -8582,104 +8453,6 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     return r;
   }
 
-  /// Level 1 with the exact-text rules switched on (see [kLevel1Exact]).
-  bool get _exact1 => kLevel1Exact && settings.coachLevel == 1;
-
-  /// A stretched vowel is often written by the recogniser as an echo of the
-  /// last letters of the word (ذلك -> ذلكلك). Tajweed is not judged at level
-  /// 1, so this is the same word, not a mistake.
-  bool _stretchNoise(String t, String exp) {
-    final e = exp.replaceAll(_arMatres, '');
-    final h = t.replaceAll(_arMatres, '');
-    if (e.length < 2 || h.length <= e.length || !h.startsWith(e)) return false;
-    final tail = e.substring(e.length - 2);
-    final extra = h.substring(e.length);
-    if (extra.length > 4) return false;
-    for (final c in extra.split('')) {
-      if (!tail.contains(c)) return false;
-    }
-    return true;
-  }
-
-  /// LEVEL 1 (exact): same consonants and the same NUMBER of و / ي letters, but
-  /// a و was heard as ي or the reverse (المؤمنون / المؤمنين): that is another
-  /// letter. A long vowel that is only longer, shorter or written with an alef
-  /// (the Uthmani / modern spelling differ there) is not judged: it is the
-  /// madd length, which level 1 does not care about.
-  bool _matresSub(String t, String exp) {
-    final a = t.replaceAll(RegExp('[^وي]'), '');
-    final b = exp.replaceAll(RegExp('[^وي]'), '');
-    return a.isNotEmpty && a.length == b.length && a != b;
-  }
-
-  /// LEVEL 1 (exact): index in [toks] of a heard word that was lined up with NO
-  /// expected word (it is not in the ayah at this place: an extra word like
-  /// والله) and stands after the last heard word of the places before [g] and
-  /// before the word [g] itself; -1 when there is none. [lined] = for each of
-  /// the last heard words (counted from [t0]) the expected word it was lined
-  /// up with, -1 = none.
-  int _extraWordAt(
-      int g, String exp, List<String> toks, int t0, List<int> lined) {
-    final al = _al;
-    if (al == null) return -1;
-    var prev = -1;
-    for (var q = 0; q < lined.length; q++) {
-      if (lined[q] >= 0 && lined[q] < g) prev = q;
-    }
-    if (prev < 0) return -1; // nothing of this reading to hold on to yet
-    for (var q = prev + 1; q < lined.length; q++) {
-      if (lined[q] >= g) break;
-      if (lined[q] >= 0) continue;
-      final tk = toks[t0 + q];
-      if (tk.length < 3) continue; // too short: recogniser noise
-      if (exp.startsWith(tk) || tk.startsWith(exp)) continue; // still being said
-      if (g > 0 && tk == al.words[g - 1]) continue; // the same word said twice
-      if (g > 1 && tk == al.words[g - 2]) continue;
-      return t0 + q;
-    }
-    return -1;
-  }
-
-  /// LEVEL 1 (exact): the engine reported word [g], but the words from the
-  /// cursor up to it were not all said. A word that WAS read right (the engine
-  /// just did not report it: a joined reading) turns green here; the first one
-  /// that was not read stops the reader (skipped, or said wrong).
-  /// true = the reader was stopped.
-  bool _skipCheck(int g) {
-    final al = _al;
-    if (al == null || g <= al.cursor || g - al.cursor > kSkipWords) return false;
-    for (var c = al.cursor; c < g; c++) {
-      if (c >= _wayah.length) return false;
-      final aic = _wayah[c];
-      if (_isMuqatta(aic, c)) {
-        al.st[c] = 1;
-        continue;
-      }
-      final lk = _lockCheck(aic, c);
-      if (lk == 1) {
-        al.st[c] = 1;
-        _wordFails.remove(c);
-        _badLetters.remove(c);
-        _badSigns.remove(c);
-        _clearGuideAt(c);
-        continue;
-      }
-      _pendFor = null;
-      _holdQ.clear();
-      _flagNeural(
-          aic,
-          c,
-          true,
-          lk < 0
-              ? _lockWhy
-              : 'وشەی «${_wordText(aic, c)}» بازدرا، دەبێت بخوێنرێتەوە',
-          c - _starts[aic] + 1);
-      _badSigns.remove(c);
-      return true;
-    }
-    return false;
-  }
-
   int _lockRaw(int ai, int g) {
     _lockWhy = '';
     _lockNear = false;
@@ -8691,7 +8464,7 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     if (exp.length < 2) return 1; // one letter (و ب ف ل): text cannot tell
     // two-letter words (إن ما لا من في) are too short for the text to judge:
     // levels 1-2 leave them to the engine
-    if (kShortWordsFree && settings.coachLevel <= 2 && exp.length <= 2 && !_exact1) return 1;
+    if (kShortWordsFree && settings.coachLevel <= 2 && exp.length <= 2) return 1;
     if (_dbgTr.trim().isEmpty) {
       judgeText.value = '«$exp» ⇐ (هێشتا دەق نییە)';
       return 0;
@@ -8769,22 +8542,6 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
         j--;
       }
     }
-    // LEVEL 1 (exact): a word that is not in the ayah at this place (an extra
-    // word the reader says on his own) stops the reader; the teacher says the
-    // word that is written here.
-    if (_exact1) {
-      final xt = _extraWordAt(g, exp, toks, t0, lined);
-      if (xt >= 0) {
-        final tk = toks[xt];
-        _lockWhy =
-            'وشەی «${raw[xt]}» لەم شوێنەدا نییە، دەبێت «${_wordText(ai, g)}» بێت';
-        _lockNear = true; // a sure misread: the joined-reading rescue must not clear it
-        _lockTok = tk;
-        _lockLast = xt == toks.length - 1; // a word still being said waits 0.4 s
-        judgeText.value = '«$exp» ⇐ زیادە «$tk»';
-        return -1;
-      }
-    }
     if (tokAtG < 0) {
       judgeText.value = '«$exp» ⇐ ؟ (هێشتا نەبیستراوە)';
       return 0;
@@ -8812,7 +8569,6 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
         settings.coachLevel <= 2 &&
         st.length >= 2 &&
         st == se &&
-        !(_exact1 && _matresSub(t, exp)) &&
         !(_QuranIndex.vocabFull ?? _surahVocab(false)).contains(t)) {
       same = true;
     }
@@ -8826,10 +8582,7 @@ class RecitationCoach extends ChangeNotifier with WidgetsBindingObserver {
     // stretched madd written as noise: ذالكلك for ذلك) and is NOT a known misread
     // (another real word, one other letter ...) does not count against the
     // reader: the engine confirmed the word, so it stands. Level 3 stays exact.
-    if (why == null && settings.coachLevel <= 2) {
-      // level 1 (exact): only a stretched vowel written as an echo is forgiven
-      if (!_exact1 || _stretchNoise(t, exp)) return 1;
-    }
+    if (why == null && settings.coachLevel <= 2) return 1;
     _lockWhy = why ??
         'وشەی «${raw[tokAtG]}» بیستراوە، بەڵام دەبێت «${_wordText(ai, g)}» بێت';
     return -1;
@@ -12321,52 +12074,6 @@ class PrayerCalc {
   static bool isOfficial(PrayCity c, DateTime date) =>
       kAwqafSchedule[c.ku]?['${_two(date.month)}-${_two(date.day)}']?.length == 6;
 
-  /// Checks every table entry (format, order, city name). Debug only.
-  static bool validateSchedule() {
-    final key = RegExp(r'^(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$');
-    for (final city in kAwqafSchedule.entries) {
-      if (!kPrayCities.any((x) => x.ku == city.key)) {
-        debugPrint('Awqaf schedule: unknown city ${city.key}');
-        return false;
-      }
-      for (final day in city.value.entries) {
-        final v = day.value;
-        var ok = key.hasMatch(day.key) && v.length == 6 && v.every(_hhmm.hasMatch);
-        for (var i = 1; ok && i < 6; i++) {
-          ok = v[i].compareTo(v[i - 1]) > 0; // fajr < sunrise < ... < isha
-        }
-        if (!ok) {
-          debugPrint('Awqaf schedule: bad entry ${city.key} ${day.key} $v');
-          return false;
-        }
-      }
-    }
-    return true;
-  }
-
-  /// Debug check against the official Awqaf benchmark of 29/10/2026.
-  /// Call once from main(): assert(PrayerCalc.selfTest());
-  static bool selfTest() {
-    const bench = {
-      'سلێمانی': ['04:55', '06:17', '11:48', '14:44', '17:15', '18:31'],
-      'سەیدسادق': ['04:53', '06:15', '11:46', '14:42', '17:13', '18:29'],
-    };
-    if (!validateSchedule()) return false;
-    // engine alone (schedule ignored) must also hit the benchmark
-    // fixed UTC+3 (Iraq) so the test does not depend on the device zone
-    for (final e in bench.entries) {
-      final c = kPrayCities.firstWhere((x) => x.ku == e.key);
-      final d = _compute(c, DateTime(2026, 10, 29),
-          hanafi: false, tzHours: 3, ignoreSchedule: true);
-      final got = d.list.map((t) => t == null ? '--' : _hm(t)).toList();
-      if (got.join() != e.value.join()) {
-        debugPrint('Awqaf self-test FAILED for ${e.key}: $got vs ${e.value}');
-        return false;
-      }
-    }
-    return true;
-  }
-
   static NextPrayer next(PrayCity c, DateTime now, {bool hanafi = false}) {
     final today = compute(c, now, hanafi: hanafi).list;
     for (final i in const [0, 2, 3, 4, 5]) {
@@ -13493,18 +13200,6 @@ class TajweedBridge {
     TajweedKind.shadda,
   };
 
-  /// Fine details: reported from level 3 on only.
-  static const Set<TajweedKind> _fine = <TajweedKind>{
-    TajweedKind.qalqala,
-    TajweedKind.tafkhim,
-    TajweedKind.raa,
-    TajweedKind.lamJalala,
-    TajweedKind.maddMunfasil,
-    TajweedKind.maddArid,
-    TajweedKind.maddLin,
-    TajweedKind.waqf,
-  };
-
   /// Strongest cause first (lesson 16: the stronger madd wins).
   static const List<TajweedKind> _rank = <TajweedKind>[
     TajweedKind.maddLazim,
@@ -13994,10 +13689,7 @@ class TajweedBridge {
       final lesson = _lessonFor(kind, cl, next);
       var flag = true;
       var why = 'reported by the engine';
-      if (level <= 1) {
-        flag = false;
-        why = 'level 1: tajweed slips are not corrected';
-      } else if (!_fits(kind, cl, next, atWaqf)) {
+      if (!_fits(kind, cl, next, atWaqf)) {
         flag = false;
         why = 'the rule does not apply to this word (lesson $lesson)';
       } else if (_permissible(kind, c.dir, atWaqf)) {
@@ -15039,57 +14731,17 @@ class _DashBanner extends StatelessWidget {
 
 /// Calligraphic Bismillah for the home banner (Ahmed Al-Ghareeb's Bismillah
 /// font: typing an English number 1..122 gives one of the 122 designs).
-/// Put the font file at assets/fonts/bismillah.ttf and change
-/// [kBismillahDesign] to pick another design. Until the font is loaded (or if
-/// the file is missing) the ordinary text is shown, so nothing ever breaks.
+/// The font is declared in pubspec.yaml (family BismillahCalli, file
+/// assets/fonts/bismillah.ttf), so it is part of the app and always ready.
+/// Change [kBismillahDesign] to pick another design.
 const String kBismillahDesign = '1';
 const Color _kBismillahInk = _darkBg; // the app's dark colour
 
-class _BismillahCalli extends StatefulWidget {
+class _BismillahCalli extends StatelessWidget {
   const _BismillahCalli();
 
   @override
-  State<_BismillahCalli> createState() => _BismillahCalliState();
-}
-
-class _BismillahCalliState extends State<_BismillahCalli> {
-  static Future<bool>? _load;
-  bool _ok = false;
-
-  static Future<bool> _font() {
-    return _load ??= () async {
-      try {
-        final loader = FontLoader('BismillahCalli');
-        loader.addFont(rootBundle.load('assets/fonts/bismillah.ttf'));
-        await loader.load();
-        return true;
-      } catch (e) {
-        debugPrint('bismillah font: $e');
-        return false;
-      }
-    }();
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    _font().then((ok) {
-      if (ok && mounted) setState(() => _ok = true);
-    });
-  }
-
-  @override
   Widget build(BuildContext context) {
-    if (!_ok) {
-      return const Text(
-        'بِسْمِ ٱللَّهِ ٱلرَّحْمَٰنِ ٱلرَّحِيمِ',
-        style: TextStyle(
-          fontSize: 18,
-          color: _kBismillahInk,
-          fontFamilyFallback: _arFonts,
-        ),
-      );
-    }
     final w = MediaQuery.of(context).size.width * 0.52;
     return SizedBox(
       width: w,
@@ -15439,125 +15091,6 @@ class _DashOrnamentLinePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
-}
-
-/// Emerald band at the bottom of the dashboard with a small mosque.
-class _DashFooterPainter extends CustomPainter {
-  final Color bg; // page colour behind the mosque (for the crescent cut-out)
-  const _DashFooterPainter(this.bg);
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final w = size.width, h = size.height;
-    final top = Path()
-      ..moveTo(0, h * 0.28)
-      ..cubicTo(w * 0.22, h * 0.30, w * 0.30, h * 0.72, w * 0.5, h * 0.72)
-      ..cubicTo(w * 0.70, h * 0.72, w * 0.78, h * 0.30, w, h * 0.28);
-    final band = Path.from(top)
-      ..lineTo(w, h)
-      ..lineTo(0, h)
-      ..close();
-    canvas.drawPath(
-      band,
-      Paint()
-        ..shader = const LinearGradient(
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
-          colors: [_prEmeraldMid, _prEmerald],
-        ).createShader(Offset.zero & size),
-    );
-    canvas.save();
-    canvas.clipPath(band);
-    _StarLatticePainter.draw(canvas, Offset.zero & size, _prGoldLight, 0.13);
-    canvas.restore();
-    canvas.drawPath(
-      top,
-      Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 2
-        ..shader = const LinearGradient(
-          colors: [_prGoldLight, _prGold, _prGoldLight, _prGold, _prGoldLight],
-        ).createShader(Offset.zero & size),
-    );
-
-    // ---- mosque ----
-    final cx = w / 2;
-    final base = h * 0.76;
-    final mw = math.min(w * 0.34, 150.0 * (h / 118));
-    final mh = h * 0.66;
-    final fill = Paint()
-      ..shader = const LinearGradient(
-        begin: Alignment.topCenter,
-        end: Alignment.bottomCenter,
-        colors: [Color(0xFF1B7A55), _prEmerald],
-      ).createShader(Rect.fromLTWH(cx - mw / 2, base - mh, mw, mh));
-    final line = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1
-      ..color = _prGold.withAlpha(210);
-    final gold = Paint()..color = _prGold;
-
-    void minaret(double x) {
-      final half = mw * 0.04;
-      final topY = base - mh * 0.76;
-      final shaft = Rect.fromLTRB(x - half, topY, x + half, base);
-      canvas.drawRect(shaft, fill);
-      canvas.drawRect(shaft, line);
-      canvas.drawRect(
-          Rect.fromLTRB(x - half * 1.9, base - mh * 0.58, x + half * 1.9,
-              base - mh * 0.54),
-          gold);
-      final cap = Path()
-        ..moveTo(x - half * 1.4, topY)
-        ..quadraticBezierTo(x, topY - mh * 0.22, x + half * 1.4, topY)
-        ..close();
-      canvas.drawPath(cap, fill);
-      canvas.drawPath(cap, line);
-      canvas.drawCircle(Offset(x, topY - mh * 0.15), half * 0.55, gold);
-    }
-
-    minaret(cx - mw * 0.44);
-    minaret(cx + mw * 0.44);
-
-    final bodyTop = base - mh * 0.30;
-    final body = Rect.fromLTRB(cx - mw * 0.31, bodyTop, cx + mw * 0.31, base);
-    canvas.drawRect(body, fill);
-    canvas.drawRect(body, line);
-
-    final dome = Path()
-      ..moveTo(cx - mw * 0.25, bodyTop)
-      ..cubicTo(cx - mw * 0.25, bodyTop - mh * 0.44, cx + mw * 0.25,
-          bodyTop - mh * 0.44, cx + mw * 0.25, bodyTop)
-      ..close();
-    canvas.drawPath(dome, fill);
-    canvas.drawPath(dome, line);
-
-    // finial + crescent
-    final tip = Offset(cx, bodyTop - mh * 0.33);
-    canvas.drawLine(tip, tip + Offset(0, -mh * 0.07), line..strokeWidth = 1.2);
-    final cc = tip + Offset(0, -mh * 0.12);
-    final cr = mh * 0.055;
-    canvas.drawCircle(cc, cr, gold);
-    canvas.drawCircle(cc + Offset(cr * 0.5, -cr * 0.15), cr * 0.85, Paint()..color = bg);
-
-    // arched windows
-    final win = Paint()..color = _prGoldLight.withAlpha(215);
-    for (final k in const [-1.0, 0.0, 1.0]) {
-      final wx = cx + k * mw * 0.15;
-      canvas.drawRRect(
-        RRect.fromRectAndCorners(
-          Rect.fromLTRB(wx - mw * 0.035, base - mh * 0.20, wx + mw * 0.035,
-              base - mh * 0.03),
-          topLeft: Radius.circular(mw * 0.035),
-          topRight: Radius.circular(mw * 0.035),
-        ),
-        win,
-      );
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant _DashFooterPainter old) => old.bg != bg;
 }
 
 // ---------- shared small widgets for the new pages ----------
@@ -18015,7 +17548,6 @@ class _PrayStarPainter extends CustomPainter {
   bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
 
-
 class PrayerTimesPage extends StatefulWidget {
   const PrayerTimesPage({super.key});
 
@@ -18807,7 +18339,6 @@ class _PrayerMonthPageState extends State<PrayerMonthPage> {
   }
 }
 
-
 // ============================================================
 //  مامۆستای مزگەوت - Tajweed Teacher layer
 //  Severity (red = major / yellow = minor), points, and the Kurdish
@@ -18841,34 +18372,6 @@ ErrDir _parseErrDir(String s) {
 /// The four modules of the curriculum.
 enum TeacherModule { makharij, sifat, nunMim, madd }
 
-extension TeacherModuleX on TeacherModule {
-  int get number => index + 1;
-
-  String get titleAr => const <String>[
-        'مخارج الحروف',
-        'صفات الحروف',
-        'أحكام النون الساكنة والتنوين والميم الساكنة',
-        'المدود وأحكامها',
-      ][index];
-
-  String get titleKu => const <String>[
-        'مەخرەجی پیتەکان',
-        'سیفاتی پیتەکان',
-        'حوکمەکانی نوونی ساکن، تەنوین و میمی ساکن',
-        'مەدەکان و حوکمەکانیان',
-      ][index];
-
-  /// Lesson ids of kTajweedLessons (main.dart) that belong to the module.
-  List<int> get lessonIds => const <List<int>>[
-        <int>[17, 18, 19],
-        <int>[20, 21, 22],
-        <int>[2, 3, 4, 5, 6, 8, 9],
-        <int>[15, 16],
-      ][index];
-}
-
-const int kColorRed = 0xFFD32F2F; // major error
-const int kColorYellow = 0xFFF9A825; // minor error
 const int kJaliPenalty = 15; // every major error
 const int kStartScore = 100;
 
@@ -18911,7 +18414,6 @@ class TeacherRule {
     this.longFix = '',
   });
 
-  bool get hasLength => maxHarakat > 0;
 }
 
 const Map<String, TeacherRule> kTeacherRules = <String, TeacherRule>{
@@ -19208,9 +18710,6 @@ class TeacherFeedback {
     required this.mustRepeat,
   });
 
-  /// Color the UI paints the word / the card with.
-  int get colorValue =>
-      severity == ErrSeverity.jali ? kColorRed : kColorYellow;
 }
 
 const List<String> _kMinorOpeners = <String>[
@@ -19276,172 +18775,6 @@ class TajweedTeacher {
     );
   }
 
-  // -------------------------------------------------------------
-  //  Duration judge: for madd and ghunnah, from measured milliseconds.
-  //  (Needs audio timing; speech-to-text alone cannot give it.)
-  // -------------------------------------------------------------
-
-  static const double _shortTol = 0.6; // harakat below the minimum
-  static const double _longTol = 0.9; // harakat above the maximum
-
-  /// [measuredMs] = how long the reader held the sound, [harakahMs] = the
-  /// reader's own harakah (see HarakahCalibrator).
-  static HarakatVerdict judgeDuration({
-    required String kind,
-    required double measuredMs,
-    required double harakahMs,
-  }) {
-    final r = kTeacherRules[kind];
-    if (r == null || !r.hasLength || harakahMs <= 0) {
-      return const HarakatVerdict(true, ErrDir.unknown, 0, false);
-    }
-    final h = measuredMs / harakahMs;
-    if (h < r.minHarakat - _shortTol) {
-      // A natural madd shorter than one harakah is no madd any more: the
-      // long vowel became a short one = altered vowel = major error.
-      final vanished =
-          (kind == 'maddAsli' || kind == 'maddBadal') && h < 1.0;
-      return HarakatVerdict(false, ErrDir.tooShort, h, vanished);
-    }
-    if (h > r.maxHarakat + _longTol) {
-      return HarakatVerdict(false, ErrDir.tooLong, h, false);
-    }
-    return HarakatVerdict(true, ErrDir.unknown, h, false);
-  }
-
-  /// Judge and build the message in one step. null = the reading is fine.
-  static TeacherFeedback? judgeAndAdvise({
-    required String kind,
-    required double measuredMs,
-    required double harakahMs,
-    String word = '',
-    int attempt = 0,
-  }) {
-    final v = judgeDuration(
-        kind: kind, measuredMs: measuredMs, harakahMs: harakahMs);
-    if (v.ok) return null;
-    return feedback(
-      kind: kind,
-      dir: v.dir == ErrDir.tooShort ? 'tooShort' : 'tooLong',
-      word: word,
-      attempt: attempt,
-      escalate: v.escalateToJali,
-    );
-  }
-
-  // -------------------------------------------------------------
-  //  Module 1: articulation points (letter substitution = lahn jali)
-  // -------------------------------------------------------------
-
-  /// The reader said [heard] where the text has [expected].
-  static TeacherFeedback substitution({
-    required String expected,
-    required String heard,
-    String word = '',
-    int attempt = 0,
-  }) {
-    final e = _kMakhraj[expected];
-    final h = _kMakhraj[heard];
-    final sb = StringBuffer()
-      ..write(_kMajorOpeners[attempt.abs() % _kMajorOpeners.length])
-      ..write('\n');
-    if (word.isNotEmpty) sb.write('وشە: «$word»\n');
-    sb.write('«$heard» خوێندرایەوە، بەڵام دەبێت «$expected» بێت.');
-    if (e != null) {
-      sb
-        ..write('\n«$expected»: ')
-        ..write(e.place)
-        ..write(' • ')
-        ..write(e.trait);
-      if (h != null) {
-        sb
-          ..write('\n«$heard» جیاوازە: ')
-          ..write(h.place)
-          ..write(' • ')
-          ..write(h.trait);
-      }
-      sb
-        ..write('\nپێشنیار: ')
-        ..write(e.tip);
-    } else {
-      sb.write('\nلەگەڵ مامۆستا مەخرەجی ئەم پیتە دووبارە بکەرەوە.');
-    }
-    sb.write('\nتکایە جارێکی تر بیخوێنەوە.');
-    final lesson = e?.lessonId ?? 18;
-    return TeacherFeedback(
-      severity: ErrSeverity.jali,
-      module: TeacherModule.makharij,
-      title: '«$heard» بەجیاتی «$expected»',
-      message: sb.toString(),
-      tip: e?.tip ?? 'لەگەڵ مامۆستا مەخرەجی ئەم پیتە دووبارە بکەرەوە.',
-      lessonId: lesson,
-      penalty: kJaliPenalty,
-      mustRepeat: true,
-    );
-  }
-
-  /// The reader changed a vowel (fatha / damma / kasra), lahn jali.
-  static TeacherFeedback vowelChange({
-    required String word,
-    required String expectedVowel, // e.g. 'فەتحە'
-    required String heardVowel, // e.g. 'کەسرە'
-    int attempt = 0,
-  }) {
-    final msg = '${_kMajorOpeners[attempt.abs() % _kMajorOpeners.length]}\n'
-        'وشە: «$word»\n'
-        'حەرەکەکە $heardVowel خوێندرایەوە، بەڵام دەبێت $expectedVowel بێت. '
-        'گۆڕینی حەرەکە واتای وشەکە دەگۆڕێت.\n'
-        'تکایە جارێکی تر بیخوێنەوە.\n(وانەی 24)';
-    return TeacherFeedback(
-      severity: ErrSeverity.jali,
-      module: TeacherModule.makharij,
-      title: 'گۆڕینی حەرەکە',
-      message: msg,
-      tip: 'گۆڕینی حەرەکە واتا دەگۆڕێت؛ حەرەکەی ڕاست بخوێنەوە.',
-      lessonId: 24,
-      penalty: kJaliPenalty,
-      mustRepeat: true,
-    );
-  }
-}
-
-class HarakatVerdict {
-  final bool ok;
-  final ErrDir dir;
-  final double harakat; // measured length in harakat
-  final bool escalateToJali;
-  const HarakatVerdict(this.ok, this.dir, this.harakat, this.escalateToJali);
-}
-
-// ---------------------------------------------------------------
-//  4. Harakah calibration: one harakah is different for every reader
-// ---------------------------------------------------------------
-
-/// Learns the reader's own tempo from his natural madds (2 harakat each),
-/// so a slow reader is not punished for a long madd and a fast one is not
-/// punished for a short one. Default 400 ms until enough samples exist.
-class HarakahCalibrator {
-  static const double defaultMs = 400;
-  static const double minMs = 180;
-  static const double maxMs = 700;
-
-  final List<double> _samples = <double>[];
-
-  void observe(String kind, double ms) {
-    if (kind != 'maddAsli') return;
-    if (ms < 200 || ms > 1600) return; // not a believable natural madd
-    _samples.add(ms);
-    if (_samples.length > 40) _samples.removeAt(0);
-  }
-
-  double get harakahMs {
-    if (_samples.length < 5) return defaultMs;
-    final s = List<double>.from(_samples)..sort();
-    final median = s.length.isOdd
-        ? s[s.length ~/ 2]
-        : (s[s.length ~/ 2 - 1] + s[s.length ~/ 2]) / 2;
-    return (median / 2).clamp(minMs, maxMs).toDouble();
-  }
 }
 
 // ---------------------------------------------------------------
@@ -19511,58 +18844,3 @@ class RecitationScorer {
   }
 }
 
-// ---------------------------------------------------------------
-//  6. Articulation table: confusable letters (module 1)
-//     Source: book part 3 (جێدەنگی پیتەکان) + lessons 17-19.
-// ---------------------------------------------------------------
-
-class _Mk {
-  final String place;
-  final String trait;
-  final String tip;
-  final int lessonId;
-  const _Mk(this.place, this.trait, this.tip, this.lessonId);
-}
-
-const String _kTipThaa =
-    'نووکی زمانت بە نەرمی لەسەر لێوی دەمی ددانە سەرەوەکان دابنێ و با بە هێمنی بڕوات.';
-
-const Map<String, _Mk> _kMakhraj = <String, _Mk>{
-  // tongue tip + upper incisors: ث ذ ظ
-  'ث': _Mk('نووکی زمان و کەناری ددانە سەرەوەکان', 'چپە (هەمس)، تەنک', _kTipThaa, 18),
-  'ذ': _Mk('نووکی زمان و کەناری ددانە سەرەوەکان', 'ئاشکرا (جەهر)، تەنک',
-      'هەمان شوێنی «ث»، بەڵام دەنگ دەربخە و دەنگی زەنگداری هەبێت.', 18),
-  'ظ': _Mk('نووکی زمان و کەناری ددانە سەرەوەکان', 'ئاشکرا، قورس',
-      'هەمان شوێنی «ذ»، بەڵام پشتی زمانت بەرز بکەرەوە بۆ ئەوەی پڕ و قورس بێت.', 18),
-  // sibilants: س ص ز
-  'س': _Mk('نێوان نووکی زمان و ددانە خوارەوەکان', 'فیکە، چپە، تەنک',
-      'دەنگی فیکە بێ پشتی زمانی بەرز؛ دەم بە سووکی بکەرەوە.', 18),
-  'ص': _Mk('نێوان نووکی زمان و ددانە خوارەوەکان', 'فیکە، چپە، قورس',
-      'هەمان فیکەی «س»، بەڵام پشتی زمان بەرز بکە و دەنگەکە پڕ بکە.', 18),
-  'ز': _Mk('نێوان نووکی زمان و ددانە خوارەوەکان', 'فیکە، ئاشکرا، تەنک',
-      'هەمان شوێنی «س»، بەڵام دەنگ لەگەڵی دەربخە.', 18),
-  // back of the tongue: ق ك
-  'ق': _Mk('کۆتایی زمان لەگەڵ سەقفی دەمی نەرم (دوورترین)', 'قورس، قەڵقەلە',
-      'پشتی زمان بە قووڵی بخەرە سەقف و بە هێز بەرەڵای بکە، قەڵقەلە دەکات.', 18),
-  'ك': _Mk('کۆتایی زمان کەمێک بەرەو پێش لە «ق»', 'تەنک، بێ قەڵقەلە',
-      'کەمێک بەرەو پێش بێنە و بێ قورسی و بێ قەڵقەلە بیڵێ.', 18),
-  // throat letters
-  'ء': _Mk('کۆتایی قورگ', 'توند', 'لە قووڵایی قورگەوە بە دەنگێکی کورتی ڕوون.', 19),
-  'ه': _Mk('کۆتایی قورگ', 'چپە، نەرم', 'هەناسەیەکی سووک لە قووڵایی قورگ.', 19),
-  'ع': _Mk('ناوەڕاستی قورگ', 'ئاشکرا، نێوانی (نە توند نە نەرم)',
-      'قورگت بە نەرمی بگوشە و دەنگێکی ڕوون لە ناوەڕاستی قورگ دەربەرە.', 19),
-  'ح': _Mk('ناوەڕاستی قورگ', 'چپە، نەرم',
-      'هەمان شوێنی «ع»، بەڵام بێ دەنگی ئاشکرا، وەک هەناسەیەکی گەرم.', 19),
-  'غ': _Mk('نزیکترین بەشی قورگ بە دەم', 'قورس، نەرم',
-      'قورگ بە سووکی بگوشە و دەنگێکی قورسی خشاو بدە.', 19),
-  'خ': _Mk('نزیکترین بەشی قورگ بە دەم', 'قورس، چپە',
-      'هەمان شوێنی «غ»، بەڵام بێ دەنگ و بە خشانێکی قورس.', 19),
-  // lips
-  'ب': _Mk('هەردوو لێو', 'توند، ئاشکرا',
-      'لێوەکان لەسەر یەک بگرە و بە توندی لێکیان بکەرەوە.', 17),
-  'م': _Mk('هەردوو لێو', 'غوننە، ئاشکرا',
-      'لێوەکان داخە و دەنگەکە لە لووتەوە بڕوات.', 17),
-  'و': _Mk('هەردوو لێو (کردنەوەی خڕ)', 'نەرم', 'لێوەکان خڕ بکە بێ ئەوەی بیانلکێنیت.', 17),
-  'ف': _Mk('ناوەڕاستی لێوی خوارەوە و کەناری ددانە سەرەوەکان', 'چپە، نەرم',
-      'لێوی خوارەوە بە نەرمی لە ددانە سەرەوەکان بدە و با بڕوات.', 17),
-};
