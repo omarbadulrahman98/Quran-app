@@ -106,16 +106,9 @@ jobs:
           done
           grep -n "permission.ACCESS_.*_LOCATION" "$MANIFEST" || echo "::warning::location permission was not added to AndroidManifest.xml"
 
-      - name: Gradle network settings (avoid HTTP 429 from Maven Central)
+      - name: Gradle download settings (patient with slow / busy servers)
         run: |
-          mkdir -p ~/.gradle/init.d
-          cat > ~/.gradle/init.d/mirror.gradle <<'EOF'
-          beforeSettings { settings ->
-            settings.pluginManagement.repositories {
-              maven { url = uri("https://maven-central.storage-download.googleapis.com/maven2/") }
-            }
-          }
-          EOF
+          mkdir -p ~/.gradle
           cat >> ~/.gradle/gradle.properties <<'EOF'
           systemProp.org.gradle.internal.http.connectionTimeout=120000
           systemProp.org.gradle.internal.http.socketTimeout=120000
@@ -146,15 +139,20 @@ jobs:
           # the filter below only needs the leading word, so it does not depend on the bullet character.
           flutter analyze --no-pub 2>&1 | grep -E "^ *(error|warning) " | head -120 || true
           # arm64 only = a much smaller APK (all modern phones are arm64)
-          # a download problem (HTTP 429 / timeout) is temporary: wait and try again
+          # A download problem (HTTP 429 / timeout) is temporary, so only THOSE are
+          # retried. A real error in the code stops the build at once.
           ok=0
           for i in 1 2 3 4; do
-            if flutter build apk --release --no-shrink --target-platform android-arm64; then
-              ok=1
+            flutter build apk --release --no-shrink --target-platform android-arm64 2>&1 | tee "$RUNNER_TEMP/build.log"
+            code=${PIPESTATUS[0]}
+            if [ "$code" = "0" ]; then ok=1; break; fi
+            if grep -qE "status code 429|Too Many Requests|Could not GET|Could not HEAD|Could not resolve all (artifacts|files)|timed out|Connection reset|Read timed out|Remote host terminated|Premature end" "$RUNNER_TEMP/build.log"; then
+              echo "::warning::build attempt $i failed because of the network - waiting before the next try"
+              sleep $((i * 45))
+            else
+              echo "::error::the build failed and it is NOT a network problem - see the lines above (first 'Error' / 'error -')"
               break
             fi
-            echo "::warning::build attempt $i failed (probably the network) - waiting before the next try"
-            sleep $((i * 45))
           done
           if [ "$ok" != "1" ]; then exit 1; fi
           # print the real size of the APK in the log
