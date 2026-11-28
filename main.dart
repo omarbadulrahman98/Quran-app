@@ -18372,6 +18372,15 @@ ErrDir _parseErrDir(String s) {
 /// The four modules of the curriculum.
 enum TeacherModule { makharij, sifat, nunMim, madd }
 
+extension TeacherModuleX on TeacherModule {
+  String get titleKu => const <String>[
+        'مەخرەجی پیتەکان',
+        'سیفاتی پیتەکان',
+        'حوکمەکانی نوونی ساکن، تەنوین و میمی ساکن',
+        'مەدەکان و حوکمەکانیان',
+      ][index];
+}
+
 const int kJaliPenalty = 15; // every major error
 const int kStartScore = 100;
 
